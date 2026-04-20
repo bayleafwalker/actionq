@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a defect in queue behavior, CLI behavior, or database lifecycle handling.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the bug and the observed outcome.
+      placeholder: Claiming an action returns a stale record instead of the current claimed row.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Include the exact CLI commands, environment variables, and queue state needed to reproduce.
+      placeholder: |
+        1. Set ACTIONQ_URL and ACTIONQ_SCHEMA
+        2. Run actionctl migrate
+        3. Run actionctl add --type ...
+        4. Run actionctl claim --worker ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: State the expected queue or event-log behavior.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: actionq version
+      description: Output of actionctl --version or the package version in use.
+      placeholder: 0.1.0
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, Postgres version, OS, and anything else relevant.
+      placeholder: Python 3.11, Postgres 16, Ubuntu 24.04
