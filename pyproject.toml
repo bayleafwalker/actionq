@@ -5,11 +5,36 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "actionq"
 version = "0.1.0"
+description = "Operational-domain action queue for deterministic agent dispatch"
+readme = "README.md"
 requires-python = ">=3.11"
+authors = [
+    { name = "Juha Huotari" },
+]
+keywords = ["action-queue", "agent", "cli", "dispatch", "postgres", "queue"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "click>=8.1",
     "psycopg[binary]>=3.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/bayleafwalker/actionq"
+Repository = "https://github.com/bayleafwalker/actionq"
+Issues = "https://github.com/bayleafwalker/actionq/issues"
 
 [project.scripts]
 actionctl = "actionq.cli:cli"
