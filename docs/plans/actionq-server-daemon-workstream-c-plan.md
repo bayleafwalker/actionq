@@ -83,6 +83,7 @@ Payload:
 ```json
 {
   "session_id": "aqs:<ulid-or-uuid>",
+  "runtime_session_id": "aqs:<ulid-or-uuid>",
   "daemon_id": "devbox:<hostname>:<pid>:<boot_uuid>",
   "action_id": 123,
   "action_type": "scope-iterate",
@@ -92,7 +93,13 @@ Payload:
   "model": "claude-sonnet-4-6",
   "routing_source": "action-explicit|project-default|action-kind-default",
   "worktree": "/home/dev/.local/state/actionq/worktrees/sprintctl/123",
-  "branch": "agent/scope-iterate/123"
+  "branch": "agent/scope-iterate/123",
+  "ttl_seconds": 120,
+  "claim": {
+    "claim_id": 456,
+    "work_item_id": 42,
+    "claim_type": "execute"
+  }
 }
 ```
 
@@ -105,10 +112,17 @@ Payload:
 ```json
 {
   "session_id": "aqs:<id>",
+  "runtime_session_id": "aqs:<id>",
   "pid": 12345,
   "started_at": "2026-04-26T12:34:56Z",
   "harness": "claude",
   "model": "claude-sonnet-4-6",
+  "ttl_seconds": 120,
+  "claim": {
+    "claim_id": 456,
+    "work_item_id": 42,
+    "claim_type": "execute"
+  },
   "sprint_takeup": {
     "attempted": true,
     "enabled": true,
@@ -128,10 +142,17 @@ Payload:
 ```json
 {
   "session_id": "aqs:<id>",
+  "runtime_session_id": "aqs:<id>",
   "pid": 12345,
   "monotonic_age_seconds": 120,
   "status": "running",
-  "worktree": "/path/to/worktree"
+  "worktree": "/path/to/worktree",
+  "ttl_seconds": 120,
+  "claim": {
+    "claim_id": 456,
+    "work_item_id": 42,
+    "claim_type": "execute"
+  }
 }
 ```
 
@@ -144,10 +165,17 @@ Payload:
 ```json
 {
   "session_id": "aqs:<id>",
+  "runtime_session_id": "aqs:<id>",
   "reason": "operator|usage-limit|shutdown|unsupported-harness",
   "mechanism": "checkpoint-and-fail|sigstop|native",
   "handoff_ref": "/path/to/handoff.md",
-  "resumable": false
+  "resumable": false,
+  "ttl_seconds": 120,
+  "claim": {
+    "claim_id": 456,
+    "work_item_id": 42,
+    "claim_type": "execute"
+  }
 }
 ```
 
@@ -175,6 +203,7 @@ Payload:
 ```json
 {
   "session_id": "aqs:<id>",
+  "runtime_session_id": "aqs:<id>",
   "pid": 12345,
   "exit_code": 0,
   "duration_seconds": 1800,
@@ -182,6 +211,12 @@ Payload:
   "result_ref": "branch=agent/scope-iterate/123",
   "failure_reason": null,
   "audit_status": "ok|failed|skipped",
+  "ttl_seconds": 120,
+  "claim": {
+    "claim_id": 456,
+    "work_item_id": 42,
+    "claim_type": "execute"
+  },
   "sprint_release": {
     "attempted": true,
     "status": "ok|failed|skipped",
@@ -516,28 +551,33 @@ Command shape:
 ```bash
 direnv exec /projects/dev/<repo> auditctl add \
   --type session.start \
+  --source actionq-daemon \
   --actor actionq:<session_id> \
   --summary "actionq session started: <action_type> #<action_id>" \
-  --refs "aq:<action_id>" \
-  --refs "aqs:<session_id>" \
-  --refs "sprint:<sprint-id>" \
+  --ref "wi:<target_ref>" \
+  --ref "sprint:<sprint-id>" \
+  --metadata '{"session_id":"<session_id>","harness":"<harness>","model":"<model>","action_id":<action_id>}' \
   --detail "<json-or-markdown-detail>"
 ```
 
-Events to emit:
+Valid ref prefixes in auditctl are `wi:`, `ka:`, `ad:`, `sha:`, `pr:`, `sprint:` — validated at insert time. Action and session identifiers (`action_id`, `session_id`) belong in `--metadata`, not `--ref`. The `wi:` ref is only emitted when `target_ref` on the action corresponds to a work item; omit it otherwise. Include `sprint:<sprint-id>` when the sprint context is known from the project.
 
-- `dispatch`: after claim and routing, before harness start.
-- `session.start`: after harness PID exists.
+Auditctl event types emitted by the daemon (these differ in naming from actionq coordinator events, which use `session.dispatch`, `session.started`, etc.):
+
+- `dispatch.queued`: after action is claimed and routed, before worktree or harness setup.
+- `dispatch.started`: worktree ready and harness selected, before child process starts.
+- `session.start`: after harness child PID exists.
 - `session.pause`: when pause/re-dispatch handoff is recorded.
-- `session.resume`: when a session starts from a handoff.
+- `session.resume`: when a session starts from a prior handoff context.
 - `session.exit`: after child exit and validation outcome is known.
-- Optional later: `pr.open`, `commit.landed`, `pr.merge` when a handler or hook can produce those facts reliably.
+- `pr.open`: after session exits completed, when `gh pr view` confirms a PR exists for the session branch (step 6).
+- `pr.merge`: when the PR state is confirmed `MERGED` at exit time or on a subsequent observer pass (step 6).
 
 Error handling:
 
 - Audit emission is best-effort by default: `fail_action_on_emit_error = false`.
 - Every audit failure is mirrored into actionq event payload fields such as `audit_status="failed"` and `audit_error`.
-- For regulated or stricter repos, config may set `fail_action_on_emit_error = true`, in which case failure to emit `dispatch` or `session.start` rejects/fails before model work begins. Do not enable that for the first devbox rollout.
+- For regulated or stricter repos, config may set `fail_action_on_emit_error = true`, in which case failure to emit `dispatch.queued` or `session.start` rejects/fails before model work begins. Do not enable that for the first devbox rollout.
 
 Audit details should be concise and machine-readable enough for cockpit aggregation: include action id, session id, harness, model, worktree, branch, result, and failure reason.
 
@@ -584,28 +624,30 @@ Manual operational checks:
 
 ## Implementation order
 
-Each step is shippable. Step 1 must work daemon-only-on-devbox without any new actionq-server service.
+Each step is shippable. Steps 1–5 are complete.
 
-1. **Daemon minimum on devbox.** Add `actionq-daemon` entrypoint, Python poll loop, signal handling, session ids, state file, session lifecycle events, and fake-runner support. Keep one active session at a time. Update systemd unit to run the daemon. No multi-harness yet; existing Claude/fake path still works.
+1. **Daemon minimum on devbox.** ✅ Done. `actionq-daemon` entrypoint, Python poll loop, signal handling (SIGTERM/SIGINT/SIGHUP), session ids, state file, session lifecycle events (dispatch/started/heartbeat/paused/exited), and fake-runner support. One active session at a time. Systemd unit updated to the long-running daemon form.
 
-2. **Session events and recovery hardening.** Add `session.heartbeat`, `session.exited`, stale state startup recovery, clear handoff file conventions, and tests around daemon crash plus `actionctl sweep`. Preserve existing `dispatcher-once` behavior.
+2. **Session events and recovery hardening.** ✅ Done. `session.heartbeat`, `session.exited`, stale state startup recovery, daemon crash plus `actionctl sweep` tests. Existing `dispatcher-once` behavior preserved.
 
-3. **Sprintctl takeup side effects.** Add `SprintctlClient.takeup_take/release`, config gates for remote-only mode, failure handling, and tests with command fakes. Validate against Workstream A's shipped `sprintctl takeup` CLI.
+3. **Sprintctl takeup side effects.** ✅ Done. `SprintctlClient.takeup_take()` and `takeup_release()` in `clients.py`. `[global.sprintctl_takeup]` config. Wired into `_dispatch_and_run`. Remote-mode detection via `SPRINTCTL_BACKEND=remote`. Tests in `test_daemon.py`.
 
-4. **Auditctl publisher.** Add auditctl client wrapper and lifecycle emission. Default to best-effort with actionq-visible failure metadata. Test command construction and failure modes.
+4. **Auditctl publisher — core lifecycle.** ✅ Done. `AuditctlClient` in `clients.py`, `[global.audit]` config, all call sites in `_dispatch_and_run`, `session.exited` payload audit fields. Full test surface in `test_audit.py` including `pr.open`/`pr.merge`.
 
-5. **Harness routing config.** Add `[harnesses]`, project defaults, action-kind defaults, deterministic routing module, compatibility with `runner="local"`, and rejection for unresolved routing.
+5. **Harness routing config.** ✅ Done. `HarnessConfig` dataclass, `[harnesses.*]` config parsing, `default_harness`/`default_model` on `ProjectConfig` and `ActionConfig`. `routing.py` with `resolve_routing()` implementing the priority chain (action-explicit > project-default > action-kind-default > global-fallback). `RoutingError` rejects with `validator="harness-routing"`. `runner="local"` compatibility → `"claude"`. `ClientError` import fix in `daemon.py`. `dispatch_payload(routing_source=...)` wired. 14 tests in `test_routing.py`.
 
-6. **Claude harness adapter extraction.** Move current Claude invocation behind the common harness interface while keeping behavior equivalent. Verify one real Claude disposable action.
+6. **Actionq-daemon publisher integration — full event set.** Complete the auditctl event coverage specified in the auditctl Workstream D plan. After a session exits with `outcome=completed`, query `gh pr view --json number,state,headRefName` against the session's branch in the project path; emit `pr.open` as an auditctl event if a PR exists for the branch. Emit `pr.merge` if the PR state is `MERGED` at exit time. For sessions without a PR at exit, emit nothing for pr events. This validates the full actionq-daemon publisher set from Workstream D: `dispatch.queued`, `dispatch.started`, `session.start`, `session.pause`, `session.resume`, `session.exit`, `pr.open`, `pr.merge`. Depends on steps 4 and 5.
 
-7. **Codex and OpenCode/Codestral adapters.** Add noninteractive command mapping, env handling, transcript capture, timeout handling, and fakeable tests. Real smoke each adapter with a disposable low-risk action.
+7. **Claude harness adapter extraction.** Move current Claude invocation from `daemon._start_harness()` behind the common harness adapter interface while keeping behavior equivalent. Verify one real Claude disposable action.
 
-8. **Copilot CLI adapter.** Add only after confirming the installed CLI has a usable noninteractive mode and auth path in devbox. If it does not, keep the harness configured as unsupported and reject with a clear message.
+8. **Codex and OpenCode/Codestral adapters.** Add noninteractive command mapping, env handling, transcript capture, timeout handling, and fakeable tests. Real smoke each adapter with a disposable low-risk action.
 
-9. **Actionq routing metadata extension.** Add first-class `--harness` and `--model` support to `actionctl add`, claim output, and action display. Until this step lands, routing is config-only.
+9. **Copilot CLI adapter.** Add only after confirming the installed CLI has a usable noninteractive mode and auth path in devbox. If it does not, keep the harness configured as unsupported and reject with a clear message.
 
-10. **Pause/resume C-minimum.** Implement usage-limit detection as checkpoint-and-fail with `session.paused`, handoff file, and re-dispatch context. Do not claim native pause support until a harness-specific implementation is proven.
+10. **Actionq routing metadata extension.** Add first-class `--harness` and `--model` support to `actionctl add`, claim output, and action display. Until this step lands, routing is config-only.
 
-11. **Optional LISTEN/NOTIFY wakeup.** Add only if poll latency is annoying. It must wake the same claim loop and not replace `actionctl claim`.
+11. **Pause/resume C-minimum.** Implement usage-limit detection as checkpoint-and-fail with `session.paused`, handoff file, and re-dispatch context. Do not claim native pause support until a harness-specific implementation is proven.
 
-At the end of step 4, the daemon satisfies the substrate contract for devbox-mediated dispatch, session lifecycle visibility, sprint takeup, and audit emission using the existing actionq cluster queue. Steps 5 onward widen harness support and routing without changing the core wire protocol.
+12. **Optional LISTEN/NOTIFY wakeup.** Add only if poll latency is annoying. It must wake the same claim loop and not replace `actionctl claim`.
+
+At the end of step 4, the daemon emits core session lifecycle events into auditctl. At the end of step 6, the daemon satisfies the full publisher spec from the auditctl Workstream D plan. Steps 7 onward widen harness support and routing without changing the core wire protocol.
