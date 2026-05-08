@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "actionq"
-version = "0.1.0"
+version = "0.1.1"
 description = "Operational-domain action queue for deterministic agent dispatch"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -221,7 +221,37 @@ def events(ctx, since, event_type, action_id, limit, follow) -> None:
 
 
 @cli.command()
-@click.option("--type", "event_type", required=True, type=click.Choice(["coordinator_cycle", "coordinator_paused"]))
+@click.option("--project", default=None, help="Project key")
+@click.option("--active", "active_only", is_flag=True, default=False, help="Show only non-exited sessions")
+@click.option("--limit", default=100, type=int, show_default=True)
+@click.pass_context
+def sessions(ctx, project: str | None, active_only: bool, limit: int) -> None:
+    """Summarize daemon sessions from session.* coordinator events."""
+    with _connect() as conn:
+        rows = db.list_sessions(
+            conn,
+            _schema(ctx),
+            project=project,
+            active_only=active_only,
+            limit=limit,
+        )
+    _echo_json(rows)
+
+
+_EMIT_EVENT_TYPES = [
+    "coordinator_cycle",
+    "coordinator_paused",
+    "session.dispatch",
+    "session.started",
+    "session.heartbeat",
+    "session.paused",
+    "session.resumed",
+    "session.exited",
+]
+
+
+@cli.command()
+@click.option("--type", "event_type", required=True, type=click.Choice(_EMIT_EVENT_TYPES))
 @click.option("--action", "action_id", default=None, type=int)
 @click.option("--actor", default=None)
 @click.option("--payload", default="{}", help="JSON payload")

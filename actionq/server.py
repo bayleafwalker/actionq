@@ -1,6 +1,6 @@
 """actionq-server: thin HTTP facade over the actionq Postgres queue.
 
-Exposes POST /dispatch and GET /health. No external framework — stdlib only.
+Exposes GET /health, GET /sessions, POST /dispatch. No external framework — stdlib only.
 Routing: COCKPIT_ACTIONQ_SERVER_URL -> this server -> actionq pg.
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from . import db as _db
 
@@ -83,12 +84,28 @@ def _dispatch(payload: dict) -> dict:
     return action
 
 
+def _sessions(query_string: str) -> list:
+    params = parse_qs(query_string or "")
+    raw_active = params.get("active_only", ["false"])[0].lower()
+    active_only = raw_active in ("true", "1", "yes")
+    limit = min(int(params.get("limit", ["500"])[0]), 1000)
+    project = (params.get("project", [None])[0] or "").strip() or None
+    with _db.connect() as conn:
+        return _db.list_sessions(
+            conn,
+            _schema(),
+            project=project,
+            active_only=active_only,
+            limit=limit,
+        )
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         print(format % args, file=sys.stderr, flush=True)
 
     def _send_json(self, status: int, body: object) -> None:
-        data = json.dumps(body, default=str).encode()
+        data = json.dumps(body, default=_db.json_default).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -96,8 +113,17 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
             self._send_json(200, {"ok": True})
+        elif parsed.path == "/sessions":
+            try:
+                sessions = _sessions(parsed.query)
+            except Exception as exc:
+                print(f"sessions error: {exc}", file=sys.stderr, flush=True)
+                self._send_json(500, {"error": "internal server error"})
+                return
+            self._send_json(200, sessions)
         else:
             self._send_json(404, {"error": "not found"})
 

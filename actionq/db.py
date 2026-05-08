@@ -4,13 +4,21 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
 MAX_CHAIN_DEPTH = int(os.environ.get("ACTIONQ_MAX_CHAIN_DEPTH", "3"))
 DEFAULT_RATE_LIMIT_PER_HOUR = int(os.environ.get("ACTIONQ_RATE_LIMIT_PER_HOUR", "20"))
 SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SESSION_EVENT_TYPES = (
+    "session.dispatch",
+    "session.started",
+    "session.heartbeat",
+    "session.paused",
+    "session.resumed",
+    "session.exited",
+)
 
 
 class ActionQError(ValueError):
@@ -73,6 +81,166 @@ def parse_json(raw: str | None, *, default: Any) -> Any:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ActionQError(f"Invalid JSON: {exc}") from exc
+
+
+def _event_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    if payload is None:
+        return {}
+    if isinstance(payload, str):
+        parsed = parse_json(payload, default={})
+        if isinstance(parsed, dict):
+            return parsed
+    raise ActionQError(f"Unexpected event payload type: {type(payload)!r}")
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _session_deadline(heartbeat_at: Any, ttl_seconds: int | None) -> str | None:
+    if ttl_seconds is None:
+        return None
+    ts = _parse_timestamp(heartbeat_at)
+    if ts is None:
+        return None
+    return json_default(ts + timedelta(seconds=ttl_seconds))
+
+
+def summarize_sessions(
+    rows: list[dict[str, Any]],
+    *,
+    active_only: bool = False,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    sessions: dict[str, dict[str, Any]] = {}
+    ordered_ids: list[str] = []
+
+    for row in sorted(rows, key=lambda item: (item["timestamp"], item["id"])):
+        payload = _event_payload(row)
+        session_id = payload.get("session_id")
+        if not session_id:
+            continue
+
+        session = sessions.get(session_id)
+        if session is None:
+            session = {
+                "session_id": session_id,
+                "runtime_session_id": None,
+                "action_id": row.get("action_id"),
+                "daemon_id": None,
+                "action_type": None,
+                "project": None,
+                "target_ref": None,
+                "harness": None,
+                "model": None,
+                "worktree": None,
+                "branch": None,
+                "pid": None,
+                "started_at": None,
+                "heartbeat_at": None,
+                "last_heartbeat_at": None,
+                "ttl_seconds": None,
+                "deadline_at": None,
+                "heartbeat_age_seconds": None,
+                "exited_at": None,
+                "last_event_type": None,
+                "last_event_at": None,
+                "status": "dispatched",
+                "outcome": None,
+                "exit_code": None,
+                "claim": {
+                    "claim_id": None,
+                    "work_item_id": None,
+                    "claim_type": None,
+                },
+            }
+            sessions[session_id] = session
+            ordered_ids.append(session_id)
+
+        claim_payload = payload.get("claim")
+        if claim_payload is not None and not isinstance(claim_payload, dict):
+            raise ActionQError("session event claim payload must be an object when present")
+
+        session["action_id"] = row.get("action_id") or session["action_id"]
+        session["last_event_type"] = row["event_type"]
+        session["last_event_at"] = row["timestamp"]
+        session["runtime_session_id"] = (
+            payload.get("runtime_session_id")
+            or session["runtime_session_id"]
+            or session_id
+        )
+        session["daemon_id"] = payload.get("daemon_id", session["daemon_id"])
+        session["action_type"] = payload.get("action_type", session["action_type"])
+        session["project"] = payload.get("project", session["project"])
+        session["target_ref"] = payload.get("target_ref", session["target_ref"])
+        session["harness"] = payload.get("harness", session["harness"])
+        session["model"] = payload.get("model", session["model"])
+        session["worktree"] = payload.get("worktree", session["worktree"])
+        session["branch"] = payload.get("branch", session["branch"])
+        session["pid"] = payload.get("pid", session["pid"])
+        session["started_at"] = payload.get("started_at", session["started_at"])
+        ttl_seconds = payload.get("ttl_seconds")
+        session["ttl_seconds"] = ttl_seconds if ttl_seconds is not None else session["ttl_seconds"]
+        if claim_payload:
+            session["claim"]["claim_id"] = claim_payload.get("claim_id", session["claim"]["claim_id"])
+            session["claim"]["work_item_id"] = claim_payload.get(
+                "work_item_id", session["claim"]["work_item_id"]
+            )
+            session["claim"]["claim_type"] = claim_payload.get(
+                "claim_type", session["claim"]["claim_type"]
+            )
+
+        if row["event_type"] == "session.dispatch":
+            session["status"] = "dispatched"
+            session["heartbeat_at"] = row["timestamp"]
+        elif row["event_type"] == "session.started":
+            session["status"] = "running"
+            session["heartbeat_at"] = row["timestamp"]
+        elif row["event_type"] == "session.heartbeat":
+            session["status"] = payload.get("status", "running")
+            session["heartbeat_at"] = row["timestamp"]
+            session["last_heartbeat_at"] = row["timestamp"]
+        elif row["event_type"] == "session.paused":
+            session["status"] = "paused"
+            session["heartbeat_at"] = row["timestamp"]
+        elif row["event_type"] == "session.resumed":
+            session["status"] = "running"
+            session["heartbeat_at"] = row["timestamp"]
+        elif row["event_type"] == "session.exited":
+            session["status"] = "exited"
+            session["outcome"] = payload.get("outcome")
+            session["exit_code"] = payload.get("exit_code")
+            session["exited_at"] = row["timestamp"]
+            session["heartbeat_at"] = row["timestamp"]
+
+        if session["ttl_seconds"] is not None:
+            last_seen_at = session["heartbeat_at"] or session["started_at"] or session["last_event_at"]
+            session["deadline_at"] = _session_deadline(last_seen_at, int(session["ttl_seconds"]))
+
+    summarized = [sessions[session_id] for session_id in ordered_ids]
+    summarized.sort(key=lambda item: (item["last_event_at"], item["session_id"]), reverse=True)
+
+    now = datetime.now(timezone.utc)
+    for session in summarized:
+        heartbeat_at = session["last_heartbeat_at"] or session["heartbeat_at"] or session["started_at"]
+        heartbeat_ts = _parse_timestamp(heartbeat_at)
+        if heartbeat_ts is not None:
+            session["heartbeat_age_seconds"] = max(int((now - heartbeat_ts).total_seconds()), 0)
+
+    if active_only:
+        summarized = [item for item in summarized if item["status"] != "exited"]
+    return summarized[:limit]
 
 
 def migrate(conn, schema: str) -> None:
@@ -534,3 +702,30 @@ def follow_events(conn, schema: str, *, event_type: str | None, action_id: int |
             last_id = row["id"]
             yield dict(row)
         time.sleep(1)
+
+
+def list_sessions(
+    conn,
+    schema: str,
+    *,
+    project: str | None = None,
+    active_only: bool = False,
+    limit: int = 100,
+) -> list[dict]:
+    clauses = [f"event_type = ANY(%s)"]
+    params: list[Any] = [list(SESSION_EVENT_TYPES)]
+    if project:
+        clauses.append("payload->>'project' = %s")
+        params.append(project)
+
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM {qname(schema, "events")}
+        WHERE {" AND ".join(clauses)}
+        ORDER BY timestamp DESC, id DESC
+        LIMIT %s
+        """,
+        (*params, max(limit * 20, limit)),
+    ).fetchall()
+    return summarize_sessions([dict(row) for row in rows], active_only=active_only, limit=limit)
