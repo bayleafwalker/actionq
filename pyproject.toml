@@ -38,6 +38,7 @@ Issues = "https://github.com/bayleafwalker/actionq/issues"
 
 [project.scripts]
 actionctl = "actionq.cli:cli"
+actionq-server = "actionq.server:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
