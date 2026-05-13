@@ -453,6 +453,140 @@ def list_actions(
     return [dict(row) for row in rows]
 
 
+def _json_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        parsed = parse_json(value, default=[])
+        if isinstance(parsed, list):
+            return parsed
+    return []
+
+
+def summarize_dispatches(actions: list[dict[str, Any]], event_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events_by_action: dict[int, list[dict[str, Any]]] = {}
+    for row in event_rows:
+        action_id = row.get("action_id")
+        if action_id is None:
+            continue
+        events_by_action.setdefault(int(action_id), []).append(row)
+
+    sessions = summarize_sessions(event_rows, active_only=False, limit=max(len(event_rows), 1))
+    sessions_by_action: dict[int, list[dict[str, Any]]] = {}
+    for session in sessions:
+        action_id = session.get("action_id")
+        if action_id is None:
+            continue
+        sessions_by_action.setdefault(int(action_id), []).append(session)
+
+    dispatches: list[dict[str, Any]] = []
+    for action in actions:
+        action_id = int(action["id"])
+        action_events = sorted(
+            events_by_action.get(action_id, []),
+            key=lambda item: (item["timestamp"], item["id"]),
+        )
+        requested_payload: dict[str, Any] = {}
+        for event in action_events:
+            if event["event_type"] == "dispatch.requested":
+                requested_payload = _event_payload(event)
+
+        action_sessions = sorted(
+            sessions_by_action.get(action_id, []),
+            key=lambda item: (item.get("last_event_at") or "", item.get("session_id") or ""),
+            reverse=True,
+        )
+        source_refs = _json_list(action.get("source_refs"))
+        dispatch_group_id = (
+            requested_payload.get("dispatch_group_id")
+            or requested_payload.get("group_id")
+            or action.get("dispatch_group_id")
+        )
+        dispatches.append(
+            {
+                "id": action_id,
+                "action_type": action["action_type"],
+                "kind": requested_payload.get("kind") or action["action_type"],
+                "output_expectation": requested_payload.get("output_expectation"),
+                "project": action.get("project"),
+                "target_ref": action.get("target_ref"),
+                "source_refs": source_refs,
+                "status": action["status"],
+                "priority": int(action["priority"]),
+                "created_at": action["created_at"],
+                "claimed_at": action.get("claimed_at"),
+                "completed_at": action.get("completed_at"),
+                "claimed_by": action.get("claimed_by"),
+                "result_ref": action.get("result_ref"),
+                "failure_reason": action.get("failure_reason"),
+                "parent_id": action.get("parent_id"),
+                "chain_depth": int(action.get("chain_depth") or 0),
+                "dispatch_group_id": dispatch_group_id,
+                "sprint_id": requested_payload.get("sprint_id"),
+                "title": requested_payload.get("title"),
+                "harness": requested_payload.get("harness"),
+                "model": requested_payload.get("model"),
+                "session": action_sessions[0] if action_sessions else None,
+                "audit_refs": [ref for ref in source_refs if isinstance(ref, str) and ref.startswith("ad:")],
+            }
+        )
+
+    dispatches.sort(
+        key=lambda item: (
+            item["created_at"],
+            item["id"],
+        ),
+        reverse=True,
+    )
+    return dispatches
+
+
+def list_dispatches(
+    conn,
+    schema: str,
+    *,
+    project: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    clauses = []
+    params: list[Any] = []
+    if project:
+        clauses.append("project = %s")
+        params.append(project)
+    if status:
+        clauses.append("status = %s")
+        params.append(status)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    actions = conn.execute(
+        f"""
+        SELECT *
+        FROM {qname(schema, "actions")}
+        {where}
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (*params, limit),
+    ).fetchall()
+    action_rows = [dict(row) for row in actions]
+    if not action_rows:
+        return []
+
+    action_ids = [row["id"] for row in action_rows]
+    events = conn.execute(
+        f"""
+        SELECT *
+        FROM {qname(schema, "events")}
+        WHERE action_id = ANY(%s)
+        ORDER BY timestamp ASC, id ASC
+        """,
+        (action_ids,),
+    ).fetchall()
+    return summarize_dispatches(action_rows, [dict(row) for row in events])
+
+
 def action_events(conn, schema: str, action_id: int) -> list[dict]:
     rows = conn.execute(
         f"""

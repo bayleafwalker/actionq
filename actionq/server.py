@@ -1,6 +1,6 @@
 """actionq-server: thin HTTP facade over the actionq Postgres queue.
 
-Exposes GET /health, GET /sessions, POST /dispatch. No external framework — stdlib only.
+Exposes GET /health, GET /sessions, GET /dispatches, POST /dispatch. No external framework — stdlib only.
 Routing: COCKPIT_ACTIONQ_SERVER_URL -> this server -> actionq pg.
 """
 from __future__ import annotations
@@ -68,10 +68,13 @@ def _dispatch(payload: dict) -> dict:
         )
         meta: dict = {
             "title": title,
+            "kind": kind,
+            "output_expectation": (payload.get("output_expectation") or "").strip() or None,
             "harness": (payload.get("harness") or "").strip() or None,
             "model": (payload.get("model") or "").strip() or None,
             "prompt": (payload.get("prompt") or "").strip() or None,
             "sprint_id": payload.get("sprint_id"),
+            "dispatch_group_id": (payload.get("dispatch_group_id") or "").strip() or None,
         }
         _db.insert_event(
             conn,
@@ -100,6 +103,21 @@ def _sessions(query_string: str) -> list:
         )
 
 
+def _dispatches(query_string: str) -> list:
+    params = parse_qs(query_string or "")
+    limit = min(int(params.get("limit", ["100"])[0]), 500)
+    project = (params.get("project", [None])[0] or "").strip() or None
+    status = (params.get("status", [None])[0] or "").strip() or None
+    with _db.connect() as conn:
+        return _db.list_dispatches(
+            conn,
+            _schema(),
+            project=project,
+            status=status,
+            limit=limit,
+        )
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         print(format % args, file=sys.stderr, flush=True)
@@ -124,6 +142,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": "internal server error"})
                 return
             self._send_json(200, sessions)
+        elif parsed.path == "/dispatches":
+            try:
+                dispatches = _dispatches(parsed.query)
+            except Exception as exc:
+                print(f"dispatches error: {exc}", file=sys.stderr, flush=True)
+                self._send_json(500, {"error": "internal server error"})
+                return
+            self._send_json(200, dispatches)
         else:
             self._send_json(404, {"error": "not found"})
 
