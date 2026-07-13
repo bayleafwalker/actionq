@@ -1,0 +1,32 @@
+{
+  "schema_version": "test-context/v1",
+  "id": "actionq.action.claim-concurrency",
+  "owner_repo": "actionq",
+  "subject": "action",
+  "contract_ref": {
+    "doc_id": "actionq.action-lifecycle",
+    "revision": "sha256:a9f18996ea50d8348f56544fa3f22664ae30029b03d644bd71e27089156c8d2f"
+  },
+  "source_of_truth": "postgres-actions-row",
+  "depth": 2,
+  "backends": ["postgres"],
+  "actors": ["worker-a", "worker-b", "sweeper"],
+  "initial_state": ["one action is pending", "claimed_by is null", "claim_deadline is null"],
+  "operations": [
+    { "name": "claim", "actors": ["worker-a", "worker-b"], "synchronization": "barrier-before-claim-statement" },
+    { "name": "sweep", "actors": ["sweeper"], "synchronization": "barrier-after-expiry-before-row-lock" },
+    { "name": "complete", "actors": ["worker-a", "worker-b"], "synchronization": "barrier-before-terminal-update" }
+  ],
+  "consistency": { "target": "linearizable", "object": "claim-selection-per-action" },
+  "assumptions": { "isolation": "postgres-read-committed", "clock": "database-clock", "fairness": "none" },
+  "bounds": { "actors": 3, "actions": 2, "histories": 500 },
+  "invariants": [
+    "at-most-one-completed-claim-per-action-incarnation",
+    "action-and-lifecycle-event-commit-together",
+    "terminal-state-does-not-transition-again"
+  ],
+  "faults": ["crash-after-commit-before-response", "claim-expiry-before-worker-response", "sweep-races-terminal-update"],
+  "oracles": ["reference-model", "completed-operation-history", "database-invariant-query"],
+  "implementation_anchors": ["actionq/db.py:claim", "actionq/db.py:sweep", "actionq/db.py:_transition_terminal"],
+  "expansions": ["semantic-doc", "stateful-test", "concurrent-history", "formal-model-config", "fault-scenario"]
+}
