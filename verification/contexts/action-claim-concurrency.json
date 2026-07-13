@@ -5,7 +5,7 @@
   "subject": "action",
   "contract_ref": {
     "doc_id": "actionq.action-lifecycle",
-    "revision": "sha256:509ccb9da3338109e4a21dfd9bae2bafd5fcb7c0fef2b1fd0b1127041c044f4d"
+    "revision": "sha256:a9f18996ea50d8348f56544fa3f22664ae30029b03d644bd71e27089156c8d2f"
   },
   "source_of_truth": "postgres-actions-row",
   "depth": 2,

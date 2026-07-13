@@ -1,7 +1,7 @@
 ---
 doc_id: actionq.action-lifecycle
 status: draft
-supersedes: []
+supersedes: null
 ---
 
 # Action lifecycle protocol
