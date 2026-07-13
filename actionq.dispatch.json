@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "repo_id": "actionq",
+  "adoption_level": "guidance-only",
+  "routing": {
+    "default_harness": "codex",
+    "default_model_alias": "fast-build",
+    "action_classes": {
+      "plan": { "enabled": true, "model_alias": "frontier-plan" },
+      "build": { "enabled": true, "model_alias": "fast-build", "review_required": true },
+      "review": { "enabled": true, "model_alias": "review-synthesis" },
+      "verify": { "enabled": true, "model_alias": "review-synthesis", "review_required": true },
+      "reconcile": { "enabled": true, "model_alias": "review-synthesis" }
+    }
+  },
+  "skills": {
+    "template_root": "/projects/dev/agentops/templates/dispatch/skills",
+    "selected": [
+      "dispatch-plan",
+      "dispatch-build",
+      "dispatch-review",
+      "code-change-verification",
+      "verify-state-protocols",
+      "reconcile-project-contracts"
+    ],
+    "overlays": [".agents/overlays/actionq.state-protocols.md"]
+  },
+  "scope": {
+    "allowed_path_roots": ["actionq/", "tests/", "docs/", "verification/", ".agents/"],
+    "out_of_scope": ["production queue mutation during verification unless explicitly authorized"]
+  },
+  "risk_surfaces": [
+    {
+      "id": "action-lifecycle",
+      "paths": ["actionq/**", "actionq/migrations/**", "tests/test_integration_postgres.py"],
+      "skills": ["verify-state-protocols", "reconcile-project-contracts"],
+      "default_depth": 2,
+      "required_on_change": true
+    }
+  ],
+  "verification": {
+    "command_families": ["unit", "integration", "docs", "full-suite"],
+    "targeted_first": true,
+    "commands": [
+      "uv run pytest <specific-test-files> -x --tb=short",
+      "ACTIONQ_TEST_URL=<test-url> uv run pytest tests/test_integration_postgres.py -q"
+    ]
+  },
+  "hooks": {
+    "level": "verification",
+    "publishers": ["git", "dispatcher-gate"]
+  }
+}
