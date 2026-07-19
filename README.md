@@ -116,6 +116,29 @@ Priority is ascending, so smaller numbers are claimed first.
 | `actionctl events` | Read the event log, optionally filtered or tailed. |
 | `actionctl emit` | Emit coordinator events without direct SQL writes. |
 
+## Daemon minimum
+
+`actionq-daemon` is the actionq-owned, long-running coordinator. It uses only
+the public `actionctl` commands to claim work, emit `session.*` events, and
+settle actions. The current minimum is deliberately single-session and supports
+the fake runner for disposable verification; it does not import
+`actionq-dispatch` at runtime.
+
+Start from [examples/actionq-daemon.toml](examples/actionq-daemon.toml), then:
+
+```bash
+mkdir -p ~/.config/actionq
+cp examples/actionq-daemon.toml ~/.config/actionq/config.toml
+actionq-daemon --config ~/.config/actionq/config.toml
+```
+
+For user-systemd operation, install
+`ops/systemd/actionq-daemon.service`, reload the user manager, and start the
+unit. `SIGTERM` and `SIGINT` stop after a bounded child grace period; `SIGHUP`
+reloads configuration between child sessions. The daemon checks the legacy
+`~/.config/actionq-dispatcher/config.toml` only when no explicit `--config` is
+provided, so existing operators retain a visible migration path.
+
 All state-changing commands return JSON records that are designed to be machine-consumable.
 
 ## Data Model

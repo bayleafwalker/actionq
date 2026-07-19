@@ -1,0 +1,14 @@
+[Unit]
+Description=actionq daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/actionq-daemon --config %h/.config/actionq/config.toml
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

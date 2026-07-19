@@ -1,0 +1,16 @@
+# C-minimum daemon configuration. Keep this at ~/.config/actionq/config.toml
+# on devbox, with ACTIONQ_URL supplied through the environment.
+[global]
+poll_interval_seconds = 30
+heartbeat_interval_seconds = 60
+graceful_shutdown_seconds = 30
+default_timeout_minutes = 30
+session_state_path = "~/.local/state/actionq/sessions.json"
+pause_file = "~/.local/state/actionq/PAUSED"
+actionctl_bin = "actionctl"
+
+# The daemon minimum executes only the fake runner. Harness routing and the
+# compatibility dispatcher's worktree/gate pipeline land in later #969 slices.
+[actions.scope-iterate]
+runner = "fake"
+fake_duration_seconds = 1
