@@ -58,3 +58,14 @@ def test_pause_file_prevents_claim(tmp_path: Path):
 
     assert daemon.run_once() is False
     assert client.claims == []
+    assert client.events[0][0] == "coordinator_paused"
+
+
+def test_unconfigured_action_fails_without_starting_child(tmp_path: Path):
+    client = FakeClient({"id": 8, "action_type": "unsupported"})
+    daemon = Daemon(DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED"), {}, client)
+
+    assert daemon.run_once() is True
+    assert client.events == []
+    assert client.completed == []
+    assert client.failed[0][0] == 8

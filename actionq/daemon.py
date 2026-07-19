@@ -61,7 +61,7 @@ class SessionRecord:
 
 class CoordinatorClient(Protocol):
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None: ...
-    def emit(self, event_type: str, *, action_id: int, actor: str, payload: dict[str, Any]) -> None: ...
+    def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None: ...
     def complete(self, action_id: int, *, result_ref: str, actor: str) -> None: ...
     def fail(self, action_id: int, *, reason: str, actor: str) -> None: ...
 
@@ -84,9 +84,11 @@ class ActionctlClient:
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None:
         return self._run("claim", "--worker", worker, "--timeout", str(timeout_minutes), allow_empty=True)
 
-    def emit(self, event_type: str, *, action_id: int, actor: str, payload: dict[str, Any]) -> None:
-        self._run("emit", "--type", event_type, "--action", str(action_id), "--actor", actor,
-                  "--payload", json.dumps(payload, sort_keys=True))
+    def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None:
+        args = ["emit", "--type", event_type, "--actor", actor, "--payload", json.dumps(payload, sort_keys=True)]
+        if action_id is not None:
+            args.extend(["--action", str(action_id)])
+        self._run(*args)
 
     def complete(self, action_id: int, *, result_ref: str, actor: str) -> None:
         self._run("complete", str(action_id), "--result", result_ref, "--actor", actor)
@@ -152,6 +154,12 @@ class Daemon:
 
     def run_once(self) -> bool:
         if self.config.pause_file.exists():
+            self.client.emit(
+                "coordinator_paused",
+                action_id=None,
+                actor=self.actor,
+                payload={"daemon_id": self.daemon_id, "pause_file": str(self.config.pause_file)},
+            )
             return False
         action = self.client.claim(self.actor, self.config.default_timeout_minutes)
         if action is None:
@@ -162,7 +170,10 @@ class Daemon:
     def _run_action(self, action: dict[str, Any]) -> None:
         action_id = int(action["id"])
         action_type = str(action["action_type"])
-        action_config = self.actions.get(action_type, ActionConfig())
+        action_config = self.actions.get(action_type)
+        if action_config is None:
+            self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.actor)
+            return
         session_id = f"aqs:{uuid.uuid4()}"
         payload = {
             "session_id": session_id, "runtime_session_id": session_id,
