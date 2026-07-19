@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
-from actionq.daemon import ActionConfig, Daemon, DaemonConfig
+from actionq.daemon import ActionConfig, Daemon, DaemonConfig, load_config
 
 
 class FakeClient:
@@ -12,6 +13,7 @@ class FakeClient:
         self.events = []
         self.completed = []
         self.failed = []
+        self.started = threading.Event()
 
     def claim(self, worker, timeout_minutes):
         self.claims.append((worker, timeout_minutes))
@@ -20,6 +22,8 @@ class FakeClient:
 
     def emit(self, event_type, *, action_id, actor, payload):
         self.events.append((event_type, action_id, actor, payload))
+        if event_type == "session.started":
+            self.started.set()
 
     def complete(self, action_id, *, result_ref, actor):
         self.completed.append((action_id, result_ref, actor))
@@ -69,3 +73,44 @@ def test_unconfigured_action_fails_without_starting_child(tmp_path: Path):
     assert client.events == []
     assert client.completed == []
     assert client.failed[0][0] == 8
+
+
+def test_shutdown_pauses_child_then_records_shutdown_outcome(tmp_path: Path):
+    client = FakeClient({"id": 9, "action_type": "scope-iterate"})
+    daemon = Daemon(
+        DaemonConfig(
+            graceful_shutdown_seconds=0.01,
+            session_state_path=tmp_path / "state.json",
+            pause_file=tmp_path / "PAUSED",
+        ),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=10)},
+        client,
+    )
+    worker = threading.Thread(target=daemon.run_once)
+    worker.start()
+    assert client.started.wait(timeout=2)
+    daemon.request_shutdown()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert [event[0] for event in client.events][-2:] == ["session.paused", "session.exited"]
+    assert client.events[-1][3]["outcome"] == "shutdown"
+    assert client.failed[0][0] == 9
+
+
+def test_load_config_reads_daemon_and_action_settings(tmp_path: Path):
+    config_path = tmp_path / "daemon.toml"
+    config_path.write_text(
+        "[global]\n"
+        "poll_interval_seconds = 5\n"
+        "session_state_path = 'state.json'\n"
+        "[actions.scope-iterate]\n"
+        "runner = 'fake'\n"
+        "fake_duration_seconds = 2\n"
+    )
+
+    config, actions = load_config(config_path)
+
+    assert config.poll_interval_seconds == 5
+    assert config.session_state_path == Path("state.json")
+    assert actions["scope-iterate"].fake_duration_seconds == 2

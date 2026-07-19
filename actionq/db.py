@@ -67,6 +67,8 @@ def connect(url: str | None = None):
 def json_default(value: Any) -> str:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
     return str(value)
 
 

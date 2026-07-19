@@ -35,6 +35,11 @@ def test_json_default_serializes_plain_values():
     assert payload == {"x": 1}
 
 
+def test_json_default_decodes_postgres_text_bytes():
+    payload = json.loads(db.to_json({"text": b"scope-iterate"}))
+    assert payload == {"text": "scope-iterate"}
+
+
 def _ts(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
