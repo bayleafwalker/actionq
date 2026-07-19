@@ -247,6 +247,7 @@ _EMIT_EVENT_TYPES = [
     "session.paused",
     "session.resumed",
     "session.exited",
+    "session.end-inferred",
 ]
 
 

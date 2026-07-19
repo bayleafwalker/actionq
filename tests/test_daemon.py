@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import threading
 
-from actionq.daemon import ActionConfig, Daemon, DaemonConfig, load_config
+from actionq.daemon import ActionConfig, Daemon, DaemonConfig, SessionRecord, load_config
 
 
 class FakeClient:
@@ -49,6 +50,7 @@ def test_fake_action_emits_lifecycle_and_clears_state(tmp_path: Path):
     assert event_types[-1] == "session.exited"
     session_id = client.events[0][3]["session_id"]
     assert all(event[3]["session_id"] == session_id for event in client.events)
+    assert client.events[0][3]["ttl_seconds"] == 1800
     assert client.completed and client.completed[0][0] == 7
     assert not client.failed
     assert config.session_state_path.read_text() == "{}"
@@ -114,3 +116,56 @@ def test_load_config_reads_daemon_and_action_settings(tmp_path: Path):
     assert config.poll_interval_seconds == 5
     assert config.session_state_path == Path("state.json")
     assert actions["scope-iterate"].fake_duration_seconds == 2
+
+
+def test_stale_state_emits_one_inferred_end_then_clears(tmp_path: Path):
+    client = FakeClient()
+    config = DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED")
+    daemon = Daemon(config, {}, client)
+    daemon._write_state(
+        SessionRecord(
+            session_id="aqs:stale",
+            runtime_session_id="aqs:stale",
+            daemon_id="old-daemon",
+            action_id=12,
+            action_type="scope-iterate",
+            project="demo",
+            target_ref="42",
+            runner="fake",
+            pid=99999999,
+            started_at="2026-07-19T00:00:00Z",
+            updated_at="2026-07-19T00:00:01Z",
+        )
+    )
+
+    assert daemon.run_once() is False
+    assert client.events[0][0] == "session.end-inferred"
+    assert client.events[0][1] == 12
+    assert config.session_state_path.read_text() == "{}"
+    assert daemon.run_once() is False
+    assert [event[0] for event in client.events].count("session.end-inferred") == 1
+
+
+def test_live_state_blocks_a_second_claim_after_restart(tmp_path: Path):
+    client = FakeClient({"id": 13, "action_type": "scope-iterate"})
+    config = DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED")
+    daemon = Daemon(config, {}, client)
+    daemon._write_state(
+        SessionRecord(
+            session_id="aqs:live",
+            runtime_session_id="aqs:live",
+            daemon_id="old-daemon",
+            action_id=12,
+            action_type="scope-iterate",
+            project="demo",
+            target_ref="42",
+            runner="fake",
+            pid=os.getpid(),
+            started_at="2026-07-19T00:00:00Z",
+            updated_at="2026-07-19T00:00:01Z",
+        )
+    )
+
+    assert daemon.run_once() is False
+    assert client.claims == []
+    assert config.session_state_path.read_text() != "{}"

@@ -18,6 +18,7 @@ SESSION_EVENT_TYPES = (
     "session.paused",
     "session.resumed",
     "session.exited",
+    "session.end-inferred",
 )
 
 
@@ -98,6 +99,10 @@ def _event_payload(row: dict[str, Any]) -> dict[str, Any]:
     raise ActionQError(f"Unexpected event payload type: {type(payload)!r}")
 
 
+def _text(value: Any) -> Any:
+    return value.decode("utf-8") if isinstance(value, bytes) else value
+
+
 def _parse_timestamp(value: Any) -> datetime | None:
     if not value:
         return None
@@ -175,7 +180,8 @@ def summarize_sessions(
             raise ActionQError("session event claim payload must be an object when present")
 
         session["action_id"] = row.get("action_id") or session["action_id"]
-        session["last_event_type"] = row["event_type"]
+        event_type = _text(row["event_type"])
+        session["last_event_type"] = event_type
         session["last_event_at"] = row["timestamp"]
         session["runtime_session_id"] = (
             payload.get("runtime_session_id")
@@ -203,23 +209,23 @@ def summarize_sessions(
                 "claim_type", session["claim"]["claim_type"]
             )
 
-        if row["event_type"] == "session.dispatch":
+        if event_type == "session.dispatch":
             session["status"] = "dispatched"
             session["heartbeat_at"] = row["timestamp"]
-        elif row["event_type"] == "session.started":
+        elif event_type == "session.started":
             session["status"] = "running"
             session["heartbeat_at"] = row["timestamp"]
-        elif row["event_type"] == "session.heartbeat":
+        elif event_type == "session.heartbeat":
             session["status"] = payload.get("status", "running")
             session["heartbeat_at"] = row["timestamp"]
             session["last_heartbeat_at"] = row["timestamp"]
-        elif row["event_type"] == "session.paused":
+        elif event_type == "session.paused":
             session["status"] = "paused"
             session["heartbeat_at"] = row["timestamp"]
-        elif row["event_type"] == "session.resumed":
+        elif event_type == "session.resumed":
             session["status"] = "running"
             session["heartbeat_at"] = row["timestamp"]
-        elif row["event_type"] == "session.exited":
+        elif event_type in {"session.exited", "session.end-inferred"}:
             session["status"] = "exited"
             session["outcome"] = payload.get("outcome")
             session["exit_code"] = payload.get("exit_code")

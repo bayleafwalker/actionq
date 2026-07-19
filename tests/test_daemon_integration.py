@@ -8,7 +8,7 @@ import uuid
 import pytest
 
 from actionq import db
-from actionq.daemon import ActionConfig, ActionctlClient, Daemon, DaemonConfig
+from actionq.daemon import ActionConfig, ActionctlClient, Daemon, DaemonConfig, SessionRecord
 
 
 pytestmark = pytest.mark.skipif(
@@ -63,3 +63,34 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
     ]
     assert "session.heartbeat" in event_types
     assert event_types[-2:] == ["session.exited", "action_completed"]
+
+    recovery = Daemon(
+        DaemonConfig(
+            session_state_path=tmp_path / "stale.json",
+            pause_file=tmp_path / "PAUSED",
+            actionctl_bin=str(actionctl),
+        ),
+        {},
+        ActionctlClient(str(actionctl)),
+    )
+    recovery._write_state(
+        SessionRecord(
+            session_id="aqs:stale",
+            runtime_session_id="aqs:stale",
+            daemon_id="old-daemon",
+            action_id=int(action["id"]),
+            action_type="scope-iterate",
+            project="demo",
+            target_ref="42",
+            runner="fake",
+            pid=99999999,
+            started_at="2026-07-19T00:00:00Z",
+            updated_at="2026-07-19T00:00:01Z",
+        )
+    )
+    assert recovery.recover_stale_state() is False
+    with db.connect() as conn:
+        sessions = db.list_sessions(conn, schema)
+    stale = next(session for session in sessions if session["session_id"] == "aqs:stale")
+    assert stale["status"] == "exited"
+    assert stale["outcome"] == "end-inferred"

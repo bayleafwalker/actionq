@@ -152,7 +152,67 @@ class Daemon:
         temporary.write_text(json.dumps(asdict(record) if record else {}, sort_keys=True), encoding="utf-8")
         temporary.replace(path)
 
+    def _read_state(self) -> SessionRecord | None:
+        path = self.config.session_state_path
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return SessionRecord(**payload) if payload else None
+        except (json.JSONDecodeError, TypeError):
+            # Preserve malformed state for operator inspection; it must not
+            # cause a daemon restart loop or authorize another claim.
+            return None
+
+    @staticmethod
+    def _pid_alive(pid: int | None) -> bool:
+        if pid is None or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def recover_stale_state(self) -> bool:
+        """Emit one inferred terminal event for a dead child from prior state.
+
+        The queue claim intentionally remains untouched; ``actionctl sweep``
+        owns requeueing after its lease deadline. Clearing state only after the
+        event succeeds makes ordinary restart recovery idempotent.
+        """
+        record = self._read_state()
+        if record is None:
+            return False
+        if self._pid_alive(record.pid):
+            return True
+        self.client.emit(
+            "session.end-inferred",
+            action_id=record.action_id,
+            actor=self.actor,
+            payload={
+                "session_id": record.session_id,
+                "runtime_session_id": record.runtime_session_id,
+                "daemon_id": self.daemon_id,
+                "action_id": record.action_id,
+                "action_type": record.action_type,
+                "project": record.project,
+                "pid": record.pid,
+                "started_at": record.started_at,
+                "exited_at": _now(),
+                "outcome": "end-inferred",
+                "exit_code": None,
+                "reason": "daemon-startup-stale-state",
+            },
+        )
+        self._write_state(None)
+        return False
+
     def run_once(self) -> bool:
+        if self.recover_stale_state():
+            return False
         if self.config.pause_file.exists():
             self.client.emit(
                 "coordinator_paused",
@@ -175,11 +235,13 @@ class Daemon:
             self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.actor)
             return
         session_id = f"aqs:{uuid.uuid4()}"
+        ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
         payload = {
             "session_id": session_id, "runtime_session_id": session_id,
             "daemon_id": self.daemon_id, "action_id": action_id,
             "action_type": action_type, "project": action.get("project"),
             "target_ref": action.get("target_ref"), "runner": action_config.runner,
+            "ttl_seconds": ttl_seconds,
         }
         self.client.emit("session.dispatch", action_id=action_id, actor=self.actor, payload=payload)
         record = SessionRecord(session_id, session_id, self.daemon_id, action_id, action_type,

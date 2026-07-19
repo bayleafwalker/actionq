@@ -40,6 +40,32 @@ def test_json_default_decodes_postgres_text_bytes():
     assert payload == {"text": "scope-iterate"}
 
 
+def test_sessions_reducer_treats_inferred_end_as_terminal():
+    rows = [
+        {
+            "id": 1,
+            "action_id": 7,
+            "event_type": "session.dispatch",
+            "actor": "daemon:test",
+            "timestamp": _ts("2026-07-19T08:00:00Z"),
+            "payload": {"session_id": "aqs:7", "ttl_seconds": 60},
+        },
+        {
+            "id": 2,
+            "action_id": 7,
+            "event_type": "session.end-inferred",
+            "actor": "daemon:test",
+            "timestamp": _ts("2026-07-19T08:02:00Z"),
+            "payload": {"session_id": "aqs:7", "outcome": "end-inferred"},
+        },
+    ]
+
+    sessions = db.summarize_sessions(rows)
+
+    assert sessions[0]["status"] == "exited"
+    assert sessions[0]["outcome"] == "end-inferred"
+
+
 def _ts(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
