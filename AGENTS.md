@@ -71,3 +71,7 @@ python /projects/dev/agentops/templates/dispatch/scripts/validate_verification_a
 
 Run the narrowest affected tests first. Exercise `actionctl migrate` only
 against an explicitly selected disposable schema or test database.
+
+<!-- agentops-project-pointer:start -->
+See `.agents/project.generated.md` for cross-repo project context (agentops-managed; do not hand-edit).
+<!-- agentops-project-pointer:end -->
