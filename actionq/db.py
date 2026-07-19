@@ -466,6 +466,8 @@ def _json_list(value: Any) -> list[Any]:
         return []
     if isinstance(value, list):
         return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
     if isinstance(value, str):
         parsed = parse_json(value, default=[])
         if isinstance(parsed, list):
@@ -498,7 +500,7 @@ def summarize_dispatches(actions: list[dict[str, Any]], event_rows: list[dict[st
         )
         requested_payload: dict[str, Any] = {}
         for event in action_events:
-            if event["event_type"] == "dispatch.requested":
+            if _text(event["event_type"]) == "dispatch.requested":
                 requested_payload = _event_payload(event)
 
         action_sessions = sorted(
@@ -515,20 +517,20 @@ def summarize_dispatches(actions: list[dict[str, Any]], event_rows: list[dict[st
         dispatches.append(
             {
                 "id": action_id,
-                "action_type": action["action_type"],
-                "kind": requested_payload.get("kind") or action["action_type"],
+                "action_type": _text(action["action_type"]),
+                "kind": requested_payload.get("kind") or _text(action["action_type"]),
                 "output_expectation": requested_payload.get("output_expectation"),
-                "project": action.get("project"),
-                "target_ref": action.get("target_ref"),
+                "project": _text(action.get("project")),
+                "target_ref": _text(action.get("target_ref")),
                 "source_refs": source_refs,
-                "status": action["status"],
+                "status": _text(action["status"]),
                 "priority": int(action["priority"]),
                 "created_at": action["created_at"],
                 "claimed_at": action.get("claimed_at"),
                 "completed_at": action.get("completed_at"),
-                "claimed_by": action.get("claimed_by"),
-                "result_ref": action.get("result_ref"),
-                "failure_reason": action.get("failure_reason"),
+                "claimed_by": _text(action.get("claimed_by")),
+                "result_ref": _text(action.get("result_ref")),
+                "failure_reason": _text(action.get("failure_reason")),
                 "parent_id": action.get("parent_id"),
                 "chain_depth": int(action.get("chain_depth") or 0),
                 "dispatch_group_id": dispatch_group_id,

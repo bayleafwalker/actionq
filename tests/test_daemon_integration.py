@@ -56,6 +56,7 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
     with db.connect() as conn:
         settled = db.get_action(conn, schema, int(action["id"]))
         events = db.action_events(conn, schema, int(action["id"]))
+        dispatches = db.list_dispatches(conn, schema)
     assert _text(settled["status"]) == "completed", repr(settled.get("failure_reason"))
     event_types = [_text(event["event_type"]) for event in events]
     assert event_types[:4] == [
@@ -63,6 +64,8 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
     ]
     assert "session.heartbeat" in event_types
     assert event_types[-2:] == ["session.exited", "action_completed"]
+    assert dispatches[0]["status"] == "completed"
+    assert dispatches[0]["session"]["status"] == "exited"
 
     recovery = Daemon(
         DaemonConfig(
