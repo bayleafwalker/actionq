@@ -27,6 +27,13 @@ def _now() -> str:
 
 
 @dataclass(frozen=True)
+class TakeupConfig:
+    enabled: bool = False
+    remote_only: bool = True
+    sprintctl_bin: str = "sprintctl"
+
+
+@dataclass(frozen=True)
 class DaemonConfig:
     poll_interval_seconds: float = 30.0
     heartbeat_interval_seconds: float = 60.0
@@ -35,6 +42,7 @@ class DaemonConfig:
     session_state_path: Path = Path("~/.local/state/actionq/sessions.json")
     pause_file: Path = Path("~/.local/state/actionq/PAUSED")
     actionctl_bin: str = "actionctl"
+    takeup: TakeupConfig = TakeupConfig()
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,13 @@ class ActionConfig:
     runner: str = "fake"
     timeout_minutes: int | None = None
     fake_duration_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class ProjectConfig:
+    path: Path
+    sprint_id: int | None = None
+    env: dict[str, str] | None = None
 
 
 @dataclass
@@ -64,6 +79,11 @@ class CoordinatorClient(Protocol):
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None: ...
     def complete(self, action_id: int, *, result_ref: str, actor: str) -> None: ...
     def fail(self, action_id: int, *, reason: str, actor: str) -> None: ...
+
+
+class TakeupClient(Protocol):
+    def take(self, project: ProjectConfig, *, session_id: str, actor: str, pid: int) -> dict[str, Any]: ...
+    def release(self, project: ProjectConfig, *, session_id: str, actor: str, reason: str) -> dict[str, Any]: ...
 
 
 class ActionctlClient:
@@ -97,11 +117,37 @@ class ActionctlClient:
         self._run("fail", str(action_id), "--reason", reason, "--actor", actor)
 
 
-def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig]]:
+class SprintctlTakeupClient:
+    def __init__(self, executable: str):
+        self.executable = executable
+
+    def _run(self, project: ProjectConfig, *args: str) -> dict[str, Any]:
+        environment = os.environ.copy()
+        environment.update(project.env or {})
+        completed = subprocess.run([self.executable, *args], cwd=project.path, env=environment,
+                                   text=True, capture_output=True, check=False, timeout=30)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl takeup failed"
+            raise RuntimeError(detail)
+        return json.loads(completed.stdout)
+
+    def take(self, project: ProjectConfig, *, session_id: str, actor: str, pid: int) -> dict[str, Any]:
+        assert project.sprint_id is not None
+        return self._run(project, "takeup", "take", "--sprint-id", str(project.sprint_id), "--actor", actor,
+                         "--runtime-session-id", session_id, "--instance-id", session_id, "--pid", str(pid), "--json")
+
+    def release(self, project: ProjectConfig, *, session_id: str, actor: str, reason: str) -> dict[str, Any]:
+        assert project.sprint_id is not None
+        return self._run(project, "takeup", "release", "--sprint-id", str(project.sprint_id), "--actor", actor,
+                         "--runtime-session-id", session_id, "--instance-id", session_id, "--reason", reason, "--json")
+
+
+def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict[str, ProjectConfig]]:
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     global_raw = raw.get("global", {})
     state_path = Path(global_raw.get("session_state_path", DaemonConfig.session_state_path)).expanduser()
     pause_file = Path(global_raw.get("pause_file", DaemonConfig.pause_file)).expanduser()
+    takeup_raw = global_raw.get("sprintctl_takeup", {})
     config = DaemonConfig(
         poll_interval_seconds=float(global_raw.get("poll_interval_seconds", 30)),
         heartbeat_interval_seconds=float(global_raw.get("heartbeat_interval_seconds", 60)),
@@ -110,6 +156,11 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig]]:
         session_state_path=state_path,
         pause_file=pause_file,
         actionctl_bin=str(global_raw.get("actionctl_bin", "actionctl")),
+        takeup=TakeupConfig(
+            enabled=bool(takeup_raw.get("enabled", False)),
+            remote_only=bool(takeup_raw.get("remote_only", True)),
+            sprintctl_bin=str(global_raw.get("sprintctl_bin", "sprintctl")),
+        ),
     )
     actions = {
         name: ActionConfig(
@@ -119,7 +170,15 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig]]:
         )
         for name, value in raw.get("actions", {}).items()
     }
-    return config, actions
+    projects = {
+        name: ProjectConfig(
+            path=Path(value["path"]).expanduser(),
+            sprint_id=(int(value["sprint_id"]) if "sprint_id" in value else None),
+            env={str(key): str(item) for key, item in value.get("env", {}).items()} or None,
+        )
+        for name, value in raw.get("projects", {}).items()
+    }
+    return config, actions, projects
 
 
 class Daemon:
@@ -128,9 +187,13 @@ class Daemon:
         config: DaemonConfig,
         actions: dict[str, ActionConfig],
         client: CoordinatorClient,
-        reload_config: Callable[[], tuple[DaemonConfig, dict[str, ActionConfig]]] | None = None,
+        projects: dict[str, ProjectConfig] | None = None,
+        takeup_client: TakeupClient | None = None,
+        reload_config: Callable[[], tuple[DaemonConfig, dict[str, ActionConfig], dict[str, ProjectConfig]]] | None = None,
     ):
         self.config, self.actions, self.client = config, actions, client
+        self.projects = projects or {}
+        self.takeup_client = takeup_client or SprintctlTakeupClient(config.takeup.sprintctl_bin)
         self.daemon_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
         self.actor = f"actionq-daemon:{self.daemon_id}"
         self._shutdown = False
@@ -235,6 +298,7 @@ class Daemon:
             self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.actor)
             return
         session_id = f"aqs:{uuid.uuid4()}"
+        project = self.projects.get(str(action.get("project") or ""))
         ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
         payload = {
             "session_id": session_id, "runtime_session_id": session_id,
@@ -250,11 +314,18 @@ class Daemon:
         try:
             self._child = self._start_child(action_config)
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
+            try:
+                takeup = self._takeup_take(project, session_id, record.pid)
+            except Exception:
+                os.killpg(self._child.pid, signal.SIGTERM)
+                self._child.wait()
+                raise
             self._write_state(record)
             self.client.emit("session.started", action_id=action_id, actor=self.actor,
-                             payload={**payload, "pid": record.pid, "started_at": record.started_at})
+                             payload={**payload, "pid": record.pid, "started_at": record.started_at, "sprint_takeup": takeup})
             outcome, exit_code = self._wait_for_child(action_id, payload, record)
-            exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now()}
+            released = self._takeup_release(project, session_id, f"session-{outcome}")
+            exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(), "sprint_takeup_release": released}
             self.client.emit("session.exited", action_id=action_id, actor=self.actor, payload=exited)
             if outcome == "completed":
                 self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor)
@@ -266,6 +337,27 @@ class Daemon:
         finally:
             self._child = None
             self._write_state(None)
+
+    def _takeup_take(self, project: ProjectConfig | None, session_id: str, pid: int) -> dict[str, Any]:
+        if not self.config.takeup.enabled or project is None or project.sprint_id is None:
+            return {"attempted": False, "status": "skipped"}
+        if self.config.takeup.remote_only and (project.env or {}).get("SPRINTCTL_BACKEND") != "remote":
+            return {"attempted": False, "status": "skipped", "reason": "local-mode"}
+        actor = f"actionq:{session_id}"
+        result = self.takeup_client.take(project, session_id=session_id, actor=actor, pid=pid)
+        return {"attempted": True, "status": "ok", "event_id": result.get("event_id")}
+
+    def _takeup_release(self, project: ProjectConfig | None, session_id: str, reason: str) -> dict[str, Any]:
+        if not self.config.takeup.enabled or project is None or project.sprint_id is None:
+            return {"attempted": False, "status": "skipped"}
+        if self.config.takeup.remote_only and (project.env or {}).get("SPRINTCTL_BACKEND") != "remote":
+            return {"attempted": False, "status": "skipped", "reason": "local-mode"}
+        actor = f"actionq:{session_id}"
+        try:
+            result = self.takeup_client.release(project, session_id=session_id, actor=actor, reason=reason)
+            return {"attempted": True, "status": "ok", "event_id": result.get("event_id")}
+        except Exception as exc:
+            return {"attempted": True, "status": "failed", "error": str(exc)}
 
     def _start_child(self, action: ActionConfig) -> subprocess.Popen[str]:
         if action.runner not in {"fake", "fake-commit"}:
@@ -298,7 +390,7 @@ class Daemon:
     def run_forever(self) -> None:
         while not self._shutdown:
             if self._reload_requested and self._child is None and self._reload_config:
-                self.config, self.actions = self._reload_config()
+                self.config, self.actions, self.projects = self._reload_config()
                 self._reload_requested = False
             claimed = self.run_once()
             if not claimed:
@@ -313,8 +405,9 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config or Path("~/.config/actionq/config.toml").expanduser()
     if not config_path.exists() and args.config is None:
         config_path = Path("~/.config/actionq-dispatcher/config.toml").expanduser()
-    config, actions = load_config(config_path)
-    daemon = Daemon(config, actions, ActionctlClient(config.actionctl_bin), lambda: load_config(config_path))
+    config, actions, projects = load_config(config_path)
+    daemon = Daemon(config, actions, ActionctlClient(config.actionctl_bin), projects,
+                    reload_config=lambda: load_config(config_path))
     signal.signal(signal.SIGTERM, daemon.request_shutdown)
     signal.signal(signal.SIGINT, daemon.request_shutdown)
     signal.signal(signal.SIGHUP, daemon.request_reload)

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import threading
 
-from actionq.daemon import ActionConfig, Daemon, DaemonConfig, SessionRecord, load_config
+from actionq.daemon import ActionConfig, Daemon, DaemonConfig, ProjectConfig, SessionRecord, TakeupConfig, load_config
 
 
 class FakeClient:
@@ -31,6 +31,19 @@ class FakeClient:
 
     def fail(self, action_id, *, reason, actor):
         self.failed.append((action_id, reason, actor))
+
+
+class FakeTakeup:
+    def __init__(self):
+        self.calls = []
+
+    def take(self, project, *, session_id, actor, pid):
+        self.calls.append(("take", project, session_id, actor, pid))
+        return {"event_id": 1}
+
+    def release(self, project, *, session_id, actor, reason):
+        self.calls.append(("release", project, session_id, actor, reason))
+        return {"event_id": 2}
 
 
 def test_fake_action_emits_lifecycle_and_clears_state(tmp_path: Path):
@@ -111,11 +124,12 @@ def test_load_config_reads_daemon_and_action_settings(tmp_path: Path):
         "fake_duration_seconds = 2\n"
     )
 
-    config, actions = load_config(config_path)
+    config, actions, projects = load_config(config_path)
 
     assert config.poll_interval_seconds == 5
     assert config.session_state_path == Path("state.json")
     assert actions["scope-iterate"].fake_duration_seconds == 2
+    assert projects == {}
 
 
 def test_stale_state_emits_one_inferred_end_then_clears(tmp_path: Path):
@@ -169,3 +183,20 @@ def test_live_state_blocks_a_second_claim_after_restart(tmp_path: Path):
     assert daemon.run_once() is False
     assert client.claims == []
     assert config.session_state_path.read_text() != "{}"
+
+
+def test_remote_project_takeup_wraps_fake_session(tmp_path: Path):
+    client, takeup = FakeClient({"id": 14, "action_type": "scope-iterate", "project": "demo"}), FakeTakeup()
+    config = DaemonConfig(
+        session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
+        takeup=TakeupConfig(enabled=True),
+    )
+    daemon = Daemon(
+        config, {"scope-iterate": ActionConfig(fake_duration_seconds=0.05)}, client,
+        {"demo": ProjectConfig(tmp_path, sprint_id=7, env={"SPRINTCTL_BACKEND": "remote"})}, takeup,
+    )
+
+    assert daemon.run_once() is True
+    assert [call[0] for call in takeup.calls] == ["take", "release"]
+    assert client.events[1][3]["sprint_takeup"]["status"] == "ok"
+    assert client.events[-1][3]["sprint_takeup_release"]["status"] == "ok"
