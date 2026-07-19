@@ -1,6 +1,31 @@
+---
+doc_id: actionq-server-daemon-workstream-c
+status: active
+last_verified: 2026-07-18
+---
+
 # actionq server and devbox daemon plan
 
-Workstream C of `/projects/dev/agentops/docs/plans/agentops/agent-ops-substrate-plan.md`. This plan updates the original workstream language to match the system that now exists: `/projects/dev/actionq` is already the Postgres-backed queue, and `/projects/dev/actionq-dispatcher` already has a working `dispatcher-once` implementation for one claimed action. The target ownership is the `actionq` repo: command/service names are `actionq`, `actionq-server`, and `actionq-daemon`; `actionq-dispatcher` is the current implementation base to absorb or retire as the daemon lands.
+Workstream C of `/projects/dev/agentops/docs/plans/agentops/agent-ops-substrate-plan.md`. `/projects/dev/actionq` is the Postgres-backed queue and HTTP server. `/projects/dev/actionq-dispatch` is the separate compatibility repository that provides a working `dispatcher-once` implementation for one claimed action.
+
+## Verified implementation checkpoint
+
+Checked against both repositories on 2026-07-18:
+
+- `actionq-server` v1 exists in `actionq` with health, sessions, dispatches,
+  and contract-gated dispatch routes.
+- `actionq-dispatch` provides only the bounded `dispatcher-once` coordinator;
+  its 18-test suite passes.
+- No `actionq-daemon` entrypoint, daemon/session registry, audit client,
+  takeup client, or multi-harness routing implementation exists in either
+  checked-out repository.
+
+The ownership decision for backlog item #968 is therefore: build the new
+daemon in `actionq`; retain `actionq-dispatch` unchanged as the supported
+one-shot compatibility and rollback surface until daemon parity is proven.
+Do not import the compatibility package as a permanent daemon dependency.
+Reuse its command/config/ACL concepts through explicit migration or copied,
+reviewed modules. Retirement requires a later, separately evidenced decision.
 
 ## Goal
 
@@ -286,8 +311,8 @@ env = { SPRINTCTL_BACKEND = "remote", SPRINTCTL_URL = "postgresql://...", KCTL_D
 default_harness = "claude"
 model = "claude-sonnet-4-6"
 runner = "local"
-prompt_template = "/projects/dev/actionq-dispatcher/prompts/scope-iterate.md"
-tool_acl = "/projects/dev/actionq-dispatcher/acls/scope-iterate.json"
+prompt_template = "/projects/dev/actionq-dispatch/prompts/scope-iterate.md"
+tool_acl = "/projects/dev/actionq-dispatch/acls/scope-iterate.json"
 test_command = "pytest"
 ```
 
@@ -306,25 +331,28 @@ If actionq does not yet have first-class `harness`/`model` columns or add flags,
 
 ### Code modules to add or split
 
-During C-minimum, these can land in `/projects/dev/actionq-dispatcher/actionq_dispatcher/` because that is where `dispatcher-once` and its tests currently live. The target cleanup is to move daemon-owned code into `/projects/dev/actionq/actionq/` once the compatibility boundary is clear.
+Daemon-owned modules land directly in `/projects/dev/actionq/actionq/`.
+`actionq-dispatch/actionq_dispatcher/` remains the one-shot compatibility
+surface during migration; it must not become a second daemon authority.
 
-- `actionq_dispatcher/daemon.py`: poll loop, signal handling, session registry, graceful shutdown.
-- `actionq_dispatcher/session.py`: `SessionRecord`, session ids, state file read/write, heartbeat payloads.
-- `actionq_dispatcher/routing.py`: deterministic harness/model resolution from action metadata, project defaults, and action defaults.
-- `actionq_dispatcher/harnesses/base.py`: common adapter interface.
-- `actionq_dispatcher/harnesses/claude.py`: current Claude invocation moved out of `worker.py`.
-- `actionq_dispatcher/harnesses/codex.py`: Codex CLI adapter.
-- `actionq_dispatcher/harnesses/copilot.py`: Copilot CLI adapter.
-- `actionq_dispatcher/harnesses/opencode.py`: OpenCode/Codestral adapter.
-- `actionq_dispatcher/lifecycle.py`: actionq lifecycle event helpers and failure-safe emit wrappers.
-- `actionq_dispatcher/audit.py`: auditctl client wrapper.
-- `actionq_dispatcher/takeup.py`: sprintctl takeup take/release wrapper.
+- `actionq/daemon.py`: poll loop, signal handling, session registry, graceful shutdown.
+- `actionq/session.py`: `SessionRecord`, session ids, state file read/write, heartbeat payloads.
+- `actionq/routing.py`: deterministic harness/model resolution from action metadata, project defaults, and action defaults.
+- `actionq/harnesses/base.py`: common adapter interface.
+- `actionq/harnesses/claude.py`: Claude invocation ported from the compatibility worker.
+- `actionq/harnesses/codex.py`: Codex CLI adapter.
+- `actionq/harnesses/copilot.py`: Copilot CLI adapter.
+- `actionq/harnesses/opencode.py`: OpenCode/Codestral adapter.
+- `actionq/lifecycle.py`: actionq lifecycle event helpers and failure-safe emit wrappers.
+- `actionq/audit.py`: auditctl client wrapper.
+- `actionq/takeup.py`: sprintctl takeup take/release wrapper.
 
-Existing modules stay in service:
+Concepts to port from the compatibility repository, without importing it as
+a runtime dependency:
 
-- `core.py` keeps the action handler and validation flow, but it should accept a session-aware harness invocation instead of only `ConfiguredWorker.invoke`.
-- `clients.py` grows `ActionctlClient.emit_session_*`, `SprintctlClient.takeup_take`, `SprintctlClient.takeup_release`, and `AuditctlClient`.
-- `worker.py` can either become the harness package facade or remain as compatibility wrappers for `dispatcher-once`.
+- `core.py` action-handler and validation flow.
+- `clients.py` subprocess boundary and error mapping.
+- `worker.py` fake-runner and Claude invocation behaviour.
 
 ## Daemon evolution
 
@@ -624,17 +652,19 @@ Manual operational checks:
 
 ## Implementation order
 
-Each step is shippable. Steps 1–5 are complete.
+Each step is shippable. The checked-out source does not contain steps 1–5;
+all five are pending. The shipped `actionq-server` v1 baseline is independent
+of these daemon steps.
 
-1. **Daemon minimum on devbox.** ✅ Done. `actionq-daemon` entrypoint, Python poll loop, signal handling (SIGTERM/SIGINT/SIGHUP), session ids, state file, session lifecycle events (dispatch/started/heartbeat/paused/exited), and fake-runner support. One active session at a time. Systemd unit updated to the long-running daemon form.
+1. **Daemon minimum on devbox — pending (#969).** Add the `actionq-daemon` entrypoint, Python poll loop, signal handling (SIGTERM/SIGINT/SIGHUP), session ids, state file, session lifecycle events (dispatch/started/heartbeat/paused/exited), and fake-runner support. Keep one active session at a time and add the long-running systemd unit.
 
-2. **Session events and recovery hardening.** ✅ Done. `session.heartbeat`, `session.exited`, stale state startup recovery, daemon crash plus `actionctl sweep` tests. Existing `dispatcher-once` behavior preserved.
+2. **Session events and recovery hardening — pending (#971/#1115).** Add `session.heartbeat`, `session.exited`, stale-state startup recovery, and daemon-crash plus `actionctl sweep` tests. Preserve existing `dispatcher-once` behavior.
 
-3. **Sprintctl takeup side effects.** ✅ Done. `SprintctlClient.takeup_take()` and `takeup_release()` in `clients.py`. `[global.sprintctl_takeup]` config. Wired into `_dispatch_and_run`. Remote-mode detection via `SPRINTCTL_BACKEND=remote`. Tests in `test_daemon.py`.
+3. **Sprintctl takeup side effects — pending (#972).** Add a bounded sprintctl subprocess client, `[global.sprintctl_takeup]` config, remote-mode detection, lifecycle wiring, and fake-client tests.
 
-4. **Auditctl publisher — core lifecycle.** ✅ Done. `AuditctlClient` in `clients.py`, `[global.audit]` config, all call sites in `_dispatch_and_run`, `session.exited` payload audit fields. Full test surface in `test_audit.py` including `pr.open`/`pr.merge`.
+4. **Auditctl publisher — core lifecycle — pending (#973; auditctl #965).** Add an auditctl subprocess client, `[global.audit]` config, lifecycle call sites, visible degradation fields, and fake-client coverage. PR events remain step 6.
 
-5. **Harness routing config.** ✅ Done. `HarnessConfig` dataclass, `[harnesses.*]` config parsing, `default_harness`/`default_model` on `ProjectConfig` and `ActionConfig`. `routing.py` with `resolve_routing()` implementing the priority chain (action-explicit > project-default > action-kind-default > global-fallback). `RoutingError` rejects with `validator="harness-routing"`. `runner="local"` compatibility → `"claude"`. `ClientError` import fix in `daemon.py`. `dispatch_payload(routing_source=...)` wired. 14 tests in `test_routing.py`.
+5. **Harness routing config — pending (#970).** Add the adapter/config model and deterministic priority chain after the fake-runner daemon minimum. Preserve `runner="local"` compatibility and reject unresolved routing explicitly.
 
 6. **Actionq-daemon publisher integration — full event set.** Complete the auditctl event coverage specified in the auditctl Workstream D plan. After a session exits with `outcome=completed`, query `gh pr view --json number,state,headRefName` against the session's branch in the project path; emit `pr.open` as an auditctl event if a PR exists for the branch. Emit `pr.merge` if the PR state is `MERGED` at exit time. For sessions without a PR at exit, emit nothing for pr events. This validates the full actionq-daemon publisher set from Workstream D: `dispatch.queued`, `dispatch.started`, `session.start`, `session.pause`, `session.resume`, `session.exit`, `pr.open`, `pr.merge`. Depends on steps 4 and 5.
 
