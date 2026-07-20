@@ -19,7 +19,7 @@ import sys
 import time
 import tomllib
 import uuid
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 
 def _now() -> str:
@@ -34,6 +34,19 @@ class TakeupConfig:
 
 
 @dataclass(frozen=True)
+class AuditConfig:
+    enabled: bool = False
+    auditctl_bin: str = "auditctl"
+    # Best-effort, bounded retry: auditctl mints a new event id on every
+    # successful `add` call (no de-dup key in its CLI contract), so a retry
+    # here is only "idempotent" in the sense that it is bounded and never
+    # doubles back into the actionq/dispatch outcome -- it does not achieve
+    # exactly-once delivery into auditctl itself. See daemon._publish_audit.
+    max_attempts: int = 2
+    retry_backoff_seconds: float = 0.2
+
+
+@dataclass(frozen=True)
 class DaemonConfig:
     poll_interval_seconds: float = 30.0
     heartbeat_interval_seconds: float = 60.0
@@ -43,6 +56,7 @@ class DaemonConfig:
     pause_file: Path = Path("~/.local/state/actionq/PAUSED")
     actionctl_bin: str = "actionctl"
     takeup: TakeupConfig = TakeupConfig()
+    audit: AuditConfig = AuditConfig()
 
 
 @dataclass(frozen=True)
@@ -84,6 +98,20 @@ class CoordinatorClient(Protocol):
 class TakeupClient(Protocol):
     def take(self, project: ProjectConfig, *, session_id: str, actor: str, pid: int) -> dict[str, Any]: ...
     def release(self, project: ProjectConfig, *, session_id: str, actor: str, reason: str) -> dict[str, Any]: ...
+
+
+class AuditClient(Protocol):
+    def publish(
+        self,
+        project: ProjectConfig | None,
+        *,
+        event_type: str,
+        actor: str,
+        summary: str,
+        refs: Sequence[str],
+        metadata: dict[str, Any],
+        detail: str | None,
+    ) -> dict[str, Any]: ...
 
 
 class ActionctlClient:
@@ -142,12 +170,75 @@ class SprintctlTakeupClient:
                          "--runtime-session-id", session_id, "--instance-id", session_id, "--reason", reason, "--json")
 
 
+class AuditctlClient:
+    """Publishes events through the documented ``auditctl add`` subprocess
+    contract (see ``/projects/dev/auditctl/AGENTS.md``: "Publishers call the
+    auditctl binary as a subprocess; do not add a Python client API"). Runs
+    with the target project's ``direnv``-equivalent env overlay, same as
+    ``SprintctlTakeupClient``, so ``AUDITCTL_ARTIFACTS_ROOT`` and any
+    repo-local overrides apply.
+    """
+
+    def __init__(self, executable: str):
+        self.executable = executable
+
+    def publish(
+        self,
+        project: ProjectConfig | None,
+        *,
+        event_type: str,
+        actor: str,
+        summary: str,
+        refs: Sequence[str],
+        metadata: dict[str, Any],
+        detail: str | None,
+    ) -> dict[str, Any]:
+        args = [
+            self.executable, "add",
+            "--type", event_type,
+            "--actor", actor,
+            "--summary", summary,
+            "--source", "actionq-daemon",
+            "--json",
+        ]
+        for ref in refs:
+            args.extend(["--ref", ref])
+        if metadata:
+            args.extend(["--metadata", json.dumps(metadata, sort_keys=True)])
+        if detail:
+            args.extend(["--detail", detail])
+        environment = os.environ.copy()
+        cwd = None
+        if project is not None:
+            environment.update(project.env or {})
+            cwd = project.path
+        completed = subprocess.run(args, cwd=cwd, env=environment, text=True, capture_output=True,
+                                   check=False, timeout=30)
+        if completed.returncode:
+            error_detail = completed.stderr.strip() or completed.stdout.strip() or "auditctl add failed"
+            raise RuntimeError(error_detail)
+        return json.loads(completed.stdout)
+
+
+def _audit_refs(action: dict[str, Any], project: ProjectConfig | None) -> list[str]:
+    """``wi:`` only when the action names a target; ``sprint:`` only when
+    the project's sprint id is known -- never guess or fabricate either."""
+    refs: list[str] = []
+    target_ref = action.get("target_ref")
+    if target_ref:
+        refs.append(f"wi:{target_ref}")
+    if project is not None and project.sprint_id is not None:
+        refs.append(f"sprint:{project.sprint_id}")
+    return refs
+
+
 def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict[str, ProjectConfig]]:
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     global_raw = raw.get("global", {})
     state_path = Path(global_raw.get("session_state_path", DaemonConfig.session_state_path)).expanduser()
     pause_file = Path(global_raw.get("pause_file", DaemonConfig.pause_file)).expanduser()
     takeup_raw = global_raw.get("sprintctl_takeup", {})
+    audit_raw = global_raw.get("audit", {})
     config = DaemonConfig(
         poll_interval_seconds=float(global_raw.get("poll_interval_seconds", 30)),
         heartbeat_interval_seconds=float(global_raw.get("heartbeat_interval_seconds", 60)),
@@ -160,6 +251,12 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             enabled=bool(takeup_raw.get("enabled", False)),
             remote_only=bool(takeup_raw.get("remote_only", True)),
             sprintctl_bin=str(global_raw.get("sprintctl_bin", "sprintctl")),
+        ),
+        audit=AuditConfig(
+            enabled=bool(audit_raw.get("enabled", False)),
+            auditctl_bin=str(global_raw.get("auditctl_bin", "auditctl")),
+            max_attempts=int(audit_raw.get("max_attempts", 2)),
+            retry_backoff_seconds=float(audit_raw.get("retry_backoff_seconds", 0.2)),
         ),
     )
     actions = {
@@ -189,11 +286,13 @@ class Daemon:
         client: CoordinatorClient,
         projects: dict[str, ProjectConfig] | None = None,
         takeup_client: TakeupClient | None = None,
+        audit_client: AuditClient | None = None,
         reload_config: Callable[[], tuple[DaemonConfig, dict[str, ActionConfig], dict[str, ProjectConfig]]] | None = None,
     ):
         self.config, self.actions, self.client = config, actions, client
         self.projects = projects or {}
         self.takeup_client = takeup_client or SprintctlTakeupClient(config.takeup.sprintctl_bin)
+        self.audit_client = audit_client or AuditctlClient(config.audit.auditctl_bin)
         self.daemon_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
         self.actor = f"actionq-daemon:{self.daemon_id}"
         self._shutdown = False
@@ -316,7 +415,16 @@ class Daemon:
             "target_ref": action.get("target_ref"), "runner": action_config.runner,
             "ttl_seconds": ttl_seconds,
         }
-        self.client.emit("session.dispatch", action_id=action_id, actor=self.actor, payload=payload)
+        audit_actor = f"actionq:{session_id}"
+        audit_refs = _audit_refs(action, project)
+        audit_dispatch = self._publish_audit(
+            project, event_type="dispatch.queued", actor=audit_actor,
+            summary=f"actionq action queued: {action_type} #{action_id}", refs=audit_refs,
+            metadata={"action_id": action_id, "session_id": session_id, "action_type": action_type,
+                     "runner": action_config.runner},
+        )
+        self.client.emit("session.dispatch", action_id=action_id, actor=self.actor,
+                         payload={**payload, "audit_dispatch": audit_dispatch})
         record = SessionRecord(session_id, session_id, self.daemon_id, action_id, action_type,
                                action.get("project"), action.get("target_ref"), action_config.runner,
                                None, None, _now())
@@ -338,11 +446,23 @@ class Daemon:
                                  actor=self.actor)
                 return
             self._write_state(record)
+            audit_start = self._publish_audit(
+                project, event_type="session.start", actor=audit_actor,
+                summary=f"actionq session started: {action_type} #{action_id}", refs=audit_refs,
+                metadata={"action_id": action_id, "session_id": session_id, "pid": record.pid},
+            )
             self.client.emit("session.started", action_id=action_id, actor=self.actor,
-                             payload={**payload, "pid": record.pid, "started_at": record.started_at, "sprint_takeup": takeup})
-            outcome, exit_code = self._wait_for_child(action_id, payload, record)
+                             payload={**payload, "pid": record.pid, "started_at": record.started_at,
+                                     "sprint_takeup": takeup, "audit_start": audit_start})
+            outcome, exit_code = self._wait_for_child(action_id, payload, record, project, audit_actor, audit_refs)
             released = self._takeup_release(project, session_id, f"session-{outcome}")
-            exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(), "sprint_takeup_release": released}
+            audit_exit = self._publish_audit(
+                project, event_type="session.exit", actor=audit_actor,
+                summary=f"actionq session exited: {action_type} #{action_id} ({outcome})", refs=audit_refs,
+                metadata={"action_id": action_id, "session_id": session_id, "outcome": outcome, "exit_code": exit_code},
+            )
+            exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(),
+                     "sprint_takeup_release": released, "audit_exit": audit_exit}
             self.client.emit("session.exited", action_id=action_id, actor=self.actor, payload=exited)
             if outcome == "completed":
                 self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor)
@@ -376,19 +496,70 @@ class Daemon:
         except Exception as exc:
             return {"attempted": True, "status": "failed", "error": str(exc)}
 
+    def _publish_audit(
+        self,
+        project: ProjectConfig | None,
+        *,
+        event_type: str,
+        actor: str,
+        summary: str,
+        refs: Sequence[str],
+        metadata: dict[str, Any],
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        """Best-effort auditctl publish. Never raises: a failed or skipped
+        audit emission must never fail the underlying dispatch/session
+        action (item #973 scope). Retries up to ``config.audit.max_attempts``
+        times with a short backoff; auditctl itself has no de-dup key in its
+        CLI contract, so this bounds the daemon's own retry behavior rather
+        than guaranteeing exactly-once delivery into auditctl.
+        """
+        if not self.config.audit.enabled:
+            return {"attempted": False, "status": "skipped"}
+        max_attempts = max(1, self.config.audit.max_attempts)
+        attempts = 0
+        last_error: str | None = None
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                result = self.audit_client.publish(
+                    project, event_type=event_type, actor=actor, summary=summary,
+                    refs=refs, metadata=metadata, detail=detail,
+                )
+                return {"attempted": True, "status": "ok", "event_id": result.get("id"), "attempts": attempts}
+            except Exception as exc:
+                last_error = str(exc)
+                if attempts < max_attempts:
+                    time.sleep(self.config.audit.retry_backoff_seconds)
+        return {"attempted": True, "status": "failed", "error": last_error, "attempts": attempts}
+
     def _start_child(self, action: ActionConfig) -> subprocess.Popen[str]:
         if action.runner not in {"fake", "fake-commit"}:
             raise RuntimeError(f"runner {action.runner!r} is not supported by daemon minimum")
         code = f"import time; time.sleep({action.fake_duration_seconds!r})"
         return subprocess.Popen([sys.executable, "-c", code], text=True, start_new_session=True)
 
-    def _wait_for_child(self, action_id: int, payload: dict[str, Any], record: SessionRecord) -> tuple[str, int]:
+    def _wait_for_child(
+        self,
+        action_id: int,
+        payload: dict[str, Any],
+        record: SessionRecord,
+        project: ProjectConfig | None = None,
+        audit_actor: str | None = None,
+        audit_refs: Sequence[str] = (),
+    ) -> tuple[str, int]:
         assert self._child is not None
         next_heartbeat = time.monotonic() + self.config.heartbeat_interval_seconds
         while self._child.poll() is None:
             if self._shutdown:
+                audit_pause = self._publish_audit(
+                    project, event_type="session.pause", actor=audit_actor or self.actor,
+                    summary=f"actionq session paused: {payload.get('action_type')} #{action_id} (shutdown)",
+                    refs=audit_refs,
+                    metadata={"action_id": action_id, "session_id": payload.get("session_id"), "reason": "shutdown"},
+                )
                 self.client.emit("session.paused", action_id=action_id, actor=self.actor,
-                                 payload={**payload, "pid": record.pid, "reason": "shutdown"})
+                                 payload={**payload, "pid": record.pid, "reason": "shutdown", "audit_pause": audit_pause})
                 try:
                     self._child.wait(timeout=self.config.graceful_shutdown_seconds)
                 except subprocess.TimeoutExpired:
