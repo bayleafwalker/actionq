@@ -245,12 +245,20 @@ class Daemon:
         The queue claim intentionally remains untouched; ``actionctl sweep``
         owns requeueing after its lease deadline. Clearing state only after the
         event succeeds makes ordinary restart recovery idempotent.
+
+        Best-effort sprintctl takeup cleanup happens here too: a session
+        that never reached its normal exit path never released its takeup,
+        so recovery releases it the same way a clean exit would, with the
+        same skip-safely and failure-evidence-retention rules as
+        ``_takeup_release`` uses on the normal path.
         """
         record = self._read_state()
         if record is None:
             return False
         if self._pid_alive(record.pid):
             return True
+        project = self.projects.get(record.project or "")
+        released = self._takeup_release(project, record.session_id, "daemon-recovered")
         self.client.emit(
             "session.end-inferred",
             action_id=record.action_id,
@@ -268,6 +276,7 @@ class Daemon:
                 "outcome": "end-inferred",
                 "exit_code": None,
                 "reason": "daemon-startup-stale-state",
+                "sprint_takeup_release": released,
             },
         )
         self._write_state(None)
@@ -316,10 +325,18 @@ class Daemon:
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
             try:
                 takeup = self._takeup_take(project, session_id, record.pid)
-            except Exception:
+            except Exception as exc:
+                # A takeup failure before the harness starts is an expected,
+                # externally-triggerable failure mode (sprintctl down or
+                # unreachable), not evidence of a daemon bug -- fail this
+                # action and keep polling instead of crashing the whole
+                # daemon process. This prevents a session that would be
+                # invisible to cockpit takeup from doing model work at all.
                 os.killpg(self._child.pid, signal.SIGTERM)
                 self._child.wait()
-                raise
+                self.client.fail(action_id, reason=f"sprintctl takeup failed before session start: {exc}",
+                                 actor=self.actor)
+                return
             self._write_state(record)
             self.client.emit("session.started", action_id=action_id, actor=self.actor,
                              payload={**payload, "pid": record.pid, "started_at": record.started_at, "sprint_takeup": takeup})
