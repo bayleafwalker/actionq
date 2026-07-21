@@ -21,6 +21,7 @@ import tomllib
 import uuid
 from typing import Any, Callable, Protocol, Sequence
 
+from .git_evidence import collect_git_evidence_bounded, git_state_at_start
 from .usage_limit import classify_usage_limit, write_handoff
 
 
@@ -97,6 +98,12 @@ class SessionRecord:
     pid: int | None
     started_at: str | None
     updated_at: str
+    # Crash-recovery evidence (#1115): the project repo path and the commit
+    # HEAD was at when this session started, when known. ``None`` for older
+    # persisted state or sessions with no configured project -- recovery
+    # degrades to no git evidence rather than guessing a worktree.
+    worktree: str | None = None
+    base_commit: str | None = None
 
 
 class CoordinatorClient(Protocol):
@@ -373,6 +380,15 @@ class Daemon:
             return True
         project = self.projects.get(record.project or "")
         released = self._takeup_release(project, record.session_id, "daemon-recovered")
+        # Collect surviving commits/worktree evidence (#1115) when the
+        # session recorded a project repo and its starting commit. Bounded:
+        # a missing/deleted worktree degrades to an honest empty-evidence
+        # record (see collect_git_evidence_bounded) rather than blocking
+        # recovery -- a session must never be silently lost just because
+        # its worktree also disappeared.
+        git_evidence = None
+        if record.worktree and record.base_commit:
+            git_evidence = collect_git_evidence_bounded(Path(record.worktree), record.base_commit)
         self.client.emit(
             "session.end-inferred",
             action_id=record.action_id,
@@ -391,6 +407,7 @@ class Daemon:
                 "exit_code": None,
                 "reason": "daemon-startup-stale-state",
                 "sprint_takeup_release": released,
+                "git": git_evidence,
             },
         )
         self._write_state(None)
@@ -440,9 +457,20 @@ class Daemon:
         )
         self.client.emit("session.dispatch", action_id=action_id, actor=self.actor,
                          payload={**payload, "audit_dispatch": audit_dispatch})
+        # Best-effort starting git state for this project (#1115 crash-
+        # recovery evidence). Never blocks dispatch: a project with no git
+        # repo at its configured path (or none configured at all) simply
+        # means recovery will later have no git evidence to collect.
+        worktree, base_commit = None, None
+        if project is not None:
+            try:
+                base_commit, _branch = git_state_at_start(project.path)
+                worktree = str(project.path)
+            except Exception:
+                worktree, base_commit = None, None
         record = SessionRecord(session_id, session_id, self.daemon_id, action_id, action_type,
                                action.get("project"), action.get("target_ref"), action_config.runner,
-                               None, None, _now())
+                               None, None, _now(), worktree, base_commit)
         output_path = self._output_path(session_id) if action_config.runner == "command" else None
         try:
             self._child = self._start_child(action_config, output_path=output_path)
