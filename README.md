@@ -48,6 +48,22 @@ uv sync --extra dev
 
 `ACTIONQ_SCHEMA` must be a simple Postgres identifier: letters, digits, and underscores, not starting with a digit.
 
+## Vuoro execution adapter
+
+`ActionQApplication` is the adapter-safe application core shared by
+`actionctl`, the legacy Actionq HTTP façade, and the Vuoro execution adapter.
+The owner-provided `actionq.vuoro` module publishes domain-qualified operation
+metadata, JSON Schemas, handlers, and the execution compatibility record for
+Vuoro composition. It does not add migrations or database access to the
+transport-only Vuoro client.
+
+Served mutation actors come from authenticated identity, require idempotency
+keys, and return durable accepted/rejected Actionq decision references. Runner
+effects remain machine-local; the service accepts session evidence and exposes
+queue/dispatch/session state. See
+[the Vuoro execution adapter contract](docs/contracts/vuoro-execution-adapter.md)
+for the catalog and preserved claimant-proof limitation.
+
 ## Quick Start
 
 Initialize the queue schema with a deployment/migration identity:

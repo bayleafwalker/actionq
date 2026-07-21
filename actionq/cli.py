@@ -8,6 +8,7 @@ import click
 from . import __version__
 from . import db
 from . import schema as schema_contract
+from .application import ActionQApplication
 
 
 class ActionQGroup(click.Group):
@@ -20,6 +21,10 @@ class ActionQGroup(click.Group):
 
 def _schema(ctx: click.Context) -> str:
     return ctx.obj["schema"]
+
+
+def _app(ctx: click.Context) -> ActionQApplication:
+    return ActionQApplication(schema=_schema(ctx))
 
 
 def _connect(schema: str | None = None, *, require_compatibility: bool = True):
@@ -87,18 +92,15 @@ def check_compatibility(ctx: click.Context) -> None:
 @click.pass_context
 def add(ctx, action_type, project, target_ref, source_refs, priority, parent_id, created_by) -> None:
     """Enqueue an action."""
-    with _connect(_schema(ctx)) as conn:
-        action = db.enqueue(
-            conn,
-            _schema(ctx),
-            action_type=action_type,
-            project=project,
-            target_ref=target_ref,
-            source_refs=list(source_refs),
-            priority=priority,
-            parent_id=parent_id,
-            created_by=created_by,
-        )
+    action = _app(ctx).enqueue(
+        action_type=action_type,
+        project=project,
+        target_ref=target_ref,
+        source_refs=list(source_refs),
+        priority=priority,
+        parent_id=parent_id,
+        created_by=created_by,
+    )
     _echo_json(action)
 
 
@@ -110,15 +112,12 @@ def add(ctx, action_type, project, target_ref, source_refs, priority, parent_id,
 @click.pass_context
 def list_cmd(ctx, status, action_type, project, limit) -> None:
     """List actions."""
-    with _connect(_schema(ctx)) as conn:
-        rows = db.list_actions(
-            conn,
-            _schema(ctx),
-            status=status,
-            action_type=action_type,
-            project=project,
-            limit=limit,
-        )
+    rows = _app(ctx).list_actions(
+        status=status,
+        action_type=action_type,
+        project=project,
+        limit=limit,
+    )
     _echo_json(rows)
 
 
@@ -127,12 +126,10 @@ def list_cmd(ctx, status, action_type, project, limit) -> None:
 @click.pass_context
 def show(ctx, action_id: int) -> None:
     """Show one action and its event history."""
-    with _connect(_schema(ctx)) as conn:
-        action = db.get_action(conn, _schema(ctx), action_id)
-        if action is None:
-            raise click.ClickException(f"Action #{action_id} not found")
-        events = db.action_events(conn, _schema(ctx), action_id)
-    _echo_json({"action": action, "events": events})
+    result = _app(ctx).show_action(action_id)
+    if result is None:
+        raise click.ClickException(f"Action #{action_id} not found")
+    _echo_json(result)
 
 
 @cli.command()
@@ -142,13 +139,10 @@ def show(ctx, action_id: int) -> None:
 def claim(ctx, worker: str, timeout_minutes: int) -> None:
     """Claim one pending action as JSON; exits non-zero if none are available."""
     try:
-        with _connect(_schema(ctx)) as conn:
-            action = db.claim(
-                conn,
-                _schema(ctx),
-                worker=worker,
-                timeout_minutes=timeout_minutes,
-            )
+        action = _app(ctx).claim(
+            worker=worker,
+            timeout_minutes=timeout_minutes,
+        )
     except db.NoActionAvailable as exc:
         click.echo(str(exc), err=True)
         raise click.exceptions.Exit(2) from exc
@@ -170,8 +164,11 @@ def renew(ctx, action_id: int, worker: str, timeout_minutes: int) -> None:
     back via `show`/`events`.
     """
     try:
-        with _connect(_schema(ctx)) as conn:
-            action = db.renew(conn, _schema(ctx), action_id=action_id, worker=worker, timeout_minutes=timeout_minutes)
+        action = _app(ctx).renew(
+            action_id=action_id,
+            worker=worker,
+            timeout_minutes=timeout_minutes,
+        )
     except db.ClaimRejected as exc:
         click.echo(str(exc), err=True)
         raise click.exceptions.Exit(2) from exc
@@ -184,8 +181,11 @@ def renew(ctx, action_id: int, worker: str, timeout_minutes: int) -> None:
 @click.option("--actor", default=None)
 @click.pass_context
 def complete(ctx, action_id: int, result_ref: str, actor: str | None) -> None:
-    with _connect(_schema(ctx)) as conn:
-        action = db.complete(conn, _schema(ctx), action_id, result_ref, actor=actor)
+    action = _app(ctx).complete(
+        action_id=action_id,
+        result_ref=result_ref,
+        actor=actor,
+    )
     _echo_json(action)
 
 
@@ -195,8 +195,11 @@ def complete(ctx, action_id: int, result_ref: str, actor: str | None) -> None:
 @click.option("--actor", default=None)
 @click.pass_context
 def fail(ctx, action_id: int, reason: str, actor: str | None) -> None:
-    with _connect(_schema(ctx)) as conn:
-        action = db.fail(conn, _schema(ctx), action_id, reason, actor=actor)
+    action = _app(ctx).fail(
+        action_id=action_id,
+        reason=reason,
+        actor=actor,
+    )
     _echo_json(action)
 
 
@@ -207,15 +210,12 @@ def fail(ctx, action_id: int, reason: str, actor: str | None) -> None:
 @click.option("--actor", default=None)
 @click.pass_context
 def reject(ctx, action_id: int, reason: str, validator: str, actor: str | None) -> None:
-    with _connect(_schema(ctx)) as conn:
-        action = db.reject(
-            conn,
-            _schema(ctx),
-            action_id,
-            reason=reason,
-            validator=validator,
-            actor=actor,
-        )
+    action = _app(ctx).reject(
+        action_id=action_id,
+        reason=reason,
+        validator=validator,
+        actor=actor,
+    )
     _echo_json(action)
 
 
@@ -225,16 +225,18 @@ def reject(ctx, action_id: int, reason: str, validator: str, actor: str | None) 
 @click.option("--actor", default="human")
 @click.pass_context
 def cancel(ctx, action_id: int, reason: str, actor: str) -> None:
-    with _connect(_schema(ctx)) as conn:
-        action = db.cancel(conn, _schema(ctx), action_id, reason, actor=actor)
+    action = _app(ctx).cancel(
+        action_id=action_id,
+        reason=reason,
+        actor=actor,
+    )
     _echo_json(action)
 
 
 @cli.command()
 @click.pass_context
 def sweep(ctx) -> None:
-    with _connect(_schema(ctx)) as conn:
-        rows = db.sweep(conn, _schema(ctx))
+    rows = _app(ctx).sweep()
     _echo_json(rows)
 
 
@@ -247,8 +249,8 @@ def sweep(ctx) -> None:
 @click.pass_context
 def events(ctx, since, event_type, action_id, limit, follow) -> None:
     """Read the event log."""
-    with _connect(_schema(ctx)) as conn:
-        if follow:
+    if follow:
+        with _connect(_schema(ctx)) as conn:
             for event in db.follow_events(
                 conn,
                 _schema(ctx),
@@ -258,14 +260,12 @@ def events(ctx, since, event_type, action_id, limit, follow) -> None:
                 click.echo(db.to_json(event))
                 sys.stdout.flush()
             return
-        rows = db.list_events(
-            conn,
-            _schema(ctx),
-            since=since,
-            event_type=event_type,
-            action_id=action_id,
-            limit=limit,
-        )
+    rows = _app(ctx).list_events(
+        since=since,
+        event_type=event_type,
+        action_id=action_id,
+        limit=limit,
+    )
     _echo_json(rows)
 
 
@@ -276,14 +276,11 @@ def events(ctx, since, event_type, action_id, limit, follow) -> None:
 @click.pass_context
 def sessions(ctx, project: str | None, active_only: bool, limit: int) -> None:
     """Summarize daemon sessions from session.* coordinator events."""
-    with _connect(_schema(ctx)) as conn:
-        rows = db.list_sessions(
-            conn,
-            _schema(ctx),
-            project=project,
-            active_only=active_only,
-            limit=limit,
-        )
+    rows = _app(ctx).list_sessions(
+        project=project,
+        active_only=active_only,
+        limit=limit,
+    )
     _echo_json(rows)
 
 
@@ -311,14 +308,10 @@ def emit(ctx, event_type: str, action_id: int | None, actor: str | None, payload
     parsed = db.parse_json(payload, default={})
     if not isinstance(parsed, dict):
         raise click.ClickException("--payload must be a JSON object")
-    with _connect(_schema(ctx)) as conn:
-        event = db.insert_event(
-            conn,
-            _schema(ctx),
-            event_type=event_type,
-            action_id=action_id,
-            actor=actor,
-            payload=parsed,
-        )
-        conn.commit()
+    event = _app(ctx).emit_event(
+        event_type=event_type,
+        action_id=action_id,
+        actor=actor,
+        payload=parsed,
+    )
     _echo_json(event)

@@ -56,6 +56,21 @@ silently mutating state or silently succeeding.
 - Action projection and corresponding lifecycle event are intended to commit atomically.
 - A lost response after commit is an unknown outcome to the caller. The caller must read the action and event history before retrying a non-idempotent command.
 
+## Served invocation provenance and retry
+
+Vuoro execution mutations pass through `ActionQApplication` with authenticated
+actor/environment identity, a request ID, catalog and optional basis
+revisions, and a required idempotency key. Actionq serializes the
+identity/environment/operation/key tuple with a transaction-scoped advisory
+lock. The immutable history links `invocation.requested`, the owner lifecycle
+events, and `invocation.decided` through the same provenance record.
+
+A retry with the same key and normalized arguments returns the original durable
+decision without repeating the lifecycle mutation. A different argument set
+under that key is rejected as an idempotency conflict. This served retry
+contract does not retrofit idempotency onto the legacy CLI when no invocation
+provenance is supplied, and it is not a fencing token for terminal transitions.
+
 ## Consistency target
 
 - Claim selection target: linearizable per action within one primary Postgres database, subject to transaction and connection behavior.

@@ -8,22 +8,14 @@ from __future__ import annotations
 import json
 import os
 import sys
-from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import db as _db
 from . import schema as _schema_contract
+from .application import ActionQApplication
 
 CONTRACT_VERSION = "v1"
-_KIND_TO_ACTION_TYPE = {
-    "implement": "scope-iterate",
-    "review": "scope-iterate",
-    "test": "scope-iterate",
-    "investigate": "scope-iterate",
-    "document": "scope-iterate",
-    "custom": "scope-iterate",
-}
 
 
 def _schema() -> str:
@@ -31,8 +23,7 @@ def _schema() -> str:
 
 
 def _compatibility() -> dict:
-    with _db.connect() as conn:
-        return _db.check_compatibility(conn, _schema()).as_dict()
+    return ActionQApplication(schema=_schema()).compatibility()
 
 
 def _require_runtime_compatibility() -> dict:
@@ -42,73 +33,8 @@ def _require_runtime_compatibility() -> dict:
         return _db.require_compatible(conn, _schema()).as_dict()
 
 
-@contextmanager
-def _runtime_connection():
-    """Open a request connection only after a fresh read-only schema gate."""
-
-    with _db.connect() as conn:
-        _db.require_compatible(conn, _schema())
-        conn.rollback()
-        yield conn
-
-
 def _dispatch(payload: dict) -> dict:
-    contract = payload.get("contract_version")
-    if contract != CONTRACT_VERSION:
-        raise ValueError(f"unsupported contract_version: {contract!r}; expected {CONTRACT_VERSION!r}")
-
-    repo_id = (payload.get("repo_id") or "").strip()
-    if not repo_id or repo_id == "ALL":
-        raise ValueError("repo_id must name one concrete repo")
-
-    kind = (payload.get("kind") or "").strip()
-    action_type = _KIND_TO_ACTION_TYPE.get(kind)
-    if not action_type:
-        raise ValueError(f"kind must be one of: {', '.join(_KIND_TO_ACTION_TYPE)}")
-
-    title = (payload.get("title") or "").strip()
-    if not title:
-        raise ValueError("title is required")
-
-    priority_label = (payload.get("priority") or "normal").strip()
-    priority = 50 if priority_label == "high" else 100
-
-    source_refs = list(payload.get("refs") or [])
-    target_ref = (payload.get("work_item_id") or "").strip() or None
-    created_by = (payload.get("requested_by") or "operator:cockpit").strip() or "operator:cockpit"
-
-    with _runtime_connection() as conn:
-        schema = _schema()
-        action = _db.enqueue(
-            conn,
-            schema,
-            action_type=action_type,
-            project=repo_id,
-            target_ref=target_ref,
-            source_refs=source_refs,
-            priority=priority,
-            parent_id=None,
-            created_by=created_by,
-        )
-        meta: dict = {
-            "title": title,
-            "kind": kind,
-            "output_expectation": (payload.get("output_expectation") or "").strip() or None,
-            "harness": (payload.get("harness") or "").strip() or None,
-            "model": (payload.get("model") or "").strip() or None,
-            "prompt": (payload.get("prompt") or "").strip() or None,
-            "sprint_id": payload.get("sprint_id"),
-            "dispatch_group_id": (payload.get("dispatch_group_id") or "").strip() or None,
-        }
-        _db.insert_event(
-            conn,
-            schema,
-            action_id=action["id"],
-            event_type="dispatch.requested",
-            actor=created_by,
-            payload=meta,
-        )
-    return action
+    return ActionQApplication(schema=_schema()).dispatch(payload)
 
 
 def _sessions(query_string: str) -> list:
@@ -117,14 +43,11 @@ def _sessions(query_string: str) -> list:
     active_only = raw_active in ("true", "1", "yes")
     limit = min(int(params.get("limit", ["500"])[0]), 1000)
     project = (params.get("project", [None])[0] or "").strip() or None
-    with _runtime_connection() as conn:
-        return _db.list_sessions(
-            conn,
-            _schema(),
-            project=project,
-            active_only=active_only,
-            limit=limit,
-        )
+    return ActionQApplication(schema=_schema()).list_sessions(
+        project=project,
+        active_only=active_only,
+        limit=limit,
+    )
 
 
 def _dispatches(query_string: str) -> list:
@@ -132,14 +55,11 @@ def _dispatches(query_string: str) -> list:
     limit = min(int(params.get("limit", ["100"])[0]), 500)
     project = (params.get("project", [None])[0] or "").strip() or None
     status = (params.get("status", [None])[0] or "").strip() or None
-    with _runtime_connection() as conn:
-        return _db.list_dispatches(
-            conn,
-            _schema(),
-            project=project,
-            status=status,
-            limit=limit,
-        )
+    return ActionQApplication(schema=_schema()).list_dispatches(
+        project=project,
+        status=status,
+        limit=limit,
+    )
 
 
 class _Handler(BaseHTTPRequestHandler):

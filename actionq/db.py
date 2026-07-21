@@ -313,6 +313,18 @@ def insert_event(
     return dict(row)
 
 
+def event_payload_with_provenance(
+    payload: dict[str, Any] | None,
+    provenance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Attach invocation provenance without changing legacy event payloads."""
+
+    result = dict(payload or {})
+    if provenance is not None:
+        result["provenance"] = dict(provenance)
+    return result
+
+
 def get_action(conn, schema: str, action_id: int) -> dict | None:
     row = conn.execute(
         f"SELECT * FROM {qname(schema, 'actions')} WHERE id = %s",
@@ -336,6 +348,7 @@ def enqueue(
     priority: int,
     parent_id: int | None,
     created_by: str,
+    provenance: dict[str, Any] | None = None,
 ) -> dict:
     chain_depth = 0
     if parent_id is not None:
@@ -387,14 +400,17 @@ def enqueue(
             action_id=action["id"],
             event_type="action_enqueued",
             actor=created_by,
-            payload={
-                "action_type": action_type,
-                "project": project,
-                "target_ref": target_ref,
-                "created_by": created_by,
-                "parent_id": parent_id,
-                "chain_depth": chain_depth,
-            },
+            payload=event_payload_with_provenance(
+                {
+                    "action_type": action_type,
+                    "project": project,
+                    "target_ref": target_ref,
+                    "created_by": created_by,
+                    "parent_id": parent_id,
+                    "chain_depth": chain_depth,
+                },
+                provenance,
+            ),
         )
     return dict(action)
 
@@ -580,7 +596,14 @@ def action_events(conn, schema: str, action_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def claim(conn, schema: str, *, worker: str, timeout_minutes: int) -> dict:
+def claim(
+    conn,
+    schema: str,
+    *,
+    worker: str,
+    timeout_minutes: int,
+    provenance: dict[str, Any] | None = None,
+) -> dict:
     with conn.transaction():
         row = conn.execute(
             f"""
@@ -608,10 +631,13 @@ def claim(conn, schema: str, *, worker: str, timeout_minutes: int) -> dict:
             action_id=row["id"],
             event_type="action_claimed",
             actor=worker,
-            payload={
-                "claimed_by": worker,
-                "claim_deadline": json_default(row["claim_deadline"]),
-            },
+            payload=event_payload_with_provenance(
+                {
+                    "claimed_by": worker,
+                    "claim_deadline": json_default(row["claim_deadline"]),
+                },
+                provenance,
+            ),
         )
     return dict(row)
 
@@ -632,7 +658,15 @@ def _renewal_rejection_reason(current: dict[str, Any] | None, worker: str) -> st
     return None
 
 
-def renew(conn, schema: str, *, action_id: int, worker: str, timeout_minutes: int) -> dict:
+def renew(
+    conn,
+    schema: str,
+    *,
+    action_id: int,
+    worker: str,
+    timeout_minutes: int,
+    provenance: dict[str, Any] | None = None,
+) -> dict:
     """Renew (extend) an existing claim's deadline as an authority command.
 
     Per the state-event-command matrix, queue claim and lease renewal are
@@ -664,17 +698,27 @@ def renew(conn, schema: str, *, action_id: int, worker: str, timeout_minutes: in
                 action_id=action_id if current is not None else None,
                 event_type="claim_renewal_rejected",
                 actor=worker,
-                payload={
-                    "requested_by": worker,
-                    "requested_action_id": action_id,
-                    "requested_timeout_minutes": timeout_minutes,
-                    "action_status": _text(current["status"]) if current is not None else None,
-                    "current_claimed_by": _text(current["claimed_by"]) if current is not None else None,
-                    "current_claim_deadline": json_default(current["claim_deadline"])
-                    if current is not None and current.get("claim_deadline") is not None
-                    else None,
-                    "reason": rejection_reason,
-                },
+                payload=event_payload_with_provenance(
+                    {
+                        "requested_by": worker,
+                        "requested_action_id": action_id,
+                        "requested_timeout_minutes": timeout_minutes,
+                        "action_status": _text(current["status"])
+                        if current is not None
+                        else None,
+                        "current_claimed_by": _text(current["claimed_by"])
+                        if current is not None
+                        else None,
+                        "current_claim_deadline": json_default(
+                            current["claim_deadline"]
+                        )
+                        if current is not None
+                        and current.get("claim_deadline") is not None
+                        else None,
+                        "reason": rejection_reason,
+                    },
+                    provenance,
+                ),
             )
         else:
             previous_deadline = current["claim_deadline"]
@@ -693,12 +737,17 @@ def renew(conn, schema: str, *, action_id: int, worker: str, timeout_minutes: in
                 action_id=action_id,
                 event_type="claim_renewed",
                 actor=worker,
-                payload={
-                    "renewed_by": worker,
-                    "previous_deadline": json_default(previous_deadline) if previous_deadline else None,
-                    "new_deadline": json_default(row["claim_deadline"]),
-                    "requested_timeout_minutes": timeout_minutes,
-                },
+                payload=event_payload_with_provenance(
+                    {
+                        "renewed_by": worker,
+                        "previous_deadline": json_default(previous_deadline)
+                        if previous_deadline
+                        else None,
+                        "new_deadline": json_default(row["claim_deadline"]),
+                        "requested_timeout_minutes": timeout_minutes,
+                    },
+                    provenance,
+                ),
             )
             granted_row = dict(row)
     if rejection_reason is not None:
@@ -724,6 +773,7 @@ def _transition_terminal(
     failure_reason: str | None = None,
     payload: dict[str, Any] | None = None,
     allowed_statuses: tuple[str, ...] = ("claimed",),
+    provenance: dict[str, Any] | None = None,
 ) -> dict:
     allowed_sql = ", ".join(f"'{status}'" for status in allowed_statuses)
     with conn.transaction():
@@ -748,12 +798,20 @@ def _transition_terminal(
             action_id=action_id,
             event_type=event_type,
             actor=actor,
-            payload=payload or {},
+            payload=event_payload_with_provenance(payload, provenance),
         )
     return dict(row)
 
 
-def complete(conn, schema: str, action_id: int, result_ref: str, actor: str | None = None) -> dict:
+def complete(
+    conn,
+    schema: str,
+    action_id: int,
+    result_ref: str,
+    actor: str | None = None,
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> dict:
     return _transition_terminal(
         conn,
         schema,
@@ -764,10 +822,19 @@ def complete(conn, schema: str, action_id: int, result_ref: str, actor: str | No
         result_ref=result_ref,
         payload={"result_ref": result_ref},
         allowed_statuses=("claimed",),
+        provenance=provenance,
     )
 
 
-def fail(conn, schema: str, action_id: int, reason: str, actor: str | None = None) -> dict:
+def fail(
+    conn,
+    schema: str,
+    action_id: int,
+    reason: str,
+    actor: str | None = None,
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> dict:
     return _transition_terminal(
         conn,
         schema,
@@ -778,6 +845,7 @@ def fail(conn, schema: str, action_id: int, reason: str, actor: str | None = Non
         failure_reason=reason,
         payload={"failure_reason": reason},
         allowed_statuses=("claimed",),
+        provenance=provenance,
     )
 
 
@@ -789,6 +857,7 @@ def reject(
     reason: str,
     validator: str,
     actor: str | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> dict:
     return _transition_terminal(
         conn,
@@ -800,10 +869,19 @@ def reject(
         failure_reason=reason,
         payload={"rejection_reason": reason, "validator": validator},
         allowed_statuses=("claimed",),
+        provenance=provenance,
     )
 
 
-def cancel(conn, schema: str, action_id: int, reason: str, actor: str | None = "human") -> dict:
+def cancel(
+    conn,
+    schema: str,
+    action_id: int,
+    reason: str,
+    actor: str | None = "human",
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> dict:
     return _transition_terminal(
         conn,
         schema,
@@ -814,10 +892,17 @@ def cancel(conn, schema: str, action_id: int, reason: str, actor: str | None = "
         failure_reason=reason,
         payload={"reason": reason, "cancelled_by": actor},
         allowed_statuses=("pending", "claimed"),
+        provenance=provenance,
     )
 
 
-def sweep(conn, schema: str) -> list[dict]:
+def sweep(
+    conn,
+    schema: str,
+    *,
+    actor: str = "actionctl:sweep",
+    provenance: dict[str, Any] | None = None,
+) -> list[dict]:
     with conn.transaction():
         rows = conn.execute(
             f"""
@@ -846,11 +931,14 @@ def sweep(conn, schema: str) -> list[dict]:
                 schema,
                 action_id=row["id"],
                 event_type="claim_timed_out",
-                actor="actionctl:sweep",
-                payload={
-                    "previous_claimed_by": row["claimed_by"],
-                    "timeout_seconds": None,
-                },
+                actor=actor,
+                payload=event_payload_with_provenance(
+                    {
+                        "previous_claimed_by": row["claimed_by"],
+                        "timeout_seconds": None,
+                    },
+                    provenance,
+                ),
             )
             swept.append(dict(updated))
     return swept
