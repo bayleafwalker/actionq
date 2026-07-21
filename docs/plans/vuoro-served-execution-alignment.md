@@ -41,3 +41,10 @@ material receipts; it never independently schedules the same work.
 - embedding machine runner effects in the service pod;
 - a second scheduler writable alongside actionq;
 - appservice-specific logic in the actionq core.
+
+## Backlog registration
+
+- **#1196** — deployment-owned actionq migration and compatibility gate.
+- **#1197** — application core and Vuoro execution adapter/catalog.
+- **#1198** — P3 external-runtime boundary, parked until a runtime is selected;
+  blocked by #1197.
