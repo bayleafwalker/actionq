@@ -9,6 +9,17 @@ session_state_path = "~/.local/state/actionq/sessions.json"
 pause_file = "~/.local/state/actionq/PAUSED"
 actionctl_bin = "actionctl"
 
+# Tier-1 deterministic context injection at session start (item #1116).
+# Requests a bounded sprintctl `context-candidates --json` packet before the
+# child starts; only a found, claim_eligible explicit target (never an
+# advisory candidate) may trigger a pre-start `sprintctl claim start`. See
+# docs/plans/actionq-server-daemon-workstream-c-plan.md.
+# [global.context]
+# enabled = false
+# remote_only = true
+# limit = 5
+# auto_claim = true
+
 # The daemon minimum executes only the fake runner. Harness routing and the
 # compatibility dispatcher's worktree/gate pipeline land in later #969 slices.
 [actions.scope-iterate]

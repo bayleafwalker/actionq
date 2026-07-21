@@ -50,6 +50,27 @@ class AuditConfig:
 
 
 @dataclass(frozen=True)
+class ContextConfig:
+    """Tier-1 deterministic context injection at session start (item #1116).
+
+    See ``sprintctl/docs/ops-upgrade-plan.md`` Tier 1 and
+    ``agentops/docs/plans/agentops/session-mechanization-plan.md`` Tier 1:
+    a bounded, ranked ``context-candidates`` packet is requested before the
+    child session starts. ``auto_claim`` gates whether a *found*,
+    ``claim_eligible`` explicit target (sprintctl's rank 1 only -- never an
+    inferred/advisory candidate) causes a pre-start ``claim start``; the
+    packet fetch itself is always best-effort/fail-open regardless of
+    ``auto_claim``.
+    """
+
+    enabled: bool = False
+    remote_only: bool = True
+    sprintctl_bin: str = "sprintctl"
+    limit: int = 5
+    auto_claim: bool = True
+
+
+@dataclass(frozen=True)
 class DaemonConfig:
     poll_interval_seconds: float = 30.0
     heartbeat_interval_seconds: float = 60.0
@@ -61,6 +82,7 @@ class DaemonConfig:
     actionctl_bin: str = "actionctl"
     takeup: TakeupConfig = TakeupConfig()
     audit: AuditConfig = AuditConfig()
+    context: ContextConfig = ContextConfig()
 
 
 @dataclass(frozen=True)
@@ -116,6 +138,16 @@ class CoordinatorClient(Protocol):
 class TakeupClient(Protocol):
     def take(self, project: ProjectConfig, *, session_id: str, actor: str, pid: int) -> dict[str, Any]: ...
     def release(self, project: ProjectConfig, *, session_id: str, actor: str, reason: str) -> dict[str, Any]: ...
+
+
+class ContextClient(Protocol):
+    def fetch(self, project: ProjectConfig, *, item_id: int | None, limit: int) -> dict[str, Any]: ...
+
+
+class ClaimClient(Protocol):
+    def start(
+        self, project: ProjectConfig, *, item_id: int, actor: str, ttl_seconds: int, branch: str | None
+    ) -> dict[str, Any]: ...
 
 
 class AuditClient(Protocol):
@@ -188,6 +220,58 @@ class SprintctlTakeupClient:
                          "--runtime-session-id", session_id, "--instance-id", session_id, "--reason", reason, "--json")
 
 
+class SprintctlContextClient:
+    """Requests the Tier-1 ``context-candidates`` packet (item #1116, depends
+    on sprintctl #1160 -- ``docs/reference/context-and-handoff.md``).
+    """
+
+    def __init__(self, executable: str):
+        self.executable = executable
+
+    def fetch(self, project: ProjectConfig, *, item_id: int | None, limit: int) -> dict[str, Any]:
+        assert project.sprint_id is not None
+        args = [self.executable, "context-candidates", "--sprint-id", str(project.sprint_id),
+                "--limit", str(limit), "--json"]
+        if item_id is not None:
+            args.extend(["--item-id", str(item_id)])
+        environment = os.environ.copy()
+        environment.update(project.env or {})
+        completed = subprocess.run(args, cwd=project.path, env=environment, text=True, capture_output=True,
+                                   check=False, timeout=30)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl context-candidates failed"
+            raise RuntimeError(detail)
+        return json.loads(completed.stdout)
+
+
+class SprintctlClaimClient:
+    """Pre-start claim acquisition for an explicit, ``claim_eligible``
+    context-candidates target (item #1116). This is the only path in this
+    module that mutates sprintctl item/claim state before a child session
+    starts; it fails closed -- callers must not start the child when
+    ``start`` raises.
+    """
+
+    def __init__(self, executable: str):
+        self.executable = executable
+
+    def start(
+        self, project: ProjectConfig, *, item_id: int, actor: str, ttl_seconds: int, branch: str | None
+    ) -> dict[str, Any]:
+        args = [self.executable, "claim", "start", "--item-id", str(item_id), "--actor", actor,
+                "--ttl", str(ttl_seconds), "--json"]
+        if branch:
+            args.extend(["--branch", branch])
+        environment = os.environ.copy()
+        environment.update(project.env or {})
+        completed = subprocess.run(args, cwd=project.path, env=environment, text=True, capture_output=True,
+                                   check=False, timeout=30)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim start failed"
+            raise RuntimeError(detail)
+        return json.loads(completed.stdout)
+
+
 class AuditctlClient:
     """Publishes events through the documented ``auditctl add`` subprocess
     contract (see ``/projects/dev/auditctl/AGENTS.md``: "Publishers call the
@@ -258,6 +342,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
     handoff_dir = Path(global_raw.get("handoff_dir", DaemonConfig.handoff_dir)).expanduser()
     takeup_raw = global_raw.get("sprintctl_takeup", {})
     audit_raw = global_raw.get("audit", {})
+    context_raw = global_raw.get("context", {})
     config = DaemonConfig(
         poll_interval_seconds=float(global_raw.get("poll_interval_seconds", 30)),
         heartbeat_interval_seconds=float(global_raw.get("heartbeat_interval_seconds", 60)),
@@ -277,6 +362,13 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             auditctl_bin=str(global_raw.get("auditctl_bin", "auditctl")),
             max_attempts=int(audit_raw.get("max_attempts", 2)),
             retry_backoff_seconds=float(audit_raw.get("retry_backoff_seconds", 0.2)),
+        ),
+        context=ContextConfig(
+            enabled=bool(context_raw.get("enabled", False)),
+            remote_only=bool(context_raw.get("remote_only", True)),
+            sprintctl_bin=str(global_raw.get("sprintctl_bin", "sprintctl")),
+            limit=int(context_raw.get("limit", 5)),
+            auto_claim=bool(context_raw.get("auto_claim", True)),
         ),
     )
     actions = {
@@ -310,11 +402,15 @@ class Daemon:
         takeup_client: TakeupClient | None = None,
         audit_client: AuditClient | None = None,
         reload_config: Callable[[], tuple[DaemonConfig, dict[str, ActionConfig], dict[str, ProjectConfig]]] | None = None,
+        context_client: ContextClient | None = None,
+        claim_client: ClaimClient | None = None,
     ):
         self.config, self.actions, self.client = config, actions, client
         self.projects = projects or {}
         self.takeup_client = takeup_client or SprintctlTakeupClient(config.takeup.sprintctl_bin)
         self.audit_client = audit_client or AuditctlClient(config.audit.auditctl_bin)
+        self.context_client = context_client or SprintctlContextClient(config.context.sprintctl_bin)
+        self.claim_client = claim_client or SprintctlClaimClient(config.context.sprintctl_bin)
         self.daemon_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
         self.actor = f"actionq-daemon:{self.daemon_id}"
         self._shutdown = False
@@ -455,8 +551,26 @@ class Daemon:
             metadata={"action_id": action_id, "session_id": session_id, "action_type": action_type,
                      "runner": action_config.runner},
         )
+        # Tier-1 deterministic context injection (item #1116): a bounded,
+        # ranked context-candidates packet is requested before the child
+        # starts, and is always fetched best-effort/fail-open. A pre-start
+        # claim is only ever attempted for an explicit target sprintctl
+        # itself marked claim_eligible -- never for advisory/inferred
+        # candidates -- and that attempt fails closed (see
+        # ``_context_claim_acquire``): a failure here must stop the action
+        # before any child process starts.
+        context_result = self._context_candidates_request(project, action)
+        claim_result = self._context_claim_acquire(project, context_result, session_id, ttl_seconds)
         self.client.emit("session.dispatch", action_id=action_id, actor=self.actor,
-                         payload={**payload, "audit_dispatch": audit_dispatch})
+                         payload={**payload, "audit_dispatch": audit_dispatch,
+                                 "context": context_result, "context_claim": claim_result})
+        if claim_result is not None and claim_result.get("status") == "failed":
+            self.client.fail(
+                action_id,
+                reason=f"context claim acquisition failed before session start: {claim_result['error']}",
+                actor=self.actor,
+            )
+            return
         # Best-effort starting git state for this project (#1115 crash-
         # recovery evidence). Never blocks dispatch: a project with no git
         # repo at its configured path (or none configured at all) simply
@@ -525,6 +639,83 @@ class Daemon:
         finally:
             self._child = None
             self._write_state(None)
+
+    def _context_candidates_request(
+        self, project: ProjectConfig | None, action: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Best-effort Tier-1 ``context-candidates`` fetch (item #1116).
+
+        Always fails open: an unreachable or erroring sprintctl only yields a
+        "failed" advisory result here and never blocks or fails the action by
+        itself -- only a claim decision derived from a *successfully
+        fetched*, explicit, ``claim_eligible`` target can gate session start
+        (see ``_context_claim_acquire``). Returns ``None`` only when the
+        feature is fully disabled by config, so callers/tests can
+        distinguish "not configured" from "attempted and skipped/failed".
+        """
+        if not self.config.context.enabled:
+            return None
+        if project is None or project.sprint_id is None:
+            return {"attempted": False, "status": "skipped"}
+        if self.config.context.remote_only and (project.env or {}).get("SPRINTCTL_BACKEND") != "remote":
+            return {"attempted": False, "status": "skipped", "reason": "local-mode"}
+        target_ref = action.get("target_ref")
+        item_id: int | None = None
+        if target_ref is not None:
+            try:
+                item_id = int(target_ref)
+            except (TypeError, ValueError):
+                item_id = None
+        try:
+            packet = self.context_client.fetch(project, item_id=item_id, limit=self.config.context.limit)
+            return {"attempted": True, "status": "ok", "packet": packet}
+        except Exception as exc:
+            return {"attempted": True, "status": "failed", "error": str(exc)}
+
+    def _context_claim_acquire(
+        self,
+        project: ProjectConfig | None,
+        context_result: dict[str, Any] | None,
+        session_id: str,
+        ttl_seconds: int,
+    ) -> dict[str, Any] | None:
+        """Pre-start claim acquisition for an explicit, eligible target only.
+
+        Only ever attempts a claim for the context packet's
+        ``explicit_target`` -- and only when it was both found and marked
+        ``claim_eligible`` by sprintctl itself (rank 1; sprintctl never marks
+        an inferred/advisory candidate eligible). This never inspects or acts
+        on ranks 2-5. Returns ``None`` when no claim was attempted (feature
+        disabled, no context, no explicit eligible target); returns a
+        ``status: "failed"`` result when an attempted claim fails -- callers
+        must treat that as fail-closed and not start the child session.
+        """
+        if not self.config.context.auto_claim or context_result is None:
+            return None
+        if context_result.get("status") != "ok":
+            return None
+        packet = context_result.get("packet") or {}
+        explicit_target = packet.get("explicit_target")
+        if not explicit_target or not explicit_target.get("found"):
+            return None
+        eligible = any(
+            candidate.get("rank") == 1 and candidate.get("claim_eligible")
+            for candidate in packet.get("candidates") or []
+        )
+        if not eligible:
+            return None
+        item_id = explicit_target["item_id"]
+        actor = f"actionq:{session_id}"
+        try:
+            assert project is not None
+            claim = self.claim_client.start(project, item_id=item_id, actor=actor,
+                                             ttl_seconds=ttl_seconds, branch=None)
+            claim_id = claim.get("claim_id")
+            if claim_id is None and isinstance(claim.get("claim"), dict):
+                claim_id = claim["claim"].get("claim_id")
+            return {"attempted": True, "status": "ok", "item_id": item_id, "claim_id": claim_id}
+        except Exception as exc:
+            return {"attempted": True, "status": "failed", "item_id": item_id, "error": str(exc)}
 
     def _takeup_take(self, project: ProjectConfig | None, session_id: str, pid: int) -> dict[str, Any]:
         if not self.config.takeup.enabled or project is None or project.sprint_id is None:

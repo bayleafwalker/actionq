@@ -609,6 +609,66 @@ Error handling:
 
 Audit details should be concise and machine-readable enough for cockpit aggregation: include action id, session id, harness, model, worktree, branch, result, and failure reason.
 
+## Tier-1 context-candidates integration (item #1116, implemented)
+
+Depends on sprintctl #1160's `context-candidates --json` contract
+(`sprintctl/docs/reference/context-and-handoff.md`) and on
+`sprintctl/docs/ops-upgrade-plan.md` Tier 1 / `agentops`'
+`docs/plans/agentops/session-mechanization-plan.md` Tier 1: at session start
+the daemon requests a small, bounded, deterministically ranked context packet
+and only ever auto-claims for a found, `claim_eligible` explicit target.
+
+When to call:
+
+- Before `_start_child` -- this is earlier than sprintctl takeup, which needs
+  the child's PID and so can only run after the child starts. A context/claim
+  failure here means the child never starts at all.
+- Only when `[global.context].enabled = true`.
+- Only when the project is remote mode if `remote_only = true` (same
+  project-env convention as takeup: require `SPRINTCTL_BACKEND=remote`).
+
+Fetch command shape:
+
+```bash
+sprintctl context-candidates --sprint-id <sprint-id> --item-id <target_ref> --limit <limit> --json
+```
+
+`--item-id` is only passed when the dispatched action's `target_ref` parses
+as an integer; sprintctl reports `explicit_target: null` in the packet when
+no `--item-id` was supplied at all, and `{"item_id": N, "found": false}` when
+that item does not exist.
+
+Pre-start claim command shape (only for a found, `claim_eligible` explicit
+target -- rank 1 only, never an advisory rank 2-5 candidate):
+
+```bash
+sprintctl claim start --item-id <item_id> --actor actionq:<session_id> --ttl <ttl_seconds> --json
+```
+
+Error handling:
+
+- The context-candidates fetch itself is always best-effort/fail-open: a
+  failure (sprintctl down, unreachable, non-zero exit) yields
+  `context={"status": "failed", "error": ...}` in the `session.dispatch`
+  payload and never blocks or fails the action by itself.
+- Claim acquisition fails closed: it is only ever attempted for a
+  successfully fetched packet whose explicit target sprintctl itself marked
+  `claim_eligible`, and if that attempt raises, the action fails
+  (`context claim acquisition failed before session start: <error>`) before
+  any child process is started -- there is no kill-already-started-child step
+  to run, unlike the takeup pre-start failure path.
+- The claim token is never included in any event payload or log; only
+  `claim_id` (when available) is recorded, mirroring sprintctl's own
+  "claim secrets are never included" bundle rule.
+- `[global.context].auto_claim = false` disables the claim step entirely
+  while still fetching and injecting the advisory packet -- useful for a
+  rollout phase that wants context without automatic claim behavior.
+
+Both the packet (`context`) and the claim outcome (`context_claim`) are
+folded into the `session.dispatch` event payload alongside `audit_dispatch`,
+so a consumer building the harness prompt has the ranked candidates and
+watermark age available before the child starts.
+
 ## Test plan
 
 Fake-runner tests that can ship before real harness adapters:
