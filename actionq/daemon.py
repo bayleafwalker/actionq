@@ -21,6 +21,8 @@ import tomllib
 import uuid
 from typing import Any, Callable, Protocol, Sequence
 
+from .usage_limit import classify_usage_limit, write_handoff
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -54,6 +56,7 @@ class DaemonConfig:
     default_timeout_minutes: int = 30
     session_state_path: Path = Path("~/.local/state/actionq/sessions.json")
     pause_file: Path = Path("~/.local/state/actionq/PAUSED")
+    handoff_dir: Path = Path("~/.local/state/actionq/handoff")
     actionctl_bin: str = "actionctl"
     takeup: TakeupConfig = TakeupConfig()
     audit: AuditConfig = AuditConfig()
@@ -64,6 +67,14 @@ class ActionConfig:
     runner: str = "fake"
     timeout_minutes: int | None = None
     fake_duration_seconds: float = 0.0
+    # Usage-limit pause/resume (#976): "command" is a deterministic,
+    # config-driven runner -- not a real harness invocation -- that lets
+    # tests simulate a harness process producing known output and a
+    # nonzero exit code so pause detection can be verified without calling
+    # a real model. ``harness`` names which confirmed-signal set in
+    # ``actionq.usage_limit`` classifies this action's captured output.
+    command: tuple[str, ...] | None = None
+    harness: str | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +248,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
     global_raw = raw.get("global", {})
     state_path = Path(global_raw.get("session_state_path", DaemonConfig.session_state_path)).expanduser()
     pause_file = Path(global_raw.get("pause_file", DaemonConfig.pause_file)).expanduser()
+    handoff_dir = Path(global_raw.get("handoff_dir", DaemonConfig.handoff_dir)).expanduser()
     takeup_raw = global_raw.get("sprintctl_takeup", {})
     audit_raw = global_raw.get("audit", {})
     config = DaemonConfig(
@@ -246,6 +258,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
         default_timeout_minutes=int(global_raw.get("default_timeout_minutes", 30)),
         session_state_path=state_path,
         pause_file=pause_file,
+        handoff_dir=handoff_dir,
         actionctl_bin=str(global_raw.get("actionctl_bin", "actionctl")),
         takeup=TakeupConfig(
             enabled=bool(takeup_raw.get("enabled", False)),
@@ -264,6 +277,8 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             runner=str(value.get("runner", "fake")),
             timeout_minutes=(int(value["timeout_minutes"]) if "timeout_minutes" in value else None),
             fake_duration_seconds=float(value.get("fake_duration_seconds", 0)),
+            command=(tuple(str(part) for part in value["command"]) if "command" in value else None),
+            harness=(str(value["harness"]) if "harness" in value else None),
         )
         for name, value in raw.get("actions", {}).items()
     }
@@ -428,8 +443,9 @@ class Daemon:
         record = SessionRecord(session_id, session_id, self.daemon_id, action_id, action_type,
                                action.get("project"), action.get("target_ref"), action_config.runner,
                                None, None, _now())
+        output_path = self._output_path(session_id) if action_config.runner == "command" else None
         try:
-            self._child = self._start_child(action_config)
+            self._child = self._start_child(action_config, output_path=output_path)
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
             try:
                 takeup = self._takeup_take(project, session_id, record.pid)
@@ -455,6 +471,12 @@ class Daemon:
                              payload={**payload, "pid": record.pid, "started_at": record.started_at,
                                      "sprint_takeup": takeup, "audit_start": audit_start})
             outcome, exit_code = self._wait_for_child(action_id, payload, record, project, audit_actor, audit_refs)
+            usage_limit_reason: str | None = None
+            if outcome == "failed":
+                usage_limit_reason = self._detect_and_handle_usage_limit(
+                    action_id=action_id, action_type=action_type, action_config=action_config,
+                    payload=payload, record=record, exit_code=exit_code, output_path=output_path,
+                )
             released = self._takeup_release(project, session_id, f"session-{outcome}")
             audit_exit = self._publish_audit(
                 project, event_type="session.exit", actor=audit_actor,
@@ -462,12 +484,13 @@ class Daemon:
                 metadata={"action_id": action_id, "session_id": session_id, "outcome": outcome, "exit_code": exit_code},
             )
             exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(),
-                     "sprint_takeup_release": released, "audit_exit": audit_exit}
+                     "sprint_takeup_release": released, "audit_exit": audit_exit,
+                     "usage_limit_paused": usage_limit_reason is not None}
             self.client.emit("session.exited", action_id=action_id, actor=self.actor, payload=exited)
             if outcome == "completed":
                 self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor)
             else:
-                self.client.fail(action_id, reason=f"daemon session {outcome}", actor=self.actor)
+                self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.actor)
         except Exception as exc:
             self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.actor)
             raise
@@ -533,11 +556,136 @@ class Daemon:
                     time.sleep(self.config.audit.retry_backoff_seconds)
         return {"attempted": True, "status": "failed", "error": last_error, "attempts": attempts}
 
-    def _start_child(self, action: ActionConfig) -> subprocess.Popen[str]:
-        if action.runner not in {"fake", "fake-commit"}:
-            raise RuntimeError(f"runner {action.runner!r} is not supported by daemon minimum")
-        code = f"import time; time.sleep({action.fake_duration_seconds!r})"
-        return subprocess.Popen([sys.executable, "-c", code], text=True, start_new_session=True)
+    def _start_child(self, action: ActionConfig, *, output_path: Path | None = None) -> subprocess.Popen[str]:
+        if action.runner in {"fake", "fake-commit"}:
+            code = f"import time; time.sleep({action.fake_duration_seconds!r})"
+            return subprocess.Popen([sys.executable, "-c", code], text=True, start_new_session=True)
+        if action.runner == "command":
+            # Deterministic, config-driven runner for usage-limit
+            # command-wrapper simulations (#976) -- not a real harness
+            # invocation. Output is captured to ``output_path`` so the
+            # daemon can classify it for a confirmed usage-limit signal
+            # after the child exits.
+            if not action.command:
+                raise RuntimeError("runner 'command' requires ActionConfig.command")
+            handle = None
+            stdout_target: Any = subprocess.DEVNULL
+            if output_path is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(output_path, "w", encoding="utf-8")
+                stdout_target = handle
+            try:
+                return subprocess.Popen(
+                    list(action.command),
+                    text=True,
+                    start_new_session=True,
+                    stdout=stdout_target,
+                    stderr=subprocess.STDOUT,
+                )
+            finally:
+                if handle is not None:
+                    handle.close()
+        raise RuntimeError(f"runner {action.runner!r} is not supported by daemon minimum")
+
+    def _output_path(self, session_id: str) -> Path:
+        safe = session_id.replace(":", "_").replace("/", "_")
+        return self.config.session_state_path.parent / "harness-output" / f"{safe}.log"
+
+    def _detect_and_handle_usage_limit(
+        self,
+        *,
+        action_id: int,
+        action_type: str,
+        action_config: ActionConfig,
+        payload: dict[str, Any],
+        record: SessionRecord,
+        exit_code: int,
+        output_path: Path | None,
+    ) -> str | None:
+        """Best-effort usage-limit classification for a failed session.
+
+        Returns an operator-visible, distinct fail reason (and has already
+        emitted ``session.paused`` plus written a handoff file) when a
+        confirmed usage-limit signal was found in captured output; returns
+        ``None`` for an ordinary failure so the caller keeps its normal
+        failure reason. Never raises: a classification or handoff-write
+        problem must not mask the underlying action outcome (#976
+        non-scope: no generic automatic retry, no masking of real
+        failures as pauses).
+        """
+        if output_path is None or not action_config.harness:
+            return None
+        try:
+            output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
+        except OSError:
+            return None
+        signal = classify_usage_limit(action_config.harness, exit_code=exit_code, output=output_text)
+        if not signal.detected:
+            return None
+
+        handoff_path: Path | None
+        handoff_error: str | None = None
+        try:
+            handoff_path = write_handoff(
+                self.config.handoff_dir,
+                session_id=record.session_id,
+                action_id=action_id,
+                action_type=action_type,
+                harness=action_config.harness,
+                model=None,
+                reason=signal.reason or "confirmed usage-limit signal",
+                evidence=signal.evidence,
+            )
+        except Exception as exc:  # noqa: BLE001 -- handoff failure must not mask the pause signal itself
+            handoff_path = None
+            handoff_error = str(exc)
+
+        self.client.emit(
+            "session.paused",
+            action_id=action_id,
+            actor=self.actor,
+            payload={
+                **payload,
+                "pid": record.pid,
+                "reason": "usage-limit",
+                "mechanism": "checkpoint-and-fail",
+                "handoff_ref": str(handoff_path) if handoff_path else None,
+                "handoff_error": handoff_error,
+                "resumable": handoff_path is not None,
+                "evidence": signal.evidence,
+            },
+        )
+        return f"usage-limit-paused: {signal.reason}"
+
+    def emit_resume_event(
+        self,
+        *,
+        action_id: int | None,
+        session_id: str,
+        resumed_from_session_id: str,
+        handoff_ref: str | None = None,
+        mechanism: str = "redispatch",
+    ) -> None:
+        """Record that a new session resumes from a prior handoff.
+
+        Resume is always re-dispatch, never process continuation (see
+        module docstring in ``actionq.usage_limit``): this only appends the
+        correlating ``session.resumed`` event. It is the operator/manual
+        re-dispatch drill entry point for #976 -- an operator (or a future
+        automated re-dispatch policy) calls this once a new action/session
+        has actually started against the handoff's context.
+        """
+        self.client.emit(
+            "session.resumed",
+            action_id=action_id,
+            actor=self.actor,
+            payload={
+                "session_id": session_id,
+                "resumed_from_session_id": resumed_from_session_id,
+                "handoff_ref": handoff_ref,
+                "mechanism": mechanism,
+            },
+        )
 
     def _wait_for_child(
         self,
