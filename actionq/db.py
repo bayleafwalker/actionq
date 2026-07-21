@@ -269,75 +269,28 @@ def summarize_sessions(
     return summarized[:limit]
 
 
-def migrate(conn, schema: str) -> None:
-    schema = schema_name(schema)
-    with conn.transaction():
-        conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-        conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {qname(schema, "actions")} (
-                id              BIGSERIAL PRIMARY KEY,
-                action_type     TEXT        NOT NULL,
-                project         TEXT,
-                target_ref      TEXT,
-                source_refs     JSONB       NOT NULL DEFAULT '[]'::jsonb,
-                priority        INTEGER     NOT NULL DEFAULT 100,
-                status          TEXT        NOT NULL DEFAULT 'pending'
-                                            CHECK (status IN ('pending', 'claimed', 'completed', 'failed', 'rejected', 'cancelled')),
-                parent_id       BIGINT      REFERENCES {qname(schema, "actions")}(id),
-                chain_depth     INTEGER     NOT NULL DEFAULT 0,
-                created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-                claimed_at      TIMESTAMPTZ,
-                claimed_by      TEXT,
-                claim_deadline  TIMESTAMPTZ,
-                completed_at    TIMESTAMPTZ,
-                result_ref      TEXT,
-                failure_reason  TEXT,
-                created_by      TEXT        NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {qname(schema, "events")} (
-                id          BIGSERIAL   PRIMARY KEY,
-                action_id   BIGINT      REFERENCES {qname(schema, "actions")}(id),
-                event_type  TEXT        NOT NULL,
-                timestamp   TIMESTAMPTZ NOT NULL DEFAULT now(),
-                actor       TEXT,
-                payload     JSONB       NOT NULL DEFAULT '{{}}'::jsonb
-            )
-            """
-        )
-        conn.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_actionq_actions_claim_lookup
-                ON {qname(schema, "actions")}(status, priority, created_at)
-                WHERE status = 'pending'
-            """
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_actionq_actions_parent ON {qname(schema, 'actions')}(parent_id)"
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_actionq_actions_project ON {qname(schema, 'actions')}(project)"
-        )
-        conn.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_actionq_actions_deadline
-                ON {qname(schema, "actions")}(claim_deadline)
-                WHERE status = 'claimed'
-            """
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_actionq_events_action ON {qname(schema, 'events')}(action_id)"
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_actionq_events_timestamp ON {qname(schema, 'events')}(timestamp DESC)"
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_actionq_events_type_time ON {qname(schema, 'events')}(event_type, timestamp DESC)"
-        )
+def migrate(conn, schema: str) -> dict[str, Any]:
+    """Compatibility wrapper for the deployment-owned migration API."""
+
+    from . import schema as schema_contract
+
+    return schema_contract.migrate(conn, schema)
+
+
+def check_compatibility(conn, schema: str):
+    """Return the execution adapter's read-only schema compatibility record."""
+
+    from . import schema as schema_contract
+
+    return schema_contract.check_compatibility(conn, schema)
+
+
+def require_compatible(conn, schema: str):
+    """Fail closed unless the schema is supported by this release."""
+
+    from . import schema as schema_contract
+
+    return schema_contract.require_compatible(conn, schema)
 
 
 def insert_event(

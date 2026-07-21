@@ -1,7 +1,8 @@
--- actionq schema v1.
--- The runtime migrator applies this shape to ACTIONQ_SCHEMA, default `actionq`.
+-- actionq execution-domain schema v1.
+-- Applied only by the deployment migration entrypoint. {{schema}} is replaced
+-- with a validated, quoted ACTIONQ_SCHEMA identifier by actionq.schema.
 
-CREATE TABLE actions (
+CREATE TABLE IF NOT EXISTS {{schema}}.actions (
     id              BIGSERIAL PRIMARY KEY,
     action_type     TEXT        NOT NULL,
     project         TEXT,
@@ -10,7 +11,7 @@ CREATE TABLE actions (
     priority        INTEGER     NOT NULL DEFAULT 100,
     status          TEXT        NOT NULL DEFAULT 'pending'
                                 CHECK (status IN ('pending', 'claimed', 'completed', 'failed', 'rejected', 'cancelled')),
-    parent_id       BIGINT      REFERENCES actions(id),
+    parent_id       BIGINT      REFERENCES {{schema}}.actions(id),
     chain_depth     INTEGER     NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     claimed_at      TIMESTAMPTZ,
@@ -22,21 +23,22 @@ CREATE TABLE actions (
     created_by      TEXT        NOT NULL
 );
 
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS {{schema}}.events (
     id          BIGSERIAL   PRIMARY KEY,
-    action_id   BIGINT      REFERENCES actions(id),
+    action_id   BIGINT      REFERENCES {{schema}}.actions(id),
     event_type  TEXT        NOT NULL,
     timestamp   TIMESTAMPTZ NOT NULL DEFAULT now(),
     actor       TEXT,
     payload     JSONB       NOT NULL DEFAULT '{}'::jsonb
 );
 
-CREATE INDEX idx_actions_claim_lookup ON actions(status, priority, created_at)
+CREATE INDEX IF NOT EXISTS idx_actionq_actions_claim_lookup
+    ON {{schema}}.actions(status, priority, created_at)
     WHERE status = 'pending';
-CREATE INDEX idx_actions_parent ON actions(parent_id);
-CREATE INDEX idx_actions_project ON actions(project);
-CREATE INDEX idx_actions_deadline ON actions(claim_deadline)
+CREATE INDEX IF NOT EXISTS idx_actionq_actions_parent ON {{schema}}.actions(parent_id);
+CREATE INDEX IF NOT EXISTS idx_actionq_actions_project ON {{schema}}.actions(project);
+CREATE INDEX IF NOT EXISTS idx_actionq_actions_deadline ON {{schema}}.actions(claim_deadline)
     WHERE status = 'claimed';
-CREATE INDEX idx_events_action ON events(action_id);
-CREATE INDEX idx_events_timestamp ON events(timestamp DESC);
-CREATE INDEX idx_events_type_time ON events(event_type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_actionq_events_action ON {{schema}}.events(action_id);
+CREATE INDEX IF NOT EXISTS idx_actionq_events_timestamp ON {{schema}}.events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_actionq_events_type_time ON {{schema}}.events(event_type, timestamp DESC);

@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import uuid
 
 import pytest
@@ -7,10 +8,13 @@ from click.testing import CliRunner
 
 try:
     import psycopg  # noqa: F401
+    from psycopg import sql
 except ModuleNotFoundError:
     psycopg = None
+    sql = None
 
 from actionq.cli import cli
+from actionq import db, schema as schema_contract, server
 
 
 pytestmark = pytest.mark.skipif(
@@ -168,3 +172,177 @@ def test_emit_coordinator_cycle(runner_env):
     )
     assert event["event_type"] == "coordinator_cycle"
     assert event["payload"]["claimed"] is False
+
+
+def test_deployment_migration_empty_current_retry_and_compatibility(runner_env):
+    runner, schema = runner_env
+
+    first = runner.invoke(cli, ["migrate", "--json-output"])
+    assert first.exit_code == 0, first.output
+    assert json.loads(first.output)["applied_versions"] == [1]
+
+    second = runner.invoke(cli, ["migrate", "--json-output"])
+    assert second.exit_code == 0, second.output
+    assert json.loads(second.output)["applied_versions"] == []
+
+    compatibility = runner.invoke(cli, ["check-compatibility"])
+    assert compatibility.exit_code == 0, compatibility.output
+    assert json.loads(compatibility.output)["state"] == "compatible"
+
+
+def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
+    runner, schema = runner_env
+    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    migration = schema_contract.load_migrations()[0]
+    conn.execute(f'CREATE SCHEMA "{schema}"')
+    for statement in schema_contract._statements(schema_contract._render(migration, schema)):
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(cli, ["migrate", "--json-output"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["applied_versions"] == [1]
+    assert runner.invoke(cli, ["check-compatibility"]).exit_code == 0
+
+
+def test_failed_migration_rolls_back_ledger_and_can_retry_after_repair(runner_env):
+    _runner, schema = runner_env
+    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    migration = schema_contract.load_migrations()[0]
+    statements = schema_contract._statements(schema_contract._render(migration, schema))
+    conn.execute(f'CREATE SCHEMA "{schema}"')
+    conn.execute(statements[0])
+    conn.execute(
+        f'CREATE TABLE "{schema}".events ('
+        f'id BIGSERIAL PRIMARY KEY, action_id BIGINT REFERENCES "{schema}".actions(id), '
+        "event_type TEXT NOT NULL, timestamp TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+    conn.commit()
+
+    with pytest.raises(schema_contract.SchemaMigrationError, match="required actionq table shape"):
+        schema_contract.migrate(conn, schema)
+    conn.rollback()
+    ledger = conn.execute(
+        "SELECT to_regclass(%s) AS relation",
+        (f'"{schema}"."schema_migrations"',),
+    ).fetchone()["relation"]
+    assert ledger is None
+
+    conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+    conn.commit()
+    report = schema_contract.migrate(conn, schema)
+    assert report["applied_versions"] == [1]
+    conn.close()
+
+
+def test_deployment_migrations_serialize_across_connections(runner_env):
+    _runner, schema = runner_env
+    barrier = threading.Barrier(2)
+    reports: list[dict] = []
+    errors: list[Exception] = []
+
+    def migrate_once():
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        try:
+            barrier.wait(timeout=5)
+            reports.append(schema_contract.migrate(conn, schema))
+        except Exception as exc:  # pragma: no cover - surfaced through errors
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=migrate_once) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors, errors
+    assert len(reports) == 2
+    assert sorted(len(report["applied_versions"]) for report in reports) == [0, 1]
+    assert all(report["compatibility"]["compatible"] for report in reports)
+
+
+def test_runtime_contract_rejects_future_schema_without_running_ddl(runner_env):
+    runner, schema = runner_env
+    assert runner.invoke(cli, ["migrate"]).exit_code == 0
+    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    migration = schema_contract.load_migrations()[0]
+    conn.execute(
+        f'INSERT INTO "{schema}"."schema_migrations" '
+        "(domain, version, name, checksum) VALUES (%s, %s, %s, %s)",
+        (schema_contract.DOMAIN, 2, "002_future.sql", migration.checksum),
+    )
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(cli, ["ls"])
+
+    assert result.exit_code != 0
+    assert "too-new" in result.output
+
+
+def test_service_restart_repeats_compatibility_without_migration(runner_env):
+    runner, schema = runner_env
+    assert runner.invoke(cli, ["migrate"]).exit_code == 0
+
+    first_start = server._require_runtime_compatibility()
+    second_start = server._require_runtime_compatibility()
+
+    assert first_start["state"] == "compatible"
+    assert second_start == first_start
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ACTIONQ_TEST_MIGRATION_URL")
+    or not os.environ.get("ACTIONQ_TEST_RUNTIME_URL"),
+    reason=(
+        "ACTIONQ_TEST_MIGRATION_URL and ACTIONQ_TEST_RUNTIME_URL are required "
+        "for role-separation integration"
+    ),
+)
+def test_runtime_role_can_check_compatibility_but_cannot_run_ddl():
+    schema = "aqroles_" + uuid.uuid4().hex
+    migration_conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    runtime_conn = db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+    runtime_role = runtime_conn.execute("SELECT current_user AS role").fetchone()["role"]
+    try:
+        schema_contract.migrate(migration_conn, schema)
+        migration_conn.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                sql.Identifier(schema), sql.Identifier(runtime_role)
+            )
+        )
+        migration_conn.execute(
+            sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
+                sql.Identifier(schema),
+                sql.Identifier("schema_migrations"),
+                sql.Identifier(runtime_role),
+            )
+        )
+        migration_conn.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} TO {}").format(
+                sql.Identifier(schema), sql.Identifier(runtime_role)
+            )
+        )
+        migration_conn.execute(
+            sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
+                sql.Identifier(schema), sql.Identifier(runtime_role)
+            )
+        )
+        migration_conn.commit()
+
+        assert schema_contract.require_compatible(runtime_conn, schema).compatible
+        with pytest.raises(Exception) as excinfo:
+            runtime_conn.execute(
+                sql.SQL("CREATE TABLE {}.forbidden_runtime_ddl (id INTEGER)").format(
+                    sql.Identifier(schema)
+                )
+            )
+        assert getattr(excinfo.value, "sqlstate", None) == "42501"
+        runtime_conn.rollback()
+    finally:
+        runtime_conn.close()
+        migration_conn.close()

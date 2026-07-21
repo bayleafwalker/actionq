@@ -45,8 +45,8 @@ actionq-session-wrap = "actionq.session_wrapper:main"
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
-[tool.setuptools]
-packages = ["actionq"]
+[tool.setuptools.packages.find]
+include = ["actionq*"]
 
 [tool.setuptools.package-data]
 actionq = ["migrations/*.sql"]

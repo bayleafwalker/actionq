@@ -39,7 +39,7 @@ uv sync --extra dev
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `ACTIONQ_URL` | Yes | None | Postgres connection string used by `actionctl`. |
+| `ACTIONQ_URL` | Yes | None | Postgres connection string used by `actionctl`; deployment migration Jobs and runtime processes use separate role-specific values. |
 | `ACTIONQ_SCHEMA` | No | `actionq` | Schema name for queue tables and events. |
 | `ACTIONQ_MAX_CHAIN_DEPTH` | No | `3` | Maximum allowed parent-child depth for enqueued actions. |
 | `ACTIONQ_RATE_LIMIT_PER_HOUR` | No | `20` | Hourly enqueue cap for `agent:` and `script:` producers. |
@@ -49,7 +49,7 @@ uv sync --extra dev
 
 ## Quick Start
 
-Initialize the queue schema:
+Initialize the queue schema with a deployment/migration identity:
 
 ```bash
 export ACTIONQ_URL='postgresql://user:password@localhost:5432/app'
@@ -57,6 +57,15 @@ export ACTIONQ_SCHEMA='actionq'
 
 actionctl migrate
 ```
+
+Check the same schema with the runtime identity before starting service:
+
+```bash
+actionctl check-compatibility
+```
+
+Normal commands and `actionq-server` fail closed when this check is not
+compatible. They never apply migrations as a startup side effect.
 
 Enqueue one action:
 
@@ -104,6 +113,7 @@ Priority is ascending, so smaller numbers are claimed first.
 | Command | Purpose |
 | --- | --- |
 | `actionctl migrate` | Create or upgrade the queue schema. |
+| `actionctl check-compatibility` | Report the read-only execution API/schema compatibility record. |
 | `actionctl add` | Enqueue a new action. |
 | `actionctl ls` | List actions with optional status, type, and project filters. |
 | `actionctl show ACTION_ID` | Show one action plus all recorded events. |
@@ -194,7 +204,14 @@ Integration tests create a fresh schema per test run.
 
 ## Operational Notes
 
-- The queue schema is created lazily by `actionctl migrate`.
+- The queue schema is created only by the deployment-owned `actionctl migrate`
+  entrypoint. It uses a transaction-scoped advisory lock, a version ledger,
+  packaged migration checksums, and idempotent retry behavior.
+- Runtime identities must not own schema objects or receive schema `CREATE`;
+  see [the migration and compatibility runbook](docs/operations/schema-migrations.md).
+- `actionq-server` checks compatibility before binding its socket. Its
+  read-only `GET /compatibility` endpoint publishes the same record for the
+  Vuoro execution adapter.
 - Claims use `FOR UPDATE SKIP LOCKED`, so multiple workers can contend safely.
 - Automated producers are rate limited when `created_by` starts with `agent:` or `script:`.
 - Child actions cannot exceed the configured chain depth.

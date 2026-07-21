@@ -1,0 +1,76 @@
+{
+  "schema_version": "test-context/v1",
+  "id": "actionq.execution.schema-migration-compatibility",
+  "owner_repo": "actionq",
+  "subject": "execution-schema",
+  "contract_ref": {
+    "doc_id": "actionq-vuoro-served-execution-alignment",
+    "revision": "git:0a2f56072f820bb973cd46ed453c0440057cc5e0"
+  },
+  "source_of_truth": "postgres-schema-migrations-ledger",
+  "depth": 2,
+  "backends": ["postgres"],
+  "actors": ["migration-job-a", "migration-job-b", "runtime-service"],
+  "initial_state": [
+    "the selected database and schema are disposable",
+    "the schema is empty, unversioned-current, current, or future-versioned",
+    "migration and runtime actors use separate database roles"
+  ],
+  "operations": [
+    {
+      "name": "migrate",
+      "actors": ["migration-job-a", "migration-job-b"],
+      "synchronization": "barrier-before-transaction-advisory-lock"
+    },
+    {
+      "name": "check-compatibility",
+      "actors": ["runtime-service"]
+    },
+    {
+      "name": "attempt-runtime-ddl",
+      "actors": ["runtime-service"]
+    }
+  ],
+  "consistency": {
+    "target": "serializable",
+    "object": "per-schema migration ledger and table shape"
+  },
+  "assumptions": {
+    "isolation": "postgres-read-committed-plus-transaction-advisory-lock",
+    "clock": "database-clock",
+    "fairness": "a lock holder eventually commits or disconnects"
+  },
+  "bounds": {
+    "actors": 3,
+    "concurrent_migration_jobs": 2,
+    "packaged_migrations": 1
+  },
+  "invariants": [
+    "one ledger row exists per applied domain migration version",
+    "a ledger row and its schema changes commit atomically",
+    "an exact retry does not reapply a recorded migration",
+    "runtime compatibility checks execute no ddl",
+    "unsupported schema versions prevent runtime request handling",
+    "the runtime role cannot create schema objects"
+  ],
+  "faults": [
+    "two migration jobs start concurrently",
+    "migration fails before ledger insertion",
+    "migration response is lost after commit",
+    "service restarts against current schema",
+    "runtime starts against a future schema"
+  ],
+  "oracles": [
+    "schema-migrations-ledger-query",
+    "information-schema-shape-query",
+    "packaged-migration-checksum",
+    "postgres-insufficient-privilege-sqlstate"
+  ],
+  "implementation_anchors": [
+    "actionq/schema.py:migrate",
+    "actionq/schema.py:check_compatibility",
+    "actionq/server.py:_runtime_connection",
+    "tests/test_integration_postgres.py:test_deployment_migrations_serialize_across_connections"
+  ],
+  "expansions": ["semantic-doc", "concurrent-history", "fault-scenario"]
+}
