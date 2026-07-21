@@ -26,7 +26,15 @@
     "overlays": [".agents/overlays/actionq.state-protocols.md"]
   },
   "scope": {
-    "allowed_path_roots": ["actionq/", "tests/", "docs/", "verification/", ".agents/"],
+    "allowed_path_roots": [
+      "README.md",
+      "pyproject.toml",
+      "actionq/",
+      "tests/",
+      "docs/",
+      "verification/",
+      ".agents/"
+    ],
     "out_of_scope": ["production queue mutation during verification unless explicitly authorized"]
   },
   "risk_surfaces": [

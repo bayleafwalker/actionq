@@ -16,6 +16,10 @@ The current execution contract reports:
 `actionctl check-compatibility` performs only `SELECT` statements and exits
 with status `3` for an incompatible schema. Its JSON object is the Actionq
 compatibility record consumed by the Vuoro execution adapter and handshake.
+The check validates the ledger and the live queue shape: column types,
+nullability/default presence, primary and foreign keys, the exact status-set
+constraint, and required index columns, ordering, predicates, access method,
+and readiness. A matching ledger never overrides damaged queue objects.
 
 ## Deployment sequence
 
@@ -27,8 +31,8 @@ compatibility record consumed by the Vuoro execution adapter and handshake.
 3. Run `actionctl migrate --json-output` in a foreground deployment Job with
    the migration DSN. The command takes a transaction-scoped PostgreSQL
    advisory lock derived from the schema name, applies every missing migration
-   in order, validates the required table shape, records its checksum, and
-   commits atomically.
+   in order, validates the required table/constraint/index shape, records its
+   checksum, and commits atomically.
 4. Run `actionctl check-compatibility` using the runtime DSN.
 5. Start or restart the service only after both commands succeed. Startup
    repeats the read-only compatibility check and never migrates automatically.
@@ -40,6 +44,13 @@ Retries are safe: an already-current migration reports an empty
 the second Job re-reads the ledger after acquiring the lock and does not apply
 a migration twice. Deployment orchestration should still create one Job per
 domain and gate service rollout on its completion so failures remain visible.
+
+The first version also recognizes the exact unversioned schema shipped before
+the ledger existed. It validates that schema semantically and records the v1
+checksum without replaying table or index DDL. Both historical index-name
+families are accepted when their definitions match; an index with a familiar
+name but different columns, order, or predicate is rejected. Partial or
+modified unversioned schemas are never stamped automatically.
 
 ## Database roles
 
@@ -69,11 +80,13 @@ by later migrations. Do not grant `CREATE`, migration-table writes, object
 ownership, role inheritance from the migrator, or database-wide DDL to the
 runtime identity.
 
-The optional integration gate uses separate
-`ACTIONQ_TEST_MIGRATION_URL`/`ACTIONQ_TEST_RUNTIME_URL` identities against one
-disposable database. It proves that the runtime identity can read the
-compatibility record and receives PostgreSQL `insufficient_privilege` for
-DDL. These variables must never refer to a production database.
+The integration gate starts an isolated PostgreSQL cluster under a temporary
+directory, listens on a private Unix socket with trust authentication, creates
+distinct migration/runtime roles, and removes the cluster afterward. It
+proves that the runtime identity can read the compatibility record and
+receives PostgreSQL `insufficient_privilege` for DDL. The harness refuses to
+skip when local `initdb`/`pg_ctl` binaries are expected but unavailable; it
+never reads or mutates an ambient queue.
 
 ## Recovery and rollback
 

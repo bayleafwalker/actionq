@@ -30,10 +30,18 @@ class _Transaction:
 
 
 class FakeSchemaConnection:
-    def __init__(self, *, ledger_exists: bool = False, applied: dict[int, str] | None = None):
+    def __init__(
+        self,
+        *,
+        ledger_exists: bool = False,
+        applied: dict[int, str] | None = None,
+        tables_exist: bool | None = None,
+        valid_indexes: bool = True,
+    ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
-        self.tables_exist = False
+        self.tables_exist = ledger_exists if tables_exist is None else tables_exist
+        self.valid_indexes = valid_indexes
         self.executed: list[tuple[str, object]] = []
         self.closed = False
 
@@ -52,6 +60,9 @@ class FakeSchemaConnection:
     def execute(self, statement, params=None):
         normalized = " ".join(str(statement).split())
         self.executed.append((normalized, params))
+        if normalized.startswith("SELECT to_regclass") and "AS actions" in normalized:
+            relation = "present" if self.tables_exist else None
+            return _Rows([{"actions": relation, "events": relation}])
         if normalized.startswith("SELECT to_regclass"):
             return _Rows([{"relation": "aq.schema_migrations" if self.ledger_exists else None}])
         if normalized.startswith("CREATE TABLE IF NOT EXISTS \"aq\".\"schema_migrations\""):
@@ -80,17 +91,66 @@ class FakeSchemaConnection:
                         for column, expected in columns.items()
                     )
             return _Rows(rows)
-        if normalized.startswith("SELECT relation.relname AS table_name"):
+        if normalized.startswith("SELECT relation.relname AS table_name") and "pg_constraint" in normalized:
             rows = []
             if self.tables_exist:
-                for table, constraints in schema._REQUIRED_CONSTRAINT_COUNTS.items():
-                    rows.extend(
+                rows = [
+                    {
+                        "table_name": "actions",
+                        "contype": "p",
+                        "columns": ["id"],
+                        "foreign_table": None,
+                        "foreign_columns": [],
+                        "definition": "PRIMARY KEY (id)",
+                    },
+                    {
+                        "table_name": "actions",
+                        "contype": "f",
+                        "columns": ["parent_id"],
+                        "foreign_table": "actions",
+                        "foreign_columns": ["id"],
+                        "definition": "FOREIGN KEY (parent_id) REFERENCES actions(id)",
+                    },
+                    {
+                        "table_name": "actions",
+                        "contype": "c",
+                        "columns": ["status"],
+                        "foreign_table": None,
+                        "foreign_columns": [],
+                        "definition": "CHECK (status IN ('pending', 'claimed', 'completed', 'failed', 'rejected', 'cancelled'))",
+                    },
+                    {
+                        "table_name": "events",
+                        "contype": "p",
+                        "columns": ["id"],
+                        "foreign_table": None,
+                        "foreign_columns": [],
+                        "definition": "PRIMARY KEY (id)",
+                    },
+                    {
+                        "table_name": "events",
+                        "contype": "f",
+                        "columns": ["action_id"],
+                        "foreign_table": "actions",
+                        "foreign_columns": ["id"],
+                        "definition": "FOREIGN KEY (action_id) REFERENCES actions(id)",
+                    },
+                ]
+            return _Rows(rows)
+        if normalized.startswith("SELECT relation.relname AS table_name") and "pg_index" in normalized:
+            rows = []
+            if self.tables_exist:
+                for table, columns, predicate in schema._REQUIRED_INDEXES.values():
+                    rows.append(
                         {
                             "table_name": table,
-                            "contype": constraint_type,
-                            "constraint_count": count,
+                            "indisvalid": self.valid_indexes,
+                            "indisready": True,
+                            "indisunique": False,
+                            "access_method": "btree",
+                            "columns": list(columns),
+                            "predicate": f"status = '{predicate}'::text" if predicate else None,
                         }
-                        for constraint_type, count in constraints.items()
                     )
             return _Rows(rows)
         if normalized.startswith("INSERT INTO \"aq\".\"schema_migrations\""):
@@ -144,6 +204,34 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "detail": "schema is compatible with the packaged execution adapter",
     }
     assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
+
+
+def test_compatibility_rejects_valid_ledger_when_queue_shape_is_missing():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        tables_exist=False,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.state == "shape-mismatch"
+    assert result.compatible is False
+    assert "column-missing:actions.id" in result.detail
+    assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
+
+
+def test_compatibility_rejects_semantically_invalid_index():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        valid_indexes=False,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.state == "shape-mismatch"
+    assert "index-missing-or-invalid:actions.claim-lookup" in result.detail
 
 
 @pytest.mark.parametrize(

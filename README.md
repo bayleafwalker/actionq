@@ -196,11 +196,14 @@ uv run pytest -q
 Run integration tests against a disposable Postgres database:
 
 ```bash
-export ACTIONQ_TEST_URL='postgresql://user:password@localhost:5432/testdb'
 uv run pytest tests/test_integration_postgres.py -q
 ```
 
-Integration tests create a fresh schema per test run.
+The migration/compatibility integration module starts its own temporary
+PostgreSQL cluster on a private Unix socket and creates distinct migration and
+runtime roles. It requires local `initdb` and `pg_ctl`, creates a fresh schema
+per test, and never uses an ambient queue DSN. Other state-protocol integration
+modules continue to require an explicitly disposable `ACTIONQ_TEST_URL`.
 
 ## Operational Notes
 
