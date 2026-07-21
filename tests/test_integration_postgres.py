@@ -441,6 +441,13 @@ def test_valid_ledger_with_damaged_queue_shape_fails_runtime_and_restart(runner_
         ),
         (
             (
+                "ALTER TABLE {schema}.actions ALTER COLUMN status "
+                "SET DEFAULT 'PENDING'",
+            ),
+            "column-default:actions.status",
+        ),
+        (
+            (
                 "ALTER TABLE {schema}.actions DROP CONSTRAINT actions_status_check",
                 "ALTER TABLE {schema}.actions ADD CONSTRAINT actions_status_check "
                 "CHECK (status IN ('pending', 'claimed', 'completed', 'failed', "
@@ -450,10 +457,70 @@ def test_valid_ledger_with_damaged_queue_shape_fails_runtime_and_restart(runner_
         ),
         (
             (
+                "ALTER TABLE {schema}.actions DROP CONSTRAINT actions_status_check",
+                "ALTER TABLE {schema}.actions ADD CONSTRAINT actions_status_check "
+                "CHECK (status IN ('PENDING', 'CLAIMED', 'COMPLETED', 'FAILED', "
+                "'REJECTED', 'CANCELLED'))",
+            ),
+            "constraint-invalid:actions.status",
+        ),
+        (
+            (
+                "DROP INDEX {schema}.idx_actions_claim_lookup",
+                "CREATE INDEX idx_actions_claim_lookup ON {schema}.actions"
+                "(status, priority, created_at) WHERE status = 'PENDING'",
+            ),
+            "index-missing-or-invalid:actions.claim-lookup",
+        ),
+        (
+            (
+                "DROP INDEX {schema}.idx_events_timestamp",
+                "CREATE INDEX idx_events_timestamp ON {schema}.events"
+                "(timestamp DESC NULLS LAST)",
+            ),
+            "index-missing-or-invalid:events.timestamp",
+        ),
+        (
+            (
                 "ALTER TABLE {schema}.events DROP CONSTRAINT events_action_id_fkey",
                 "ALTER TABLE {schema}.events ADD CONSTRAINT events_action_id_fkey "
                 "FOREIGN KEY (action_id) REFERENCES {schema}.actions(id) "
                 "ON UPDATE CASCADE ON DELETE CASCADE",
+            ),
+            "constraint-missing-or-invalid:events-action-foreign-key",
+        ),
+        (
+            (
+                "CREATE SCHEMA {shadow}",
+                "CREATE TABLE {shadow}.actions (id BIGINT PRIMARY KEY)",
+                "ALTER TABLE {schema}.events DROP CONSTRAINT events_action_id_fkey",
+                "ALTER TABLE {schema}.events ADD CONSTRAINT events_action_id_fkey "
+                "FOREIGN KEY (action_id) REFERENCES {shadow}.actions(id)",
+            ),
+            "constraint-missing-or-invalid:events-action-foreign-key",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.events DROP CONSTRAINT events_action_id_fkey",
+                "ALTER TABLE {schema}.events ADD CONSTRAINT events_action_id_fkey "
+                "FOREIGN KEY (action_id) REFERENCES {schema}.actions(id) "
+                "DEFERRABLE INITIALLY DEFERRED",
+            ),
+            "constraint-missing-or-invalid:events-action-foreign-key",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.events DROP CONSTRAINT events_action_id_fkey",
+                "ALTER TABLE {schema}.events ADD CONSTRAINT events_action_id_fkey "
+                "FOREIGN KEY (action_id) REFERENCES {schema}.actions(id) NOT VALID",
+            ),
+            "constraint-missing-or-invalid:events-action-foreign-key",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.events DROP CONSTRAINT events_action_id_fkey",
+                "ALTER TABLE {schema}.events ADD CONSTRAINT events_action_id_fkey "
+                "FOREIGN KEY (action_id) REFERENCES {schema}.actions(id) MATCH FULL",
             ),
             "constraint-missing-or-invalid:events-action-foreign-key",
         ),
@@ -466,8 +533,13 @@ def test_runtime_rejects_semantically_permissive_schema_shape(
     assert runner.invoke(cli, ["migrate"]).exit_code == 0
     conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
     quoted_schema = f'"{schema}"'
+    quoted_shadow = f'"{schema}_shadow"'
     for statement in statements:
-        conn.execute(statement.replace("{schema}", quoted_schema))
+        conn.execute(
+            statement.replace("{schema}", quoted_schema).replace(
+                "{shadow}", quoted_shadow
+            )
+        )
     conn.commit()
     conn.close()
 
@@ -563,3 +635,193 @@ def test_migration_role_cannot_serve_and_runtime_role_cannot_run_ddl(monkeypatch
     finally:
         runtime_conn.close()
         migration_conn.close()
+
+
+def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revoked(
+    monkeypatch,
+):
+    """Reproduce the split owner topology from the independent PG18 gate."""
+
+    schema = "aqsplitroles_" + uuid.uuid4().hex
+    admin_conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    migration_conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    runtime_conn = db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+    schema_identifier = sql.Identifier(schema)
+    migration_identifier = sql.Identifier(MIGRATION_ROLE)
+    runtime_identifier = sql.Identifier(RUNTIME_ROLE)
+    membership_granted = False
+    try:
+        admin_conn.execute(
+            sql.SQL("CREATE SCHEMA {} AUTHORIZATION CURRENT_USER").format(
+                schema_identifier
+            )
+        )
+        admin_conn.execute(
+            sql.SQL("GRANT USAGE, CREATE ON SCHEMA {} TO {}").format(
+                schema_identifier, migration_identifier
+            )
+        )
+        admin_conn.commit()
+
+        monkeypatch.delenv("ACTIONQ_RUNTIME_ROLE")
+        report = schema_contract.migrate(migration_conn, schema)
+        assert report["runtime_role"] is None
+
+        admin_conn.execute(
+            sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC, {}, {}").format(
+                schema_identifier, migration_identifier, runtime_identifier
+            )
+        )
+        admin_conn.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                schema_identifier, runtime_identifier
+            )
+        )
+        admin_conn.execute(
+            sql.SQL(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {}.{}, {}.{} TO {}"
+            ).format(
+                schema_identifier,
+                sql.Identifier("actions"),
+                schema_identifier,
+                sql.Identifier("events"),
+                runtime_identifier,
+            )
+        )
+        admin_conn.execute(
+            sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
+                schema_identifier,
+                sql.Identifier("schema_migrations"),
+                runtime_identifier,
+            )
+        )
+        admin_conn.execute(
+            sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
+                schema_identifier, runtime_identifier
+            )
+        )
+        admin_conn.commit()
+
+        topology = admin_conn.execute(
+            """
+            SELECT owner_role.rolname AS schema_owner,
+                   array_agg(DISTINCT relation_owner.rolname) AS relation_owners
+            FROM pg_namespace AS namespace_record
+            JOIN pg_roles AS owner_role ON owner_role.oid = namespace_record.nspowner
+            JOIN pg_class AS relation_record
+              ON relation_record.relnamespace = namespace_record.oid
+             AND relation_record.relname = ANY(%s)
+            JOIN pg_roles AS relation_owner
+              ON relation_owner.oid = relation_record.relowner
+            WHERE namespace_record.nspname = %s
+            GROUP BY owner_role.rolname
+            """,
+            (["actions", "events", "schema_migrations"], schema),
+        ).fetchone()
+        admin_conn.rollback()
+        assert topology["schema_owner"] != MIGRATION_ROLE
+        assert topology["relation_owners"] == [MIGRATION_ROLE]
+        assert migration_conn.execute(
+            "SELECT has_schema_privilege(current_user, %s, 'CREATE') AS allowed",
+            (schema,),
+        ).fetchone()["allowed"] is False
+        migration_conn.rollback()
+
+        owner_compatibility = schema_contract.check_compatibility(
+            migration_conn, schema
+        )
+        assert owner_compatibility.state == "role-mismatch"
+        assert "owns a domain relation" in owner_compatibility.detail
+        migration_conn.rollback()
+
+        # Revoking schema CREATE does not remove ALTER authority from the
+        # principal that owns the tables. Prove the verifier topology without
+        # retaining the probe mutation.
+        migration_conn.execute(
+            sql.SQL("ALTER TABLE {}.{} ADD COLUMN verifier_probe INTEGER").format(
+                schema_identifier, sql.Identifier("actions")
+            )
+        )
+        migration_conn.rollback()
+
+        monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
+        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
+            server._require_runtime_compatibility()
+        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
+            server._dispatch(
+                {
+                    "contract_version": "v1",
+                    "repo_id": "actionq",
+                    "kind": "implement",
+                    "title": "relation owner must not dispatch",
+                }
+            )
+
+        assert schema_contract.require_compatible(runtime_conn, schema).compatible
+        runtime_conn.rollback()
+        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+        assert server._require_runtime_compatibility()["state"] == "compatible"
+        assert server._dispatch(
+            {
+                "contract_version": "v1",
+                "repo_id": "actionq",
+                "kind": "implement",
+                "title": "bounded runtime dispatch",
+            }
+        )["status"] == "pending"
+
+        with pytest.raises(Exception) as excinfo:
+            runtime_conn.execute(
+                sql.SQL("ALTER TABLE {}.{} ADD COLUMN forbidden INTEGER").format(
+                    schema_identifier, sql.Identifier("actions")
+                )
+            )
+        assert getattr(excinfo.value, "sqlstate", None) == "42501"
+        runtime_conn.rollback()
+        with pytest.raises(Exception) as excinfo:
+            runtime_conn.execute(
+                sql.SQL("UPDATE {}.{} SET checksum = 'forbidden'").format(
+                    schema_identifier, sql.Identifier("schema_migrations")
+                )
+            )
+        assert getattr(excinfo.value, "sqlstate", None) == "42501"
+        runtime_conn.rollback()
+
+        admin_conn.execute(
+            sql.SQL("GRANT {} TO {}").format(
+                migration_identifier, runtime_identifier
+            )
+        )
+        admin_conn.commit()
+        membership_granted = True
+
+        assumable_compatibility = schema_contract.check_compatibility(
+            runtime_conn, schema
+        )
+        assert assumable_compatibility.state == "role-mismatch"
+        assert "can assume a domain relation owner" in assumable_compatibility.detail
+        runtime_conn.rollback()
+        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
+            server._require_runtime_compatibility()
+        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
+            server._dispatch(
+                {
+                    "contract_version": "v1",
+                    "repo_id": "actionq",
+                    "kind": "implement",
+                    "title": "owner member must not dispatch",
+                }
+            )
+    finally:
+        if membership_granted:
+            admin_conn.rollback()
+            admin_conn.execute(
+                sql.SQL("REVOKE {} FROM {}").format(
+                    migration_identifier, runtime_identifier
+                )
+            )
+            admin_conn.commit()
+        runtime_conn.close()
+        migration_conn.close()
+        admin_conn.close()

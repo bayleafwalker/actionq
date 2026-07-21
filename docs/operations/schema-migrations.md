@@ -18,11 +18,13 @@ with status `3` for an incompatible schema. Its JSON object is the Actionq
 compatibility record consumed by the Vuoro execution adapter and handshake.
 The check validates the ledger and the live queue shape: exact column types,
 nullability and default expressions; primary keys; foreign-key columns,
-targets, and `NO ACTION` update/delete behavior; the exact status-set
-expression; and required index columns, ordering, predicates, access method,
-and readiness. A matching ledger never overrides damaged queue objects. A
-constraint containing all expected status literals plus a permissive branch
-such as `OR true` is incompatible.
+target schema/relation identity, referenced columns, match/update/delete
+actions, deferrability, initial mode, and validation state; the exact
+status-set expression; and required index columns, direction, explicit null
+ordering, predicates, access method, and readiness. Quoted literal case is
+preserved in comparisons. A matching ledger never overrides damaged queue
+objects. A constraint containing all expected status literals plus a
+permissive branch such as `OR true` is incompatible.
 
 ## Deployment sequence
 
@@ -64,8 +66,11 @@ requires two distinct roles:
 - The migration role can connect, take advisory locks, create/alter objects in
   the selected Actionq schema, and read/write `schema_migrations`. It is used
   only by a migration Job. Runtime compatibility rejects any principal with
-  `CREATE` authority on the selected schema, so a migration owner cannot start
-  the server or dispatch work even if it is presented as a runtime DSN.
+  `CREATE` authority on the selected schema, ownership of any relation in that
+  schema, membership in a schema/relation owner role, or write authority on
+  the migration ledger. Revoking schema `CREATE` alone does not make a table
+  owner safe to serve: it retains `ALTER` authority. Such a principal cannot
+  start the server or dispatch work even if presented as a runtime DSN.
 - The runtime role has schema `USAGE`, queue table DML, sequence usage, and
   `SELECT` on `schema_migrations`. It has no `CREATE` privilege on the schema,
   no ownership of its objects, and no membership in the migration role.
@@ -92,10 +97,13 @@ runtime identity.
 The integration gate starts an isolated PostgreSQL cluster under a temporary
 directory, listens on a private Unix socket with trust authentication, creates
 distinct migration/runtime roles, and removes the cluster afterward. It
-proves that the migration identity cannot pass the service startup/dispatch
-gate, while the runtime identity can serve normal queue requests and receives
-PostgreSQL `insufficient_privilege` for DDL and migration-ledger writes. It
-also runs durable rejection-event and exact default/constraint regressions.
+proves that schema owners, relation owners, and principals that can assume an
+owner role cannot pass the service startup/dispatch gate, including the split
+topology where an administrator owns the schema and the migrator owns its
+tables after schema `CREATE` is revoked. The runtime identity can serve normal
+queue requests and receives PostgreSQL `insufficient_privilege` for DDL and
+migration-ledger writes. The gate also runs durable rejection-event and exact
+default/constraint/index regressions.
 The harness refuses to skip when local `initdb`/`pg_ctl` binaries are expected
 but unavailable; it never reads or mutates an ambient queue.
 

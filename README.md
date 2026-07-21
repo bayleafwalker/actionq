@@ -213,7 +213,8 @@ uses an ambient queue DSN.
 - The queue schema is created only by the deployment-owned `actionctl migrate`
   entrypoint. It uses a transaction-scoped advisory lock, a version ledger,
   packaged migration checksums, and idempotent retry behavior.
-- Runtime identities must not own schema objects or receive schema `CREATE`;
+- Runtime identities must not own schema objects, assume an owner role, or
+  receive schema `CREATE` or migration-ledger write authority;
   see [the migration and compatibility runbook](docs/operations/schema-migrations.md).
 - `actionq-server` checks compatibility before binding its socket. Its
   read-only `GET /compatibility` endpoint publishes the same record for the

@@ -60,13 +60,25 @@ _REQUIRED_CONSTRAINT_COUNTS = {
     "events": {"p": 1, "f": 1},
 }
 _REQUIRED_INDEXES = {
-    "actions.claim-lookup": ("actions", ("status", "priority", "created_at"), "pending"),
-    "actions.parent": ("actions", ("parent_id",), None),
-    "actions.project": ("actions", ("project",), None),
-    "actions.deadline": ("actions", ("claim_deadline",), "claimed"),
-    "events.action": ("events", ("action_id",), None),
-    "events.timestamp": ("events", ("timestamp desc",), None),
-    "events.type-time": ("events", ("event_type", "timestamp desc"), None),
+    "actions.claim-lookup": (
+        "actions",
+        (("status", False, False), ("priority", False, False), ("created_at", False, False)),
+        "status = 'pending'::text",
+    ),
+    "actions.parent": ("actions", (("parent_id", False, False),), None),
+    "actions.project": ("actions", (("project", False, False),), None),
+    "actions.deadline": (
+        "actions",
+        (("claim_deadline", False, False),),
+        "status = 'claimed'::text",
+    ),
+    "events.action": ("events", (("action_id", False, False),), None),
+    "events.timestamp": ("events", (("timestamp", True, True),), None),
+    "events.type-time": (
+        "events",
+        (("event_type", False, False), ("timestamp", True, True)),
+        None,
+    ),
 }
 
 
@@ -189,38 +201,158 @@ def _data_tables_exist(conn, schema: str) -> bool:
     )
 
 
-def _normalized_identifier(value: Any) -> str:
-    normalized = " ".join(str(value).replace('"', "").strip().lower().split())
-    return re.sub(r"\s+nulls\s+(first|last)$", "", normalized)
+def _canonical_sql(value: Any) -> str:
+    """Collapse only insignificant SQL whitespace outside quoted tokens.
+
+    PostgreSQL catalog deparsers already normalize unquoted identifiers. This
+    helper deliberately preserves case and contents inside string and quoted
+    identifier tokens, and it never removes ordering or other SQL clauses.
+    """
+
+    output: list[str] = []
+    quote: str | None = None
+    pending_space = False
+    raw = str(value).strip()
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if quote is not None:
+            output.append(character)
+            if character == quote:
+                if index + 1 < len(raw) and raw[index + 1] == quote:
+                    index += 1
+                    output.append(raw[index])
+                else:
+                    quote = None
+            index += 1
+            continue
+        if character in ("'", '"'):
+            if pending_space and output:
+                output.append(" ")
+            pending_space = False
+            quote = character
+            output.append(character)
+        elif character.isspace():
+            pending_space = True
+        else:
+            if pending_space and output:
+                output.append(" ")
+            pending_space = False
+            output.append(character)
+        index += 1
+    return "".join(output).strip()
 
 
-def _normalized_default(schema: str, expected: str | None, value: Any) -> str | None:
+def _without_redundant_outer_parentheses(value: Any) -> str:
+    canonical = _canonical_sql(value)
+    while canonical.startswith("(") and canonical.endswith(")"):
+        depth = 0
+        quote: str | None = None
+        wraps_entire_expression = True
+        index = 0
+        while index < len(canonical):
+            character = canonical[index]
+            if quote is not None:
+                if character == quote:
+                    if index + 1 < len(canonical) and canonical[index + 1] == quote:
+                        index += 1
+                    else:
+                        quote = None
+            elif character in ("'", '"'):
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0 and index != len(canonical) - 1:
+                    wraps_entire_expression = False
+                    break
+            index += 1
+        if not wraps_entire_expression or depth != 0:
+            break
+        canonical = _canonical_sql(canonical[1:-1])
+    return canonical
+
+
+def _canonical_default(schema: str, expected: str | None, value: Any) -> str | None:
     if value is None:
         return None
-    normalized = _normalized_identifier(value)
+    canonical = _canonical_sql(value)
     if expected and expected.startswith("sequence:"):
         sequence = expected.removeprefix("sequence:")
-        pattern = (
-            r"nextval\('(?:"
-            + re.escape(schema.lower())
-            + r"\.)?"
-            + re.escape(sequence)
-            + r"'::regclass\)"
-        )
-        return expected if re.fullmatch(pattern, normalized) else normalized
-    return normalized
+        accepted = {
+            _canonical_sql(f"nextval('{sequence}'::regclass)"),
+            _canonical_sql(f"nextval('{schema}.{sequence}'::regclass)"),
+            _canonical_sql(f"nextval('\"{schema}\".{sequence}'::regclass)"),
+        }
+        return expected if canonical in accepted else canonical
+    return canonical
 
 
 def _runtime_principal_issue(conn, schema: str) -> str | None:
     row = conn.execute(
         """
         SELECT current_user AS principal,
-               has_schema_privilege(current_user, %s, 'CREATE') AS can_create
+               principal_record.rolsuper AS is_superuser,
+               schema_record.nspowner = principal_record.oid AS owns_schema,
+               pg_has_role(current_user, schema_record.nspowner, 'MEMBER')
+                   AS can_assume_schema_owner,
+               has_schema_privilege(current_user, schema_record.oid, 'CREATE')
+                   AS can_create,
+               COALESCE(bool_or(
+                   relation_record.relowner = principal_record.oid
+               ), false) AS owns_relation,
+               COALESCE(bool_or(
+                   relation_record.relowner IS NOT NULL
+                   AND pg_has_role(current_user, relation_record.relowner, 'MEMBER')
+               ), false) AS can_assume_relation_owner,
+               COALESCE(bool_or(
+                   relation_record.relname = %s
+                   AND relation_record.relkind IN ('r', 'p')
+                   AND (
+                       has_table_privilege(current_user, relation_record.oid, 'INSERT')
+                       OR has_table_privilege(current_user, relation_record.oid, 'UPDATE')
+                       OR has_table_privilege(current_user, relation_record.oid, 'DELETE')
+                       OR has_table_privilege(current_user, relation_record.oid, 'TRUNCATE')
+                       OR has_table_privilege(current_user, relation_record.oid, 'REFERENCES')
+                       OR has_table_privilege(current_user, relation_record.oid, 'TRIGGER')
+                   )
+               ), false) AS can_write_ledger
+        FROM pg_namespace AS schema_record
+        JOIN pg_roles AS principal_record ON principal_record.rolname = current_user
+        LEFT JOIN pg_class AS relation_record
+          ON relation_record.relnamespace = schema_record.oid
+         AND relation_record.relkind IN ('r', 'p', 'S', 'i', 'I')
+        WHERE schema_record.nspname = %s
+        GROUP BY principal_record.oid,
+                 principal_record.rolsuper,
+                 schema_record.oid,
+                 schema_record.nspowner
         """,
-        (schema,),
+        (MIGRATION_TABLE, schema),
     ).fetchone()
-    if row and bool(_row_value(row, "can_create", 1)):
-        return "runtime principal has schema CREATE authority"
+    if row is None:
+        return "runtime principal authority could not be established"
+    checks = (
+        ("is_superuser", 1, "runtime principal is superuser"),
+        ("owns_schema", 2, "runtime principal owns the domain schema"),
+        (
+            "can_assume_schema_owner",
+            3,
+            "runtime principal can assume the domain schema owner",
+        ),
+        ("can_create", 4, "runtime principal has schema CREATE authority"),
+        ("owns_relation", 5, "runtime principal owns a domain relation"),
+        (
+            "can_assume_relation_owner",
+            6,
+            "runtime principal can assume a domain relation owner",
+        ),
+        ("can_write_ledger", 7, "runtime principal can mutate the migration ledger"),
+    )
+    for key, index, detail in checks:
+        if bool(_row_value(row, key, index)):
+            return detail
     return None
 
 
@@ -247,7 +379,7 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
             observed[table][column] = (
                 str(_row_value(row, "data_type", 2)),
                 str(_row_value(row, "is_nullable", 3)),
-                _normalized_default(
+                _canonical_default(
                     schema,
                     expected_default,
                     _row_value(row, "column_default", 4),
@@ -271,6 +403,7 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     constraint_rows = conn.execute(
         """
         SELECT relation.relname AS table_name,
+               relation.oid AS relation_oid,
                constraint_record.contype,
                ARRAY(
                    SELECT attribute_record.attname
@@ -280,7 +413,9 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                     AND attribute_record.attnum = key_record.attnum
                    ORDER BY key_record.position
                ) AS columns,
+               foreign_namespace.nspname AS foreign_namespace,
                foreign_relation.relname AS foreign_table,
+               foreign_relation.oid AS foreign_oid,
                ARRAY(
                    SELECT foreign_attribute.attname
                    FROM unnest(constraint_record.confkey) WITH ORDINALITY AS key_record(attnum, position)
@@ -291,6 +426,10 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                ) AS foreign_columns,
                constraint_record.confupdtype AS update_action,
                constraint_record.confdeltype AS delete_action,
+               constraint_record.confmatchtype AS match_action,
+               constraint_record.condeferrable AS is_deferrable,
+               constraint_record.condeferred AS is_initially_deferred,
+               constraint_record.convalidated AS is_validated,
                pg_get_expr(
                    constraint_record.conbin,
                    constraint_record.conrelid,
@@ -300,6 +439,8 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
         JOIN pg_namespace AS namespace_record ON namespace_record.oid = relation.relnamespace
         LEFT JOIN pg_class AS foreign_relation ON foreign_relation.oid = constraint_record.confrelid
+        LEFT JOIN pg_namespace AS foreign_namespace
+          ON foreign_namespace.oid = foreign_relation.relnamespace
         WHERE namespace_record.nspname = %s AND relation.relname = ANY(%s)
         """,
         (schema, list(_REQUIRED_CONSTRAINT_COUNTS)),
@@ -309,25 +450,45 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         constraints.append(
             {
                 "table": str(_row_value(row, "table_name")),
-                "type": str(_row_value(row, "contype", 1)),
-                "columns": tuple(_row_value(row, "columns", 2) or ()),
-                "foreign_table": _row_value(row, "foreign_table", 3),
-                "foreign_columns": tuple(_row_value(row, "foreign_columns", 4) or ()),
-                "update_action": str(_row_value(row, "update_action", 5)),
-                "delete_action": str(_row_value(row, "delete_action", 6)),
-                "expression": str(_row_value(row, "expression", 7) or ""),
+                "relation_oid": _row_value(row, "relation_oid", 1),
+                "type": str(_row_value(row, "contype", 2)),
+                "columns": tuple(_row_value(row, "columns", 3) or ()),
+                "foreign_namespace": _row_value(row, "foreign_namespace", 4),
+                "foreign_table": _row_value(row, "foreign_table", 5),
+                "foreign_oid": _row_value(row, "foreign_oid", 6),
+                "foreign_columns": tuple(_row_value(row, "foreign_columns", 7) or ()),
+                "update_action": str(_row_value(row, "update_action", 8)),
+                "delete_action": str(_row_value(row, "delete_action", 9)),
+                "match_action": str(_row_value(row, "match_action", 10)),
+                "is_deferrable": bool(_row_value(row, "is_deferrable", 11)),
+                "is_initially_deferred": bool(
+                    _row_value(row, "is_initially_deferred", 12)
+                ),
+                "is_validated": bool(_row_value(row, "is_validated", 13)),
+                "expression": str(_row_value(row, "expression", 14) or ""),
             }
         )
+    table_oids = {
+        constraint["table"]: constraint["relation_oid"]
+        for constraint in constraints
+        if constraint["table"] in _REQUIRED_CONSTRAINT_COUNTS
+    }
 
     def has_constraint(
         table: str,
         constraint_type: str,
         columns: tuple[str, ...],
         *,
+        foreign_namespace: str | None = None,
         foreign_table: str | None = None,
+        foreign_oid: Any = None,
         foreign_columns: tuple[str, ...] = (),
         update_action: str = "a",
         delete_action: str = "a",
+        match_action: str = "s",
+        is_deferrable: bool = False,
+        is_initially_deferred: bool = False,
+        is_validated: bool = True,
     ) -> bool:
         return any(
             constraint["table"] == table
@@ -336,10 +497,16 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
             and (
                 foreign_table is None
                 or (
-                    constraint["foreign_table"] == foreign_table
+                    constraint["foreign_namespace"] == foreign_namespace
+                    and constraint["foreign_table"] == foreign_table
+                    and constraint["foreign_oid"] == foreign_oid
                     and constraint["foreign_columns"] == foreign_columns
                     and constraint["update_action"] == update_action
                     and constraint["delete_action"] == delete_action
+                    and constraint["match_action"] == match_action
+                    and constraint["is_deferrable"] is is_deferrable
+                    and constraint["is_initially_deferred"] is is_initially_deferred
+                    and constraint["is_validated"] is is_validated
                 )
             )
             for constraint in constraints
@@ -353,7 +520,9 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                 "actions",
                 "f",
                 ("parent_id",),
+                foreign_namespace=schema,
                 foreign_table="actions",
+                foreign_oid=table_oids.get("actions"),
                 foreign_columns=("id",),
             ),
         ),
@@ -364,7 +533,9 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                 "events",
                 "f",
                 ("action_id",),
+                foreign_namespace=schema,
                 foreign_table="actions",
+                foreign_oid=table_oids.get("actions"),
                 foreign_columns=("id",),
             ),
         ),
@@ -379,7 +550,7 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         and constraint["type"] == "c"
         and constraint["columns"] == ("status",)
     ]
-    expected_status_expression = _normalized_identifier(
+    expected_status_expression = _without_redundant_outer_parentheses(
         "status = ANY (ARRAY["
         + ", ".join(f"'{status}'::text" for status in (
             "pending",
@@ -392,12 +563,10 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         + "])"
     )
     actual_status_expression = (
-        _normalized_identifier(status_checks[0]["expression"])
+        _without_redundant_outer_parentheses(status_checks[0]["expression"])
         if len(status_checks) == 1
         else ""
     )
-    if actual_status_expression.startswith("(") and actual_status_expression.endswith(")"):
-        actual_status_expression = actual_status_expression[1:-1]
     if len(status_checks) != 1 or actual_status_expression != expected_status_expression:
         issues.append("constraint-invalid:actions.status")
 
@@ -409,15 +578,28 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                index_record.indisunique,
                access_method.amname AS access_method,
                ARRAY(
-                   SELECT pg_get_indexdef(index_record.indexrelid, position, true)
-                       || CASE
-                              WHEN (index_record.indoption[position - 1] & 1) = 1
-                              THEN ' DESC'
-                              ELSE ''
-                          END
+                   SELECT COALESCE(
+                       (
+                           SELECT attribute_record.attname
+                           FROM pg_attribute AS attribute_record
+                           WHERE attribute_record.attrelid = index_record.indrelid
+                             AND attribute_record.attnum = index_record.indkey[position - 1]
+                       ),
+                       pg_get_indexdef(index_record.indexrelid, position, true)
+                   )
                    FROM generate_series(1, index_record.indnkeyatts) AS position
                    ORDER BY position
-               ) AS columns,
+               ) AS expressions,
+               ARRAY(
+                   SELECT (index_record.indoption[position - 1] & 1) = 1
+                   FROM generate_series(1, index_record.indnkeyatts) AS position
+                   ORDER BY position
+               ) AS descending,
+               ARRAY(
+                   SELECT (index_record.indoption[position - 1] & 2) = 2
+                   FROM generate_series(1, index_record.indnkeyatts) AS position
+                   ORDER BY position
+               ) AS nulls_first,
                pg_get_expr(index_record.indpred, index_record.indrelid, true) AS predicate
         FROM pg_index AS index_record
         JOIN pg_class AS relation ON relation.oid = index_record.indrelid
@@ -432,12 +614,9 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     ).fetchall()
     indexes = []
     for row in index_rows:
-        predicate = _row_value(row, "predicate", 6)
-        normalized_predicate = _normalized_identifier(predicate or "")
-        predicate_match = re.fullmatch(
-            r"\(?status\s*=\s*'([^']+)'(?:::text)?\)?",
-            normalized_predicate,
-        )
+        expressions = tuple(_row_value(row, "expressions", 5) or ())
+        descending = tuple(_row_value(row, "descending", 6) or ())
+        nulls_first = tuple(_row_value(row, "nulls_first", 7) or ())
         indexes.append(
             {
                 "table": str(_row_value(row, "table_name")),
@@ -445,22 +624,31 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                 "ready": bool(_row_value(row, "indisready", 2)),
                 "unique": bool(_row_value(row, "indisunique", 3)),
                 "access_method": str(_row_value(row, "access_method", 4)),
-                "columns": tuple(
-                    _normalized_identifier(column)
-                    for column in (_row_value(row, "columns", 5) or ())
+                "keys": tuple(
+                    (_canonical_sql(expression), bool(is_desc), bool(is_nulls_first))
+                    for expression, is_desc, is_nulls_first in zip(
+                        expressions, descending, nulls_first, strict=True
+                    )
                 ),
-                "predicate_status": predicate_match.group(1) if predicate_match else None,
+                "predicate": (
+                    _without_redundant_outer_parentheses(
+                        _row_value(row, "predicate", 8)
+                    )
+                    if _row_value(row, "predicate", 8) is not None
+                    else None
+                ),
             }
         )
-    for name, (table, columns, predicate_status) in _REQUIRED_INDEXES.items():
+    for name, (table, keys, predicate) in _REQUIRED_INDEXES.items():
         if not any(
             index["table"] == table
             and index["valid"]
             and index["ready"]
             and not index["unique"]
             and index["access_method"] == "btree"
-            and index["columns"] == columns
-            and index["predicate_status"] == predicate_status
+            and index["keys"] == keys
+            and index["predicate"]
+            == (_without_redundant_outer_parentheses(predicate) if predicate else None)
             for index in indexes
         ):
             issues.append(f"index-missing-or-invalid:{name}")
