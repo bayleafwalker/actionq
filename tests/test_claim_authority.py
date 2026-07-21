@@ -15,8 +15,6 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from click.testing import CliRunner
-
 try:
     import psycopg  # noqa: F401
 except ModuleNotFoundError:
@@ -208,10 +206,11 @@ def test_renew_after_reassignment_by_a_different_worker_is_rejected_for_the_stal
 # -- CLI surface -----------------------------------------------------------
 
 
-def test_renew_cli_exits_nonzero_with_rejection_reason(schema, monkeypatch):
-    monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_URL"])
+def test_renew_cli_exits_nonzero_with_rejection_reason(
+    schema, monkeypatch, actionq_cli_runner
+):
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
-    runner = CliRunner()
+    runner = actionq_cli_runner
     assert runner.invoke(cli, ["migrate"]).exit_code == 0
 
     action = json.loads(
@@ -229,6 +228,14 @@ def test_renew_cli_exits_nonzero_with_rejection_reason(schema, monkeypatch):
     rejected = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:impostor"])
     assert rejected.exit_code == 2
     assert "claimed-by-different-worker" in rejected.output
+
+    # Read through an independent connection before issuing another CLI command.
+    # This proves the rejection survived the failed command's connection close;
+    # it is not merely visible inside a transaction that will be rolled back.
+    verify_conn = db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+    durable_events = db.action_events(verify_conn, schema, action["id"])
+    verify_conn.close()
+    assert _event_type(durable_events[-1]) == "claim_renewal_rejected"
 
     history = json.loads(runner.invoke(cli, ["show", str(action["id"])]).output)
     assert [e["event_type"] for e in history["events"]] == [

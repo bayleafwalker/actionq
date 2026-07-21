@@ -28,6 +28,7 @@
   "scope": {
     "allowed_path_roots": [
       "README.md",
+      "actionq.dispatch.json",
       "pyproject.toml",
       "actionq/",
       "tests/",

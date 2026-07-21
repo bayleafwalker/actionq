@@ -8,6 +8,7 @@ issue DDL and work with a role that can only read the migration ledger.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import asdict, dataclass
 from importlib import resources
@@ -24,31 +25,31 @@ MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
     "actions": {
-        "id": ("bigint", "NO", True),
-        "action_type": ("text", "NO", False),
-        "project": ("text", "YES", False),
-        "target_ref": ("text", "YES", False),
-        "source_refs": ("jsonb", "NO", True),
-        "priority": ("integer", "NO", True),
-        "status": ("text", "NO", True),
-        "parent_id": ("bigint", "YES", False),
-        "chain_depth": ("integer", "NO", True),
-        "created_at": ("timestamp with time zone", "NO", True),
-        "claimed_at": ("timestamp with time zone", "YES", False),
-        "claimed_by": ("text", "YES", False),
-        "claim_deadline": ("timestamp with time zone", "YES", False),
-        "completed_at": ("timestamp with time zone", "YES", False),
-        "result_ref": ("text", "YES", False),
-        "failure_reason": ("text", "YES", False),
-        "created_by": ("text", "NO", False),
+        "id": ("bigint", "NO", "sequence:actions_id_seq"),
+        "action_type": ("text", "NO", None),
+        "project": ("text", "YES", None),
+        "target_ref": ("text", "YES", None),
+        "source_refs": ("jsonb", "NO", "'[]'::jsonb"),
+        "priority": ("integer", "NO", "100"),
+        "status": ("text", "NO", "'pending'::text"),
+        "parent_id": ("bigint", "YES", None),
+        "chain_depth": ("integer", "NO", "0"),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+        "claimed_at": ("timestamp with time zone", "YES", None),
+        "claimed_by": ("text", "YES", None),
+        "claim_deadline": ("timestamp with time zone", "YES", None),
+        "completed_at": ("timestamp with time zone", "YES", None),
+        "result_ref": ("text", "YES", None),
+        "failure_reason": ("text", "YES", None),
+        "created_by": ("text", "NO", None),
     },
     "events": {
-        "id": ("bigint", "NO", True),
-        "action_id": ("bigint", "YES", False),
-        "event_type": ("text", "NO", False),
-        "timestamp": ("timestamp with time zone", "NO", True),
-        "actor": ("text", "YES", False),
-        "payload": ("jsonb", "NO", True),
+        "id": ("bigint", "NO", "sequence:events_id_seq"),
+        "action_id": ("bigint", "YES", None),
+        "event_type": ("text", "NO", None),
+        "timestamp": ("timestamp with time zone", "NO", "now()"),
+        "actor": ("text", "YES", None),
+        "payload": ("jsonb", "NO", "'{}'::jsonb"),
     },
 }
 _REQUIRED_COLUMNS = {
@@ -57,14 +58,6 @@ _REQUIRED_COLUMNS = {
 _REQUIRED_CONSTRAINT_COUNTS = {
     "actions": {"p": 1, "f": 1, "c": 1},
     "events": {"p": 1, "f": 1},
-}
-_TERMINAL_AND_ACTIVE_STATUSES = {
-    "pending",
-    "claimed",
-    "completed",
-    "failed",
-    "rejected",
-    "cancelled",
 }
 _REQUIRED_INDEXES = {
     "actions.claim-lookup": ("actions", ("status", "priority", "created_at"), "pending"),
@@ -201,6 +194,36 @@ def _normalized_identifier(value: Any) -> str:
     return re.sub(r"\s+nulls\s+(first|last)$", "", normalized)
 
 
+def _normalized_default(schema: str, expected: str | None, value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = _normalized_identifier(value)
+    if expected and expected.startswith("sequence:"):
+        sequence = expected.removeprefix("sequence:")
+        pattern = (
+            r"nextval\('(?:"
+            + re.escape(schema.lower())
+            + r"\.)?"
+            + re.escape(sequence)
+            + r"'::regclass\)"
+        )
+        return expected if re.fullmatch(pattern, normalized) else normalized
+    return normalized
+
+
+def _runtime_principal_issue(conn, schema: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT current_user AS principal,
+               has_schema_privilege(current_user, %s, 'CREATE') AS can_create
+        """,
+        (schema,),
+    ).fetchone()
+    if row and bool(_row_value(row, "can_create", 1)):
+        return "runtime principal has schema CREATE authority"
+    return None
+
+
 def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     """Return deterministic schema-shape issues using SELECT statements only."""
 
@@ -213,25 +236,37 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         """,
         (schema, list(_REQUIRED_COLUMNS)),
     ).fetchall()
-    observed: dict[str, dict[str, tuple[str, str, bool]]] = {
+    observed: dict[str, dict[str, tuple[str, str, str | None]]] = {
         table: {} for table in _COLUMN_SHAPE
     }
     for row in rows:
         table = str(_row_value(row, "table_name"))
         column = str(_row_value(row, "column_name", 1))
-        if table in observed:
+        if table in observed and column in _COLUMN_SHAPE[table]:
+            expected_default = _COLUMN_SHAPE[table][column][2]
             observed[table][column] = (
                 str(_row_value(row, "data_type", 2)),
                 str(_row_value(row, "is_nullable", 3)),
-                _row_value(row, "column_default", 4) is not None,
+                _normalized_default(
+                    schema,
+                    expected_default,
+                    _row_value(row, "column_default", 4),
+                ),
             )
+        elif table in observed:
+            issues.append(f"column-unexpected:{table}.{column}")
     for table, columns in _COLUMN_SHAPE.items():
         for column, expected in columns.items():
             actual = observed[table].get(column)
             if actual is None:
                 issues.append(f"column-missing:{table}.{column}")
-            elif actual != expected:
-                issues.append(f"column-shape:{table}.{column}")
+            else:
+                if actual[0] != expected[0]:
+                    issues.append(f"column-type:{table}.{column}")
+                if actual[1] != expected[1]:
+                    issues.append(f"column-nullability:{table}.{column}")
+                if actual[2] != expected[2]:
+                    issues.append(f"column-default:{table}.{column}")
 
     constraint_rows = conn.execute(
         """
@@ -254,7 +289,13 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                     AND foreign_attribute.attnum = key_record.attnum
                    ORDER BY key_record.position
                ) AS foreign_columns,
-               pg_get_constraintdef(constraint_record.oid, true) AS definition
+               constraint_record.confupdtype AS update_action,
+               constraint_record.confdeltype AS delete_action,
+               pg_get_expr(
+                   constraint_record.conbin,
+                   constraint_record.conrelid,
+                   true
+               ) AS expression
         FROM pg_constraint AS constraint_record
         JOIN pg_class AS relation ON relation.oid = constraint_record.conrelid
         JOIN pg_namespace AS namespace_record ON namespace_record.oid = relation.relnamespace
@@ -272,7 +313,9 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                 "columns": tuple(_row_value(row, "columns", 2) or ()),
                 "foreign_table": _row_value(row, "foreign_table", 3),
                 "foreign_columns": tuple(_row_value(row, "foreign_columns", 4) or ()),
-                "definition": str(_row_value(row, "definition", 5)),
+                "update_action": str(_row_value(row, "update_action", 5)),
+                "delete_action": str(_row_value(row, "delete_action", 6)),
+                "expression": str(_row_value(row, "expression", 7) or ""),
             }
         )
 
@@ -283,6 +326,8 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         *,
         foreign_table: str | None = None,
         foreign_columns: tuple[str, ...] = (),
+        update_action: str = "a",
+        delete_action: str = "a",
     ) -> bool:
         return any(
             constraint["table"] == table
@@ -293,6 +338,8 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                 or (
                     constraint["foreign_table"] == foreign_table
                     and constraint["foreign_columns"] == foreign_columns
+                    and constraint["update_action"] == update_action
+                    and constraint["delete_action"] == delete_action
                 )
             )
             for constraint in constraints
@@ -324,7 +371,7 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     )
     for name, present in required_constraints:
         if not present:
-            issues.append(f"constraint-missing:{name}")
+            issues.append(f"constraint-missing-or-invalid:{name}")
     status_checks = [
         constraint
         for constraint in constraints
@@ -332,22 +379,26 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         and constraint["type"] == "c"
         and constraint["columns"] == ("status",)
     ]
-    status_literals = (
-        set(re.findall(r"'([^']+)'", status_checks[0]["definition"]))
+    expected_status_expression = _normalized_identifier(
+        "status = ANY (ARRAY["
+        + ", ".join(f"'{status}'::text" for status in (
+            "pending",
+            "claimed",
+            "completed",
+            "failed",
+            "rejected",
+            "cancelled",
+        ))
+        + "])"
+    )
+    actual_status_expression = (
+        _normalized_identifier(status_checks[0]["expression"])
         if len(status_checks) == 1
-        else set()
+        else ""
     )
-    status_definition = (
-        status_checks[0]["definition"].upper() if len(status_checks) == 1 else ""
-    )
-    status_operator_is_membership = (
-        " = ANY " in status_definition or " IN (" in status_definition
-    ) and " NOT " not in status_definition
-    if (
-        len(status_checks) != 1
-        or status_literals != _TERMINAL_AND_ACTIVE_STATUSES
-        or not status_operator_is_membership
-    ):
+    if actual_status_expression.startswith("(") and actual_status_expression.endswith(")"):
+        actual_status_expression = actual_status_expression[1:-1]
+    if len(status_checks) != 1 or actual_status_expression != expected_status_expression:
         issues.append("constraint-invalid:actions.status")
 
     index_rows = conn.execute(
@@ -416,7 +467,12 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     return tuple(sorted(issues))
 
 
-def check_compatibility(conn, schema: str) -> Compatibility:
+def check_compatibility(
+    conn,
+    schema: str,
+    *,
+    require_runtime_principal: bool = True,
+) -> Compatibility:
     """Inspect schema compatibility using SELECT statements only."""
 
     schema = db.schema_name(schema)
@@ -459,6 +515,11 @@ def check_compatibility(conn, schema: str) -> Compatibility:
     elif any(applied[version] != checksum for version, checksum in expected.items()):
         state = "checksum-mismatch"
         detail = "an applied migration checksum does not match the packaged asset"
+    elif require_runtime_principal and (
+        principal_issue := _runtime_principal_issue(conn, schema)
+    ):
+        state = "role-mismatch"
+        detail = principal_issue
     else:
         shape_issues = _shape_issues(conn, schema)
         if shape_issues:
@@ -480,8 +541,17 @@ def check_compatibility(conn, schema: str) -> Compatibility:
     )
 
 
-def require_compatible(conn, schema: str) -> Compatibility:
-    compatibility = check_compatibility(conn, schema)
+def require_compatible(
+    conn,
+    schema: str,
+    *,
+    require_runtime_principal: bool = True,
+) -> Compatibility:
+    compatibility = check_compatibility(
+        conn,
+        schema,
+        require_runtime_principal=require_runtime_principal,
+    )
     if not compatibility.compatible:
         raise SchemaCompatibilityError(
             f"actionq schema {schema!r} is {compatibility.state}: "
@@ -490,10 +560,87 @@ def require_compatible(conn, schema: str) -> Compatibility:
     return compatibility
 
 
-def migrate(conn, schema: str) -> dict[str, Any]:
+def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> None:
+    if runtime_role is None:
+        return
+    if not db.SCHEMA_RE.fullmatch(runtime_role):
+        raise SchemaMigrationError(
+            "ACTIONQ_RUNTIME_ROLE must be a simple PostgreSQL identifier"
+        )
+    from psycopg import sql
+
+    schema_identifier = sql.Identifier(schema)
+    role_identifier = sql.Identifier(runtime_role)
+    conn.execute(
+        sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC").format(schema_identifier)
+    )
+    conn.execute(
+        sql.SQL("REVOKE CREATE ON SCHEMA {} FROM {}").format(
+            schema_identifier, role_identifier
+        )
+    )
+    conn.execute(
+        sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+            schema_identifier, role_identifier
+        )
+    )
+    conn.execute(
+        sql.SQL(
+            "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {} FROM {}"
+        ).format(schema_identifier, role_identifier)
+    )
+    conn.execute(
+        sql.SQL(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {}.{}, {}.{} TO {}"
+        ).format(
+            schema_identifier,
+            sql.Identifier("actions"),
+            schema_identifier,
+            sql.Identifier("events"),
+            role_identifier,
+        )
+    )
+    conn.execute(
+        sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
+            schema_identifier,
+            sql.Identifier(MIGRATION_TABLE),
+            role_identifier,
+        )
+    )
+    conn.execute(
+        sql.SQL(
+            "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}"
+        ).format(schema_identifier, role_identifier)
+    )
+    conn.execute(
+        sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
+            schema_identifier, role_identifier
+        )
+    )
+    conn.execute(
+        sql.SQL(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {} "
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {}"
+        ).format(schema_identifier, role_identifier)
+    )
+    conn.execute(
+        sql.SQL(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {} "
+            "GRANT USAGE, SELECT ON SEQUENCES TO {}"
+        ).format(schema_identifier, role_identifier)
+    )
+
+
+def migrate(
+    conn,
+    schema: str,
+    *,
+    runtime_role: str | None = None,
+) -> dict[str, Any]:
     """Apply packaged migrations once under a transaction-scoped advisory lock."""
 
     schema = db.schema_name(schema)
+    runtime_role = runtime_role or os.environ.get("ACTIONQ_RUNTIME_ROLE")
     migrations = load_migrations()
     applied_now: list[int] = []
     adopted_legacy_schema = False
@@ -555,7 +702,12 @@ def migrate(conn, schema: str) -> dict[str, Any]:
             )
             applied_now.append(migration.version)
 
-        compatibility = require_compatible(conn, schema)
+        _grant_runtime_privileges(conn, schema, runtime_role)
+        compatibility = require_compatible(
+            conn,
+            schema,
+            require_runtime_principal=False,
+        )
 
     return {
         "domain": DOMAIN,
@@ -563,5 +715,6 @@ def migrate(conn, schema: str) -> dict[str, Any]:
         "target_schema_version": MAX_SCHEMA_VERSION,
         "applied_versions": applied_now,
         "adopted_legacy_schema": adopted_legacy_schema,
+        "runtime_role": runtime_role,
         "compatibility": compatibility.as_dict(),
     }

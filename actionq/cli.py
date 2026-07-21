@@ -28,6 +28,7 @@ def _connect(schema: str | None = None, *, require_compatibility: bool = True):
         if require_compatibility:
             try:
                 db.require_compatible(conn, db.schema_name(schema))
+                conn.rollback()
             except Exception:
                 conn.close()
                 raise

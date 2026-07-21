@@ -16,10 +16,13 @@ The current execution contract reports:
 `actionctl check-compatibility` performs only `SELECT` statements and exits
 with status `3` for an incompatible schema. Its JSON object is the Actionq
 compatibility record consumed by the Vuoro execution adapter and handshake.
-The check validates the ledger and the live queue shape: column types,
-nullability/default presence, primary and foreign keys, the exact status-set
-constraint, and required index columns, ordering, predicates, access method,
-and readiness. A matching ledger never overrides damaged queue objects.
+The check validates the ledger and the live queue shape: exact column types,
+nullability and default expressions; primary keys; foreign-key columns,
+targets, and `NO ACTION` update/delete behavior; the exact status-set
+expression; and required index columns, ordering, predicates, access method,
+and readiness. A matching ledger never overrides damaged queue objects. A
+constraint containing all expected status literals plus a permissive branch
+such as `OR true` is incompatible.
 
 ## Deployment sequence
 
@@ -29,10 +32,11 @@ and readiness. A matching ledger never overrides damaged queue objects.
 2. Confirm a usable database backup and record its restore point before the
    first migration for a release.
 3. Run `actionctl migrate --json-output` in a foreground deployment Job with
-   the migration DSN. The command takes a transaction-scoped PostgreSQL
-   advisory lock derived from the schema name, applies every missing migration
-   in order, validates the required table/constraint/index shape, records its
-   checksum, and commits atomically.
+   the migration DSN and `ACTIONQ_RUNTIME_ROLE` set to the runtime identity.
+   The command takes a transaction-scoped PostgreSQL advisory lock derived
+   from the schema name, applies every missing migration in order, validates
+   the required table/constraint/index shape, records its checksum, establishes
+   bounded runtime grants, and commits atomically.
 4. Run `actionctl check-compatibility` using the runtime DSN.
 5. Start or restart the service only after both commands succeed. Startup
    repeats the read-only compatibility check and never migrates automatically.
@@ -59,7 +63,9 @@ requires two distinct roles:
 
 - The migration role can connect, take advisory locks, create/alter objects in
   the selected Actionq schema, and read/write `schema_migrations`. It is used
-  only by a migration Job and cannot serve requests.
+  only by a migration Job. Runtime compatibility rejects any principal with
+  `CREATE` authority on the selected schema, so a migration owner cannot start
+  the server or dispatch work even if it is presented as a runtime DSN.
 - The runtime role has schema `USAGE`, queue table DML, sequence usage, and
   `SELECT` on `schema_migrations`. It has no `CREATE` privilege on the schema,
   no ownership of its objects, and no membership in the migration role.
@@ -69,8 +75,11 @@ owner, is:
 
 ```sql
 REVOKE CREATE ON SCHEMA actionq FROM PUBLIC;
+REVOKE CREATE ON SCHEMA actionq FROM actionq_runtime;
 GRANT USAGE ON SCHEMA actionq TO actionq_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA actionq TO actionq_runtime;
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA actionq FROM actionq_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON actionq.actions, actionq.events TO actionq_runtime;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA actionq FROM actionq_runtime;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA actionq TO actionq_runtime;
 GRANT SELECT ON actionq.schema_migrations TO actionq_runtime;
 ```
@@ -83,10 +92,12 @@ runtime identity.
 The integration gate starts an isolated PostgreSQL cluster under a temporary
 directory, listens on a private Unix socket with trust authentication, creates
 distinct migration/runtime roles, and removes the cluster afterward. It
-proves that the runtime identity can read the compatibility record and
-receives PostgreSQL `insufficient_privilege` for DDL. The harness refuses to
-skip when local `initdb`/`pg_ctl` binaries are expected but unavailable; it
-never reads or mutates an ambient queue.
+proves that the migration identity cannot pass the service startup/dispatch
+gate, while the runtime identity can serve normal queue requests and receives
+PostgreSQL `insufficient_privilege` for DDL and migration-ledger writes. It
+also runs durable rejection-event and exact default/constraint regressions.
+The harness refuses to skip when local `initdb`/`pg_ctl` binaries are expected
+but unavailable; it never reads or mutates an ambient queue.
 
 ## Recovery and rollback
 

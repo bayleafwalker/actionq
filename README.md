@@ -41,6 +41,7 @@ uv sync --extra dev
 | --- | --- | --- | --- |
 | `ACTIONQ_URL` | Yes | None | Postgres connection string used by `actionctl`; deployment migration Jobs and runtime processes use separate role-specific values. |
 | `ACTIONQ_SCHEMA` | No | `actionq` | Schema name for queue tables and events. |
+| `ACTIONQ_RUNTIME_ROLE` | Migration Job | None | Simple PostgreSQL role name that `actionctl migrate` grants queue DML, sequence use, and migration-ledger read access. It never grants schema `CREATE` or ledger writes. |
 | `ACTIONQ_MAX_CHAIN_DEPTH` | No | `3` | Maximum allowed parent-child depth for enqueued actions. |
 | `ACTIONQ_RATE_LIMIT_PER_HOUR` | No | `20` | Hourly enqueue cap for `agent:` and `script:` producers. |
 | `ACTIONQ_TEST_URL` | Test-only | None | Separate Postgres URL used by integration tests. |
@@ -54,6 +55,7 @@ Initialize the queue schema with a deployment/migration identity:
 ```bash
 export ACTIONQ_URL='postgresql://user:password@localhost:5432/app'
 export ACTIONQ_SCHEMA='actionq'
+export ACTIONQ_RUNTIME_ROLE='actionq_runtime'
 
 actionctl migrate
 ```
@@ -61,6 +63,7 @@ actionctl migrate
 Check the same schema with the runtime identity before starting service:
 
 ```bash
+export ACTIONQ_URL='postgresql://actionq_runtime:password@localhost:5432/app'
 actionctl check-compatibility
 ```
 
@@ -199,11 +202,11 @@ Run integration tests against a disposable Postgres database:
 uv run pytest tests/test_integration_postgres.py -q
 ```
 
-The migration/compatibility integration module starts its own temporary
-PostgreSQL cluster on a private Unix socket and creates distinct migration and
-runtime roles. It requires local `initdb` and `pg_ctl`, creates a fresh schema
-per test, and never uses an ambient queue DSN. Other state-protocol integration
-modules continue to require an explicitly disposable `ACTIONQ_TEST_URL`.
+The PostgreSQL integration modules start one temporary cluster on a private
+Unix socket and create distinct migration and runtime roles before test
+collection. The harness requires local `initdb` and `pg_ctl`, creates a fresh
+schema per test, refuses to silently skip live database coverage, and never
+uses an ambient queue DSN.
 
 ## Operational Notes
 

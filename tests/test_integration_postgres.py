@@ -1,125 +1,28 @@
-import getpass
 import hashlib
 import json
 import os
-import shutil
-import socket
-import subprocess
-import tempfile
 import threading
 import uuid
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 
-import psycopg
 from psycopg import sql
 
 from actionq.cli import cli
 from actionq import db, schema as schema_contract, server
 
-
 MIGRATION_ROLE = "actionq_migration"
 RUNTIME_ROLE = "actionq_runtime"
 LEGACY_V1_PATH = Path(__file__).parent / "fixtures" / "actionq_legacy_v1.sql"
-LEGACY_V1_SHA256 = "49b1a8a316ca8de67d404e000a9a35d7de3ce2263ed1f490bfa66a2b01b7954f"
-
-
-@pytest.fixture(scope="module", autouse=True)
-def postgres_urls():
-    binaries = {command: shutil.which(command) for command in ("initdb", "pg_ctl")}
-    missing = sorted(command for command, path in binaries.items() if path is None)
-    if missing:
-        pytest.fail(f"PostgreSQL server binaries are required: {missing}")
-
-    root = Path(tempfile.mkdtemp(prefix="actionq-pg-"))
-    data = root / "data"
-    socket_dir = root / "socket"
-    socket_dir.mkdir()
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    initdb = Path(binaries["initdb"] or "initdb").resolve()
-    pg_ctl = Path(binaries["pg_ctl"] or "pg_ctl").resolve()
-    initdb_args = [
-        str(initdb),
-        "--no-locale",
-        "--encoding=UTF8",
-        "--auth=trust",
-        "-D",
-        str(data),
-    ]
-    adjacent_share = initdb.parents[1] / "share" / "postgresql"
-    if (adjacent_share / "postgres.bki").exists():
-        initdb_args.extend(["-L", str(adjacent_share)])
-    subprocess.run(initdb_args, check=True, capture_output=True, text=True)
-    subprocess.run(
-        [
-            str(pg_ctl),
-            "-D",
-            str(data),
-            "-l",
-            str(root / "postgres.log"),
-            "-o",
-            f"-F -h '' -k {socket_dir} -p {port}",
-            "-w",
-            "start",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    base = f"dbname=postgres host={socket_dir} port={port}"
-    urls = {
-        "admin": f"{base} user={getpass.getuser()}",
-        "migration": f"{base} user={MIGRATION_ROLE}",
-        "runtime": f"{base} user={RUNTIME_ROLE}",
-    }
-    previous = {
-        name: os.environ.get(name)
-        for name in (
-            "ACTIONQ_TEST_URL",
-            "ACTIONQ_TEST_MIGRATION_URL",
-            "ACTIONQ_TEST_RUNTIME_URL",
-        )
-    }
-    try:
-        with psycopg.connect(urls["admin"], autocommit=True) as conn:
-            conn.execute(
-                sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(MIGRATION_ROLE))
-            )
-            conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(RUNTIME_ROLE)))
-            conn.execute(
-                sql.SQL("GRANT CREATE ON DATABASE postgres TO {}").format(
-                    sql.Identifier(MIGRATION_ROLE)
-                )
-            )
-        os.environ["ACTIONQ_TEST_URL"] = urls["admin"]
-        os.environ["ACTIONQ_TEST_MIGRATION_URL"] = urls["migration"]
-        os.environ["ACTIONQ_TEST_RUNTIME_URL"] = urls["runtime"]
-        yield urls
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-        subprocess.run(
-            [str(pg_ctl), "-D", str(data), "-m", "fast", "-w", "stop"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        shutil.rmtree(root, ignore_errors=True)
+LEGACY_V1_SHA256 = "ae2b2166dc841b06793de6a6f706a01056725cd674aa018bb98aba36eab47de0"
 
 
 @pytest.fixture
-def runner_env(monkeypatch):
+def runner_env(monkeypatch, actionq_cli_runner):
     schema = "aqtest_" + uuid.uuid4().hex
-    monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_URL"])
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
-    return CliRunner(), schema
+    return actionq_cli_runner, schema
 
 
 def _invoke_json(runner, args):
@@ -131,13 +34,11 @@ def _invoke_json(runner, args):
 def _install_legacy_v1(conn, schema: str) -> None:
     raw = LEGACY_V1_PATH.read_text(encoding="utf-8")
     assert hashlib.sha256(raw.encode()).hexdigest() == LEGACY_V1_SHA256
+    rendered = raw.replace("{{schema}}", f'"{schema}"')
+    assert "{{schema}}" not in rendered
     conn.execute(f'CREATE SCHEMA "{schema}"')
-    conn.execute(f'SET search_path TO "{schema}"')
-    try:
-        for statement in schema_contract._statements(raw):
-            conn.execute(statement)
-    finally:
-        conn.execute("RESET search_path")
+    for statement in schema_contract._statements(rendered):
+        conn.execute(statement)
     conn.commit()
 
 
@@ -296,7 +197,7 @@ def test_deployment_migration_empty_current_retry_and_compatibility(runner_env):
 
 def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
     runner, schema = runner_env
-    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
     _install_legacy_v1(conn, schema)
     before = {
         row["indexname"]
@@ -324,23 +225,23 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
     }
     verify_conn.close()
     assert before == after == {
-        "idx_actions_claim_lookup",
-        "idx_actions_parent",
-        "idx_actions_project",
-        "idx_actions_deadline",
-        "idx_events_action",
-        "idx_events_timestamp",
-        "idx_events_type_time",
+        "idx_actionq_actions_claim_lookup",
+        "idx_actionq_actions_parent",
+        "idx_actionq_actions_project",
+        "idx_actionq_actions_deadline",
+        "idx_actionq_events_action",
+        "idx_actionq_events_timestamp",
+        "idx_actionq_events_type_time",
     }
 
 
 def test_unversioned_legacy_wrong_index_definition_is_not_stamped(runner_env):
     _runner, schema = runner_env
-    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
     _install_legacy_v1(conn, schema)
-    conn.execute(f'DROP INDEX "{schema}".idx_actions_project')
+    conn.execute(f'DROP INDEX "{schema}".idx_actionq_actions_project')
     conn.execute(
-        f'CREATE INDEX idx_actions_project ON "{schema}".actions(target_ref)'
+        f'CREATE INDEX idx_actionq_actions_project ON "{schema}".actions(target_ref)'
     )
     conn.commit()
 
@@ -358,14 +259,15 @@ def test_unversioned_legacy_wrong_index_definition_is_not_stamped(runner_env):
 
 def test_unversioned_legacy_wrong_status_constraint_is_not_stamped(runner_env):
     _runner, schema = runner_env
-    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
     _install_legacy_v1(conn, schema)
     conn.execute(
         f'ALTER TABLE "{schema}".actions DROP CONSTRAINT actions_status_check'
     )
     conn.execute(
         f'ALTER TABLE "{schema}".actions ADD CONSTRAINT actions_status_check '
-        "CHECK (status IN ('pending', 'claimed'))"
+        "CHECK (status IN ('pending', 'claimed', 'completed', 'failed', "
+        "'rejected', 'cancelled') OR true)"
     )
     conn.commit()
 
@@ -373,6 +275,52 @@ def test_unversioned_legacy_wrong_status_constraint_is_not_stamped(runner_env):
         schema_contract.SchemaMigrationError,
         match="constraint-invalid:actions.status",
     ):
+        schema_contract.migrate(conn, schema)
+    conn.rollback()
+    assert conn.execute(
+        "SELECT to_regclass(%s) AS relation",
+        (f'"{schema}"."schema_migrations"',),
+    ).fetchone()["relation"] is None
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("statements", "expected_issue"),
+    [
+        (
+            ("ALTER TABLE {schema}.actions ALTER COLUMN priority SET DEFAULT 50",),
+            "column-default:actions.priority",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.events ALTER COLUMN payload "
+                "SET DEFAULT '{\"unexpected\": true}'::jsonb",
+            ),
+            "column-default:events.payload",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.events DROP CONSTRAINT events_action_id_fkey",
+                "ALTER TABLE {schema}.events ADD CONSTRAINT events_action_id_fkey "
+                "FOREIGN KEY (action_id) REFERENCES {schema}.actions(id) "
+                "ON UPDATE CASCADE ON DELETE CASCADE",
+            ),
+            "constraint-missing-or-invalid:events-action-foreign-key",
+        ),
+    ],
+)
+def test_unversioned_legacy_semantic_drift_is_not_stamped(
+    runner_env, statements, expected_issue
+):
+    _runner, schema = runner_env
+    conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    _install_legacy_v1(conn, schema)
+    quoted_schema = f'"{schema}"'
+    for statement in statements:
+        conn.execute(statement.replace("{schema}", quoted_schema))
+    conn.commit()
+
+    with pytest.raises(schema_contract.SchemaMigrationError, match=expected_issue):
         schema_contract.migrate(conn, schema)
     conn.rollback()
     assert conn.execute(
@@ -477,6 +425,60 @@ def test_valid_ledger_with_damaged_queue_shape_fails_runtime_and_restart(runner_
         server._require_runtime_compatibility()
 
 
+@pytest.mark.parametrize(
+    ("statements", "expected_issue"),
+    [
+        (
+            ("ALTER TABLE {schema}.actions ALTER COLUMN priority SET DEFAULT 50",),
+            "column-default:actions.priority",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.events ALTER COLUMN payload "
+                "SET DEFAULT '{\"unexpected\": true}'::jsonb",
+            ),
+            "column-default:events.payload",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.actions DROP CONSTRAINT actions_status_check",
+                "ALTER TABLE {schema}.actions ADD CONSTRAINT actions_status_check "
+                "CHECK (status IN ('pending', 'claimed', 'completed', 'failed', "
+                "'rejected', 'cancelled') OR true)",
+            ),
+            "constraint-invalid:actions.status",
+        ),
+        (
+            (
+                "ALTER TABLE {schema}.events DROP CONSTRAINT events_action_id_fkey",
+                "ALTER TABLE {schema}.events ADD CONSTRAINT events_action_id_fkey "
+                "FOREIGN KEY (action_id) REFERENCES {schema}.actions(id) "
+                "ON UPDATE CASCADE ON DELETE CASCADE",
+            ),
+            "constraint-missing-or-invalid:events-action-foreign-key",
+        ),
+    ],
+)
+def test_runtime_rejects_semantically_permissive_schema_shape(
+    runner_env, statements, expected_issue
+):
+    runner, schema = runner_env
+    assert runner.invoke(cli, ["migrate"]).exit_code == 0
+    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    quoted_schema = f'"{schema}"'
+    for statement in statements:
+        conn.execute(statement.replace("{schema}", quoted_schema))
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(cli, ["check-compatibility"])
+
+    assert result.exit_code == 3
+    compatibility = json.loads(result.output)
+    assert compatibility["state"] == "shape-mismatch"
+    assert expected_issue in compatibility["detail"]
+
+
 def test_service_restart_repeats_compatibility_without_migration(runner_env):
     runner, schema = runner_env
     assert runner.invoke(cli, ["migrate"]).exit_code == 0
@@ -488,7 +490,7 @@ def test_service_restart_repeats_compatibility_without_migration(runner_env):
     assert second_start == first_start
 
 
-def test_runtime_role_can_check_compatibility_but_cannot_run_ddl():
+def test_migration_role_cannot_serve_and_runtime_role_cannot_run_ddl(monkeypatch):
     schema = "aqroles_" + uuid.uuid4().hex
     migration_conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
     runtime_conn = db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"])
@@ -498,36 +500,62 @@ def test_runtime_role_can_check_compatibility_but_cannot_run_ddl():
     assert runtime_role == RUNTIME_ROLE
     assert migration_role != runtime_role
     try:
-        schema_contract.migrate(migration_conn, schema)
-        migration_conn.execute(
-            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
-                sql.Identifier(schema), sql.Identifier(runtime_role)
-            )
+        migration_conn.rollback()
+        runtime_conn.rollback()
+        report = schema_contract.migrate(
+            migration_conn,
+            schema,
+            runtime_role=runtime_role,
         )
-        migration_conn.execute(
-            sql.SQL("GRANT SELECT ON {}.{} TO {}").format(
-                sql.Identifier(schema),
-                sql.Identifier("schema_migrations"),
-                sql.Identifier(runtime_role),
-            )
+        assert report["runtime_role"] == runtime_role
+
+        migration_compatibility = schema_contract.check_compatibility(
+            migration_conn, schema
         )
-        migration_conn.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {} TO {}").format(
-                sql.Identifier(schema), sql.Identifier(runtime_role)
+        assert migration_compatibility.state == "role-mismatch"
+        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
+            schema_contract.require_compatible(migration_conn, schema)
+        migration_conn.rollback()
+
+        monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
+        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
+            server._require_runtime_compatibility()
+        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
+            server._dispatch(
+                {
+                    "contract_version": "v1",
+                    "repo_id": "actionq",
+                    "kind": "implement",
+                    "title": "must not dispatch as migrator",
+                }
             )
-        )
-        migration_conn.execute(
-            sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
-                sql.Identifier(schema), sql.Identifier(runtime_role)
-            )
-        )
-        migration_conn.commit()
 
         assert schema_contract.require_compatible(runtime_conn, schema).compatible
+        runtime_conn.rollback()
+        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+        assert server._require_runtime_compatibility()["state"] == "compatible"
+        action = server._dispatch(
+            {
+                "contract_version": "v1",
+                "repo_id": "actionq",
+                "kind": "implement",
+                "title": "runtime dispatch",
+            }
+        )
+        assert action["status"] == "pending"
         with pytest.raises(Exception) as excinfo:
             runtime_conn.execute(
                 sql.SQL("CREATE TABLE {}.forbidden_runtime_ddl (id INTEGER)").format(
                     sql.Identifier(schema)
+                )
+            )
+        assert getattr(excinfo.value, "sqlstate", None) == "42501"
+        runtime_conn.rollback()
+        with pytest.raises(Exception) as excinfo:
+            runtime_conn.execute(
+                sql.SQL("UPDATE {}.{} SET checksum = 'forbidden'").format(
+                    sql.Identifier(schema), sql.Identifier("schema_migrations")
                 )
             )
         assert getattr(excinfo.value, "sqlstate", None) == "42501"

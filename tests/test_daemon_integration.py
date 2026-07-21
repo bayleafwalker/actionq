@@ -23,10 +23,11 @@ def _text(value):
 
 def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: Path):
     schema = "aqdaemon_" + uuid.uuid4().hex
-    monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_URL"])
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
-    with db.connect() as conn:
+    with db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"]) as conn:
         db.migrate(conn, schema)
+    monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+    with db.connect() as conn:
         action = db.enqueue(
             conn,
             schema,

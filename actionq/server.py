@@ -48,6 +48,7 @@ def _runtime_connection():
 
     with _db.connect() as conn:
         _db.require_compatible(conn, _schema())
+        conn.rollback()
         yield conn
 
 

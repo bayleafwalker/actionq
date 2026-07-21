@@ -37,13 +37,22 @@ class FakeSchemaConnection:
         applied: dict[int, str] | None = None,
         tables_exist: bool | None = None,
         valid_indexes: bool = True,
+        can_create_schema: bool = False,
+        permissive_status: bool = False,
+        default_overrides: dict[tuple[str, str], str] | None = None,
+        cascading_foreign_keys: bool = False,
     ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
         self.tables_exist = ledger_exists if tables_exist is None else tables_exist
         self.valid_indexes = valid_indexes
+        self.can_create_schema = can_create_schema
+        self.permissive_status = permissive_status
+        self.default_overrides = default_overrides or {}
+        self.cascading_foreign_keys = cascading_foreign_keys
         self.executed: list[tuple[str, object]] = []
         self.closed = False
+        self.rollbacks = 0
 
     def __enter__(self):
         return self
@@ -53,6 +62,9 @@ class FakeSchemaConnection:
 
     def close(self):
         self.closed = True
+
+    def rollback(self):
+        self.rollbacks += 1
 
     def transaction(self):
         return _Transaction()
@@ -73,6 +85,10 @@ class FakeSchemaConnection:
                 {"version": version, "checksum": checksum}
                 for version, checksum in sorted(self.applied.items())
             )
+        if normalized.startswith("SELECT current_user AS principal"):
+            return _Rows(
+                [{"principal": "runtime", "can_create": self.can_create_schema}]
+            )
         if "CREATE TABLE IF NOT EXISTS \"aq\".actions" in normalized:
             self.tables_exist = True
             return _Rows()
@@ -86,7 +102,14 @@ class FakeSchemaConnection:
                             "column_name": column,
                             "data_type": expected[0],
                             "is_nullable": expected[1],
-                            "column_default": "expected" if expected[2] else None,
+                            "column_default": self.default_overrides.get(
+                                (table, column),
+                                (
+                                    f"nextval('{expected[2].removeprefix('sequence:')}'::regclass)"
+                                    if expected[2] and expected[2].startswith("sequence:")
+                                    else expected[2]
+                                ),
+                            ),
                         }
                         for column, expected in columns.items()
                     )
@@ -101,7 +124,9 @@ class FakeSchemaConnection:
                         "columns": ["id"],
                         "foreign_table": None,
                         "foreign_columns": [],
-                        "definition": "PRIMARY KEY (id)",
+                        "update_action": " ",
+                        "delete_action": " ",
+                        "expression": "",
                     },
                     {
                         "table_name": "actions",
@@ -109,7 +134,9 @@ class FakeSchemaConnection:
                         "columns": ["parent_id"],
                         "foreign_table": "actions",
                         "foreign_columns": ["id"],
-                        "definition": "FOREIGN KEY (parent_id) REFERENCES actions(id)",
+                        "update_action": "c" if self.cascading_foreign_keys else "a",
+                        "delete_action": "c" if self.cascading_foreign_keys else "a",
+                        "expression": "",
                     },
                     {
                         "table_name": "actions",
@@ -117,7 +144,14 @@ class FakeSchemaConnection:
                         "columns": ["status"],
                         "foreign_table": None,
                         "foreign_columns": [],
-                        "definition": "CHECK (status IN ('pending', 'claimed', 'completed', 'failed', 'rejected', 'cancelled'))",
+                        "update_action": " ",
+                        "delete_action": " ",
+                        "expression": (
+                            "status = ANY (ARRAY['pending'::text, 'claimed'::text, "
+                            "'completed'::text, 'failed'::text, 'rejected'::text, "
+                            "'cancelled'::text])"
+                            + (" OR true" if self.permissive_status else "")
+                        ),
                     },
                     {
                         "table_name": "events",
@@ -125,7 +159,9 @@ class FakeSchemaConnection:
                         "columns": ["id"],
                         "foreign_table": None,
                         "foreign_columns": [],
-                        "definition": "PRIMARY KEY (id)",
+                        "update_action": " ",
+                        "delete_action": " ",
+                        "expression": "",
                     },
                     {
                         "table_name": "events",
@@ -133,7 +169,9 @@ class FakeSchemaConnection:
                         "columns": ["action_id"],
                         "foreign_table": "actions",
                         "foreign_columns": ["id"],
-                        "definition": "FOREIGN KEY (action_id) REFERENCES actions(id)",
+                        "update_action": "c" if self.cascading_foreign_keys else "a",
+                        "delete_action": "c" if self.cascading_foreign_keys else "a",
+                        "expression": "",
                     },
                 ]
             return _Rows(rows)
@@ -232,6 +270,52 @@ def test_compatibility_rejects_semantically_invalid_index():
 
     assert result.state == "shape-mismatch"
     assert "index-missing-or-invalid:actions.claim-lookup" in result.detail
+
+
+def test_compatibility_rejects_ddl_capable_principal_even_with_valid_schema():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        can_create_schema=True,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.state == "role-mismatch"
+    assert "schema CREATE authority" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("connection_options", "expected_issue"),
+    [
+        ({"permissive_status": True}, "constraint-invalid:actions.status"),
+        (
+            {"default_overrides": {("actions", "priority"): "50"}},
+            "column-default:actions.priority",
+        ),
+        (
+            {"default_overrides": {("events", "payload"): "'{\"x\": 1}'::jsonb"}},
+            "column-default:events.payload",
+        ),
+        (
+            {"cascading_foreign_keys": True},
+            "constraint-missing-or-invalid:actions-parent-foreign-key",
+        ),
+    ],
+)
+def test_compatibility_rejects_semantically_permissive_shape(
+    connection_options, expected_issue
+):
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        **connection_options,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.state == "shape-mismatch"
+    assert expected_issue in result.detail
 
 
 @pytest.mark.parametrize(
@@ -334,6 +418,8 @@ def test_server_request_connections_recheck_compatibility_without_ddl(monkeypatc
     monkeypatch.setattr(db, "connect", lambda: conn)
 
     assert server._sessions("") == []
+
+    assert conn.rollbacks == 1
 
     assert any(statement.startswith("SELECT to_regclass") for statement, _ in conn.executed)
     assert all(
