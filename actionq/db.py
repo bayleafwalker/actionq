@@ -30,6 +30,24 @@ class NoActionAvailable(ActionQError):
     pass
 
 
+class ClaimRejected(ActionQError):
+    """A stale or invalid claim/lease authority command.
+
+    Per the state-event-command matrix, queue claim and lease renewal are
+    authority commands requiring remote arbitration: a stale or invalid
+    command must produce a visible, durable rejection rather than mutating
+    authoritative state. The rejection event is always recorded (in the
+    same transaction, before this is raised) even though the command
+    itself did not take effect.
+    """
+
+    def __init__(self, message: str, *, reason: str, action_id: int, requested_by: str):
+        super().__init__(message)
+        self.reason = reason
+        self.action_id = action_id
+        self.requested_by = requested_by
+
+
 def _import_psycopg():
     try:
         import psycopg
@@ -643,6 +661,102 @@ def claim(conn, schema: str, *, worker: str, timeout_minutes: int) -> dict:
             },
         )
     return dict(row)
+
+
+def _renewal_rejection_reason(current: dict[str, Any] | None, worker: str) -> str | None:
+    if current is None:
+        return "action-not-found"
+    status = _text(current["status"])
+    if status != "claimed":
+        return f"not-claimed:{status}"
+    if _text(current["claimed_by"]) != worker:
+        return "claimed-by-different-worker"
+    deadline = current.get("claim_deadline")
+    if deadline is not None:
+        deadline_utc = deadline if deadline.tzinfo else deadline.replace(tzinfo=timezone.utc)
+        if deadline_utc <= datetime.now(timezone.utc):
+            return "claim-already-expired"
+    return None
+
+
+def renew(conn, schema: str, *, action_id: int, worker: str, timeout_minutes: int) -> dict:
+    """Renew (extend) an existing claim's deadline as an authority command.
+
+    Per the state-event-command matrix, queue claim and lease renewal are
+    authority commands: a stale or invalid renewal must be visibly
+    rejected, never silently mutate state and never silently succeed.
+
+    Grants (extends ``claim_deadline`` from now, emits ``claim_renewed``)
+    only when the action is currently ``claimed`` by exactly this worker
+    and its lease has not already expired. Any other case -- wrong worker,
+    expired lease, wrong status, or an unknown action id -- is rejected: a
+    durable ``claim_renewal_rejected`` event is appended (the request and
+    its rejection are kept as immutable history, matching
+    ``adr-outbox-sync-model``) and the action row is left byte-for-byte
+    unchanged. Raises ``ClaimRejected`` after that event has committed, so
+    the rejection is never lost even though the caller sees an exception.
+    """
+    rejection_reason: str | None = None
+    granted_row: dict[str, Any] | None = None
+    with conn.transaction():
+        current = conn.execute(
+            f'SELECT * FROM {qname(schema, "actions")} WHERE id = %s FOR UPDATE',
+            (action_id,),
+        ).fetchone()
+        rejection_reason = _renewal_rejection_reason(current, worker)
+        if rejection_reason is not None:
+            insert_event(
+                conn,
+                schema,
+                action_id=action_id if current is not None else None,
+                event_type="claim_renewal_rejected",
+                actor=worker,
+                payload={
+                    "requested_by": worker,
+                    "requested_action_id": action_id,
+                    "requested_timeout_minutes": timeout_minutes,
+                    "action_status": _text(current["status"]) if current is not None else None,
+                    "current_claimed_by": _text(current["claimed_by"]) if current is not None else None,
+                    "current_claim_deadline": json_default(current["claim_deadline"])
+                    if current is not None and current.get("claim_deadline") is not None
+                    else None,
+                    "reason": rejection_reason,
+                },
+            )
+        else:
+            previous_deadline = current["claim_deadline"]
+            row = conn.execute(
+                f"""
+                UPDATE {qname(schema, "actions")}
+                SET claim_deadline = now() + (%s * interval '1 minute')
+                WHERE id = %s
+                RETURNING *
+                """,
+                (timeout_minutes, action_id),
+            ).fetchone()
+            insert_event(
+                conn,
+                schema,
+                action_id=action_id,
+                event_type="claim_renewed",
+                actor=worker,
+                payload={
+                    "renewed_by": worker,
+                    "previous_deadline": json_default(previous_deadline) if previous_deadline else None,
+                    "new_deadline": json_default(row["claim_deadline"]),
+                    "requested_timeout_minutes": timeout_minutes,
+                },
+            )
+            granted_row = dict(row)
+    if rejection_reason is not None:
+        raise ClaimRejected(
+            f"claim renewal rejected for action #{action_id}: {rejection_reason}",
+            reason=rejection_reason,
+            action_id=action_id,
+            requested_by=worker,
+        )
+    assert granted_row is not None
+    return granted_row
 
 
 def _transition_terminal(

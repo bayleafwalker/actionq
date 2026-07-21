@@ -131,6 +131,29 @@ def claim(ctx, worker: str, timeout_minutes: int) -> None:
 
 @cli.command()
 @click.argument("action_id", type=int)
+@click.option("--worker", required=True, help="Worker identity; must match the current claimant")
+@click.option("--timeout", "timeout_minutes", default=30, type=int, show_default=True)
+@click.pass_context
+def renew(ctx, action_id: int, worker: str, timeout_minutes: int) -> None:
+    """Renew (extend) a claim's deadline as an authority command.
+
+    Exits non-zero with the durable rejection reason for a stale or
+    invalid renewal (wrong worker, expired lease, wrong status, or an
+    unknown action) -- the action row is left unchanged and a
+    claim_renewal_rejected event is still recorded for the caller to read
+    back via `show`/`events`.
+    """
+    try:
+        with _connect() as conn:
+            action = db.renew(conn, _schema(ctx), action_id=action_id, worker=worker, timeout_minutes=timeout_minutes)
+    except db.ClaimRejected as exc:
+        click.echo(str(exc), err=True)
+        raise click.exceptions.Exit(2) from exc
+    _echo_json(action)
+
+
+@cli.command()
+@click.argument("action_id", type=int)
 @click.option("--result", "result_ref", required=True)
 @click.option("--actor", default=None)
 @click.pass_context
