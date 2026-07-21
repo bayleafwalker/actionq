@@ -1,7 +1,7 @@
 ---
 doc_id: actionq-server-daemon-workstream-c
 status: active
-last_verified: 2026-07-18
+last_verified: 2026-07-21
 ---
 
 # actionq server and devbox daemon plan
@@ -741,3 +741,60 @@ of these daemon steps.
 12. **Optional LISTEN/NOTIFY wakeup.** Add only if poll latency is annoying. It must wake the same claim loop and not replace `actionctl claim`.
 
 At the end of step 4, the daemon emits core session lifecycle events into auditctl. At the end of step 6, the daemon satisfies the full publisher spec from the auditctl Workstream D plan. Steps 7 onward widen harness support and routing without changing the core wire protocol.
+
+## Appservice deployment contract for actionq-server (item #975)
+
+Verified live against the cluster on 2026-07-21 (`kubectl -n vscode`, appservice
+repo commit `1c88672e`). `actionq-server` is not a scaffold — it has been
+active in production since `1dea5397` (activation) / `2fa34df5` / `cdaf4a69`
+(subsequent bumps), deployment age 73d, current pod 8d.
+
+- **Image / build provenance.** Built from this repo's `Dockerfile`
+  (`python:3.12-slim`, installs `psycopg[binary]` then the package, entrypoint
+  `actionq-server`) and pushed to the in-cluster registry at
+  `${REGISTRY_IP}:5000/actionq-server:<tag>`. Deployed tag is `0.1.2`
+  (`clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml`);
+  `pyproject.toml` in this repo currently reads `0.1.1` — the deployed image
+  was tagged ahead of the last version bump in source. Treat the deployment
+  manifest's tag, not `pyproject.toml`, as the source of truth for what's
+  live.
+- **ACTIONQ_URL secret.** Injected via `secretKeyRef` on
+  `actionq-cnpg-main-app` / key `uri` (CNPG-managed, same cluster as the
+  queue). No credential is embedded in the manifest or image.
+- **Schema/config.** The server does not run migrations itself — it assumes
+  the `actionq` schema already exists. Schema migration is applied
+  out-of-band via `actionctl migrate` against `actionq-cnpg-main`, independent
+  of the server rollout. `PORT`/`HOST` are plain env vars (`8080`/`0.0.0.0`).
+- **Service and health probe.** `ClusterIP` service `actionq-server.vscode`
+  on port 8080. Both `readinessProbe` and `livenessProbe` hit `GET /health`.
+  Live check: `200 {"ok": true}`.
+- **Network exposure.** `ClusterIP` only, namespace `vscode` — no ingress, no
+  LoadBalancer, not reachable outside the cluster. Consumers (agent-cockpit)
+  reach it at `http://actionq-server.vscode.svc.cluster.local:8080`.
+- **Queue migration ordering.** The Flux `Kustomization`
+  (`clusters/main/kubernetes/apps/actionq-server/ks.yaml`) declares
+  `dependsOn: [actionq-db, networkpolicies]`, so the CNPG cluster and its
+  network policy exist before the server reconciles. Schema migration itself
+  is a separate, manual `actionctl migrate` step (see above) — Flux ordering
+  guarantees the database exists, not that the schema is current.
+- **Dashboard/cockpit endpoint.** `agent-cockpit`'s deployment sets
+  `ACTIONQ_SERVER_URL=http://actionq-server.vscode.svc.cluster.local:8080` and
+  its own `ACTIONQ_URL` secret ref (`clusters/main/kubernetes/apps/agent-cockpit/app/deployment.yaml`),
+  wired in `1dea5397`.
+- **Rollback tag.** Standard GitOps rollback: revert the image-tag bump
+  commit in `deployment.yaml` (history: `1dea5397` activate → `2fa34df5` bump
+  to 0.1.1/cockpit 0.1.3 → `cdaf4a69` dispatch-lifecycle fix) and let Flux
+  reconcile the previous tag. No separate rollback tooling exists or is
+  needed given `strategy: Recreate` and a single replica.
+- **Post-deploy smoke (evidence, 2026-07-21).** Port-forwarded
+  `svc/actionq-server` in-cluster and exercised the live service directly:
+  `GET /health` → `200 {"ok": true}`; `GET /sessions` → `200`, real session
+  records (not fixtures); `GET /dispatches` → `200`, real dispatch records
+  including recent (`2026-07-18`) entries. `POST /dispatch` was not exercised
+  against the live queue to avoid mutating production state; its contract is
+  covered by this repo's non-Postgres and Postgres-integration test suites.
+
+Non-scope carried over unchanged from the item: no unauthenticated public
+write API was added, the daemon was not bundled into this rollout, and no
+GitOps mutation originated from the `actionq` repository — the manifests
+above live in and were reviewed against `appservice`.
