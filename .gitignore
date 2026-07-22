@@ -1,4 +1,6 @@
 .pytest_cache/
+.envrc
+.sprintctl/
 __pycache__/
 *.pyc
 .venv/
