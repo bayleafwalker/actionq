@@ -22,6 +22,16 @@ import uuid
 from typing import Any, Callable, Protocol, Sequence
 
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
+from .harnesses import HarnessInvocation, get_adapter
+from .routing import (
+    HarnessRoute,
+    RoutingContext,
+    RoutingError,
+    RoutingRequest,
+    RoutingResult,
+    resolve_routing,
+    same_provider_fallback,
+)
 from .usage_limit import classify_usage_limit, write_handoff
 
 
@@ -83,6 +93,7 @@ class DaemonConfig:
     takeup: TakeupConfig = TakeupConfig()
     audit: AuditConfig = AuditConfig()
     context: ContextConfig = ContextConfig()
+    routing: RoutingContext = RoutingContext()
 
 
 @dataclass(frozen=True)
@@ -98,6 +109,8 @@ class ActionConfig:
     # ``actionq.usage_limit`` classifies this action's captured output.
     command: tuple[str, ...] | None = None
     harness: str | None = None
+    model: str | None = None
+    prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,8 @@ class ProjectConfig:
     path: Path
     sprint_id: int | None = None
     env: dict[str, str] | None = None
+    default_harness: str | None = None
+    default_model: str | None = None
 
 
 @dataclass
@@ -126,6 +141,16 @@ class SessionRecord:
     # degrades to no git evidence rather than guessing a worktree.
     worktree: str | None = None
     base_commit: str | None = None
+    harness: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    requested_selector: str | None = None
+    routing_source: str | None = None
+    transport: str | None = None
+    surface: str | None = None
+    fallback_model: str | None = None
+    fallback_reason: str | None = None
+    caller_harness: str | None = None
 
 
 class CoordinatorClient(Protocol):
@@ -343,6 +368,17 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
     takeup_raw = global_raw.get("sprintctl_takeup", {})
     audit_raw = global_raw.get("audit", {})
     context_raw = global_raw.get("context", {})
+    routing_raw = global_raw.get("routing") or raw.get("routing") or {}
+    harnesses = {
+        name: HarnessRoute(
+            name=name,
+            bin=(str(value["bin"]) if value.get("bin") else None),
+            provider=(str(value["provider"]) if value.get("provider") else None),
+            transport=(str(value["transport"]) if value.get("transport") else None),
+            surface=(str(value["surface"]) if value.get("surface") else None),
+        )
+        for name, value in raw.get("harnesses", {}).items()
+    }
     config = DaemonConfig(
         poll_interval_seconds=float(global_raw.get("poll_interval_seconds", 30)),
         heartbeat_interval_seconds=float(global_raw.get("heartbeat_interval_seconds", 60)),
@@ -370,6 +406,29 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             limit=int(context_raw.get("limit", 5)),
             auto_claim=bool(context_raw.get("auto_claim", True)),
         ),
+        routing=RoutingContext(
+            policy_path=(
+                Path(str(routing_raw["policy_path"])).expanduser()
+                if routing_raw.get("policy_path") else None
+            ),
+            default_harness=(
+                str(routing_raw["default_harness"]) if routing_raw.get("default_harness") else None
+            ),
+            trusted_caller_harness=(
+                str(routing_raw["trusted_caller_harness"])
+                if routing_raw.get("trusted_caller_harness") else None
+            ),
+            caller_provider=(
+                str(routing_raw["caller_provider"]) if routing_raw.get("caller_provider") else None
+            ),
+            caller_transport=(
+                str(routing_raw["caller_transport"]) if routing_raw.get("caller_transport") else None
+            ),
+            caller_surface=(
+                str(routing_raw["caller_surface"]) if routing_raw.get("caller_surface") else None
+            ),
+            harnesses=harnesses,
+        ),
     )
     actions = {
         name: ActionConfig(
@@ -378,6 +437,8 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             fake_duration_seconds=float(value.get("fake_duration_seconds", 0)),
             command=(tuple(str(part) for part in value["command"]) if "command" in value else None),
             harness=(str(value["harness"]) if "harness" in value else None),
+            model=(str(value["model"]) if "model" in value else None),
+            prompt=(str(value["prompt"]) if "prompt" in value else None),
         )
         for name, value in raw.get("actions", {}).items()
     }
@@ -386,6 +447,10 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             path=Path(value["path"]).expanduser(),
             sprint_id=(int(value["sprint_id"]) if "sprint_id" in value else None),
             env={str(key): str(item) for key, item in value.get("env", {}).items()} or None,
+            default_harness=(
+                str(value["default_harness"]) if value.get("default_harness") else None
+            ),
+            default_model=(str(value["default_model"]) if value.get("default_model") else None),
         )
         for name, value in raw.get("projects", {}).items()
     }
@@ -533,8 +598,30 @@ class Daemon:
         if action_config is None:
             self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.actor)
             return
-        session_id = f"aqs:{uuid.uuid4()}"
         project = self.projects.get(str(action.get("project") or ""))
+        routing: RoutingResult | None = None
+        if action_config.runner == "harness":
+            try:
+                routing = resolve_routing(
+                    RoutingRequest(
+                        model_selector="",
+                        action_harness=(str(action["harness"]) if action.get("harness") else None),
+                        action_class_harness=action_config.harness,
+                        project_harness=project.default_harness if project else None,
+                        action_model=(str(action["model"]) if action.get("model") else None),
+                        action_class_model=action_config.model,
+                        project_model=project.default_model if project else None,
+                    ),
+                    self.config.routing,
+                )
+                if project is None:
+                    raise RoutingError("runner 'harness' requires a configured project worktree")
+                if not (action.get("prompt") or action_config.prompt):
+                    raise RoutingError("runner 'harness' requires an explicit or action-class prompt")
+            except RoutingError as exc:
+                self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor)
+                return
+        session_id = f"aqs:{uuid.uuid4()}"
         ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
         payload = {
             "session_id": session_id, "runtime_session_id": session_id,
@@ -543,6 +630,8 @@ class Daemon:
             "target_ref": action.get("target_ref"), "runner": action_config.runner,
             "ttl_seconds": ttl_seconds,
         }
+        if routing is not None:
+            payload["routing"] = routing.provenance()
         audit_actor = f"actionq:{session_id}"
         audit_refs = _audit_refs(action, project)
         audit_dispatch = self._publish_audit(
@@ -582,12 +671,44 @@ class Daemon:
                 worktree = str(project.path)
             except Exception:
                 worktree, base_commit = None, None
-        record = SessionRecord(session_id, session_id, self.daemon_id, action_id, action_type,
-                               action.get("project"), action.get("target_ref"), action_config.runner,
-                               None, None, _now(), worktree, base_commit)
-        output_path = self._output_path(session_id) if action_config.runner == "command" else None
+        record = SessionRecord(
+            session_id=session_id,
+            runtime_session_id=session_id,
+            daemon_id=self.daemon_id,
+            action_id=action_id,
+            action_type=action_type,
+            project=action.get("project"),
+            target_ref=action.get("target_ref"),
+            runner=action_config.runner,
+            pid=None,
+            started_at=None,
+            updated_at=_now(),
+            worktree=worktree,
+            base_commit=base_commit,
+            harness=routing.harness if routing else action_config.harness,
+            provider=routing.provider if routing else None,
+            model=routing.model if routing else action_config.model,
+            requested_selector=routing.requested_selector if routing else action_config.model,
+            routing_source=routing.routing_source if routing else None,
+            transport=routing.transport if routing else None,
+            surface=routing.surface if routing else None,
+            fallback_model=routing.fallback_model if routing else None,
+            fallback_reason=routing.fallback_reason if routing else None,
+            caller_harness=routing.caller_harness if routing else None,
+        )
+        output_path = (
+            self._output_path(session_id)
+            if action_config.runner in {"command", "harness"}
+            else None
+        )
         try:
-            self._child = self._start_child(action_config, output_path=output_path)
+            self._child = self._start_child(
+                action_config,
+                project=project,
+                routing=routing,
+                prompt=(str(action["prompt"]) if action.get("prompt") else action_config.prompt),
+                output_path=output_path,
+            )
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
             try:
                 takeup = self._takeup_take(project, session_id, record.pid)
@@ -618,6 +739,7 @@ class Daemon:
                 usage_limit_reason = self._detect_and_handle_usage_limit(
                     action_id=action_id, action_type=action_type, action_config=action_config,
                     payload=payload, record=record, exit_code=exit_code, output_path=output_path,
+                    routing=routing,
                 )
             released = self._takeup_release(project, session_id, f"session-{outcome}")
             audit_exit = self._publish_audit(
@@ -775,7 +897,15 @@ class Daemon:
                     time.sleep(self.config.audit.retry_backoff_seconds)
         return {"attempted": True, "status": "failed", "error": last_error, "attempts": attempts}
 
-    def _start_child(self, action: ActionConfig, *, output_path: Path | None = None) -> subprocess.Popen[str]:
+    def _start_child(
+        self,
+        action: ActionConfig,
+        *,
+        project: ProjectConfig | None = None,
+        routing: RoutingResult | None = None,
+        prompt: str | None = None,
+        output_path: Path | None = None,
+    ) -> subprocess.Popen[str]:
         if action.runner in {"fake", "fake-commit"}:
             code = f"import time; time.sleep({action.fake_duration_seconds!r})"
             return subprocess.Popen([sys.executable, "-c", code], text=True, start_new_session=True)
@@ -804,6 +934,50 @@ class Daemon:
             finally:
                 if handle is not None:
                     handle.close()
+        if action.runner == "harness":
+            if project is None or routing is None or prompt is None:
+                raise RuntimeError("runner 'harness' requires project, routing, and prompt")
+            harness_route = (self.config.routing.harnesses or {}).get(routing.harness)
+            adapter = get_adapter(
+                routing.harness,
+                bin_path=harness_route.bin if harness_route else None,
+            )
+            invocation = HarnessInvocation(
+                prompt=prompt,
+                worktree=project.path,
+                model=routing.model,
+                timeout_seconds=(action.timeout_minutes or self.config.default_timeout_minutes) * 60,
+                extra_env=project.env or {},
+            )
+            handle = None
+            stdout_target: Any = subprocess.DEVNULL
+            if output_path is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(output_path, "w", encoding="utf-8")
+                stdout_target = handle
+            try:
+                child = subprocess.Popen(
+                    adapter.build_command(invocation),
+                    cwd=invocation.worktree,
+                    env=adapter.build_env(invocation),
+                    stdin=subprocess.PIPE if adapter.stdin_text(invocation) is not None else subprocess.DEVNULL,
+                    stdout=stdout_target,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
+                stdin_text = adapter.stdin_text(invocation)
+                if stdin_text is not None and child.stdin is not None:
+                    try:
+                        child.stdin.write(stdin_text)
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        child.stdin.close()
+                return child
+            finally:
+                if handle is not None:
+                    handle.close()
         raise RuntimeError(f"runner {action.runner!r} is not supported by daemon minimum")
 
     def _output_path(self, session_id: str) -> Path:
@@ -820,6 +994,7 @@ class Daemon:
         record: SessionRecord,
         exit_code: int,
         output_path: Path | None,
+        routing: RoutingResult | None = None,
     ) -> str | None:
         """Best-effort usage-limit classification for a failed session.
 
@@ -832,28 +1007,43 @@ class Daemon:
         non-scope: no generic automatic retry, no masking of real
         failures as pauses).
         """
-        if output_path is None or not action_config.harness:
+        harness = routing.harness if routing else action_config.harness
+        model = routing.model if routing else action_config.model
+        if output_path is None or not harness:
             return None
         try:
             output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
         except OSError:
             return None
-        signal = classify_usage_limit(action_config.harness, exit_code=exit_code, output=output_text)
+        signal = classify_usage_limit(harness, exit_code=exit_code, output=output_text)
         if not signal.detected:
             return None
 
         handoff_path: Path | None
         handoff_error: str | None = None
+        fallback: RoutingResult | None = None
+        if routing is not None and routing.fallback_model:
+            try:
+                fallback = same_provider_fallback(
+                    routing,
+                    reason=signal.reason or "confirmed usage-limit signal",
+                )
+            except RoutingError:
+                fallback = None
         try:
             handoff_path = write_handoff(
                 self.config.handoff_dir,
                 session_id=record.session_id,
                 action_id=action_id,
                 action_type=action_type,
-                harness=action_config.harness,
-                model=None,
+                harness=harness,
+                model=model,
                 reason=signal.reason or "confirmed usage-limit signal",
                 evidence=signal.evidence,
+                fallback_harness=fallback.harness if fallback else None,
+                fallback_provider=fallback.provider if fallback else None,
+                fallback_model=fallback.model if fallback else None,
+                fallback_reason=fallback.fallback_reason if fallback else None,
             )
         except Exception as exc:  # noqa: BLE001 -- handoff failure must not mask the pause signal itself
             handoff_path = None
@@ -872,6 +1062,7 @@ class Daemon:
                 "handoff_error": handoff_error,
                 "resumable": handoff_path is not None,
                 "evidence": signal.evidence,
+                "redispatch_routing": fallback.provenance() if fallback else None,
             },
         )
         return f"usage-limit-paused: {signal.reason}"

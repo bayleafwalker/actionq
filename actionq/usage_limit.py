@@ -99,6 +99,10 @@ def write_handoff(
     model: str | None,
     reason: str,
     evidence: str | None,
+    fallback_harness: str | None = None,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+    fallback_reason: str | None = None,
 ) -> Path:
     """Write a bounded, durable handoff/checkpoint markdown file.
 
@@ -122,6 +126,10 @@ def write_handoff(
         f"- model: {model or ''}",
         f"- recorded_at: {recorded_at}",
         f"- reason: {reason}",
+        f"- redispatch_harness: {fallback_harness or ''}",
+        f"- redispatch_provider: {fallback_provider or ''}",
+        f"- redispatch_model: {fallback_model or ''}",
+        f"- redispatch_reason: {fallback_reason or ''}",
         "",
         "## evidence (bounded tail of captured output)",
         "",
