@@ -180,6 +180,10 @@ class ClaimClient(Protocol):
         actor: str, ttl_seconds: int, runtime_session_id: str,
     ) -> dict[str, Any]: ...
 
+    def release(
+        self, project: ProjectConfig, *, claim_id: int, claim_token: str, actor: str,
+    ) -> dict[str, Any]: ...
+
 
 @dataclass(frozen=True)
 class SprintClaimLease:
@@ -334,6 +338,22 @@ class SprintctlClaimClient:
             detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim heartbeat failed"
             raise RuntimeError(detail)
         return json.loads(completed.stdout)
+
+    def release(
+        self, project: ProjectConfig, *, claim_id: int, claim_token: str, actor: str,
+    ) -> dict[str, Any]:
+        args = [
+            self.executable, "claim", "release", "--id", str(claim_id),
+            "--claim-token", claim_token, "--actor", actor,
+        ]
+        environment = os.environ.copy()
+        environment.update(project.env or {})
+        completed = subprocess.run(args, cwd=project.path, env=environment, text=True,
+                                   capture_output=True, check=False, timeout=30)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim release failed"
+            raise RuntimeError(detail)
+        return {"claim_id": claim_id, "status": "released"}
 
 
 class AuditctlClient:
@@ -794,11 +814,36 @@ class Daemon:
                 summary=f"actionq session exited: {action_type} #{action_id} ({outcome})", refs=audit_refs,
                 metadata={"action_id": action_id, "session_id": session_id, "outcome": outcome, "exit_code": exit_code},
             )
+            settlement_error: str | None = None
+            self.client.emit(
+                "settlement.pending", action_id=action_id, actor=self.actor,
+                payload={**payload, "outcome": outcome, "sprint_claim": self._claim_ref(sprint_claim_lease)},
+            )
+            if sprint_claim_lease is not None:
+                try:
+                    self.claim_client.release(
+                        sprint_claim_lease.project, claim_id=sprint_claim_lease.claim_id,
+                        claim_token=sprint_claim_lease.claim_token, actor=sprint_claim_lease.actor,
+                    )
+                except Exception as exc:
+                    settlement_error = f"sprint claim release failed: {exc}"
+                    self.client.emit(
+                        "settlement.sprint_claim_release_failed", action_id=action_id, actor=self.actor,
+                        payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease), "detail": str(exc)},
+                    )
+                else:
+                    self.client.emit(
+                        "settlement.sprint_claim_released", action_id=action_id, actor=self.actor,
+                        payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease)},
+                    )
             exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(),
                      "sprint_takeup_release": released, "audit_exit": audit_exit,
-                     "usage_limit_paused": usage_limit_reason is not None}
+                     "usage_limit_paused": usage_limit_reason is not None,
+                     "settlement_error": settlement_error}
             self.client.emit("session.exited", action_id=action_id, actor=self.actor, payload=exited)
-            if outcome == "completed":
+            if settlement_error is not None:
+                self.client.fail(action_id, reason=settlement_error, actor=self.actor, claim_receipt=claim_receipt)
+            elif outcome == "completed":
                 self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor, claim_receipt=claim_receipt)
             else:
                 self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.actor, claim_receipt=claim_receipt)
@@ -809,6 +854,13 @@ class Daemon:
             self._sprint_claim_leases.pop(session_id, None)
             self._child = None
             self._write_state(None)
+
+    @staticmethod
+    def _claim_ref(lease: SprintClaimLease | None) -> dict[str, Any] | None:
+        """Return audit-safe claim identity; opaque proof never leaves memory."""
+        if lease is None:
+            return None
+        return {"claim_id": lease.claim_id, "runtime_session_id": lease.runtime_session_id}
 
     def _context_candidates_request(
         self, project: ProjectConfig | None, action: dict[str, Any]

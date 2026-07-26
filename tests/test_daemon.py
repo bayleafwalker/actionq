@@ -119,7 +119,8 @@ def test_shutdown_pauses_child_then_records_shutdown_outcome(tmp_path: Path):
     worker.join(timeout=2)
 
     assert not worker.is_alive()
-    assert [event[0] for event in client.events][-2:] == ["session.paused", "session.exited"]
+    event_types = [event[0] for event in client.events]
+    assert event_types.index("session.paused") < event_types.index("settlement.pending") < event_types.index("session.exited")
     assert client.events[-1][3]["outcome"] == "shutdown"
     assert client.failed[0][0] == 9
 

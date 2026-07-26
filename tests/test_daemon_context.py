@@ -37,7 +37,9 @@ class FakeClaim:
         self.fail = fail
         self.response = response if response is not None else {"claim_id": 900, "claim_token": "test-sprint-proof"}
         self.renew_calls = []
+        self.release_calls = []
         self.renew_error = None
+        self.release_error = None
 
     def start(self, project, *, item_id, actor, ttl_seconds, branch):
         self.calls.append((project, item_id, actor, ttl_seconds, branch))
@@ -50,6 +52,12 @@ class FakeClaim:
         if self.renew_error is not None:
             raise self.renew_error
         return {"claim_id": claim_id, "status": "active"}
+
+    def release(self, project, *, claim_id, claim_token, actor):
+        self.release_calls.append((project, claim_id, claim_token, actor))
+        if self.release_error is not None:
+            raise self.release_error
+        return {"claim_id": claim_id, "status": "released"}
 
 
 def _remote_project(tmp_path: Path, sprint_id: int = 7) -> ProjectConfig:
@@ -220,6 +228,7 @@ def test_supervision_renews_sprint_claim_without_emitting_its_proof(tmp_path: Pa
 
     assert daemon.run_once() is True
     assert claim.renew_calls
+    assert claim.release_calls
     rendered_events = repr(client.events)
     assert "test-sprint-proof" not in rendered_events
 
@@ -244,6 +253,27 @@ def test_sprint_claim_renewal_loss_stops_child_and_prevents_completion(tmp_path:
     assert client.failed and "claim-lost" in client.failed[0][1]
     pauses = [event for event in client.events if event[0] == "session.paused"]
     assert pauses and pauses[-1][3]["reason"] == "claim-authority-lost"
+
+
+def test_sprint_claim_release_failure_journals_and_fails_queue_settlement(tmp_path: Path):
+    client = FakeClient({"id": 50, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
+    context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
+    claim = FakeClaim()
+    claim.release_error = RuntimeError("sprintctl unavailable")
+    daemon = Daemon(
+        DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED", context=ContextConfig(enabled=True)),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=0.01)}, client,
+        {"demo": _remote_project(tmp_path)}, context_client=context, claim_client=claim,
+    )
+
+    assert daemon.run_once() is True
+    assert claim.release_calls
+    assert not client.completed
+    assert client.failed and "sprint claim release failed" in client.failed[0][1]
+    event_types = [event[0] for event in client.events]
+    assert "settlement.pending" in event_types
+    assert "settlement.sprint_claim_release_failed" in event_types
+    assert client.events[-1][0] == "session.exited"
 
 
 def test_context_fetch_failure_is_advisory_and_session_still_starts(tmp_path: Path):
