@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import threading
 import uuid
 
 import pytest
@@ -37,7 +38,15 @@ def _sprint_db(tmp_path: Path) -> tuple[Path, int]:
     return path, item
 
 
-def _make_daemon(monkeypatch, tmp_path: Path, *, daemon_type=Daemon, claim_client_type=SprintctlClaimClient, duration=0.12) -> tuple[Daemon, str, int, Path, int]:
+def _make_daemon(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    daemon_type=Daemon,
+    action_client_type=ActionctlClient,
+    claim_client_type=SprintctlClaimClient,
+    duration=0.12,
+) -> tuple[Daemon, str, int, Path, int]:
     schema = "aqcross_" + uuid.uuid4().hex
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
     with db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"]) as conn:
@@ -49,8 +58,8 @@ def _make_daemon(monkeypatch, tmp_path: Path, *, daemon_type=Daemon, claim_clien
     actionctl = str(Path(sys.executable).with_name("actionctl"))
     sprintctl = _wrapper(tmp_path)
     daemon = daemon_type(
-        DaemonConfig(heartbeat_interval_seconds=0.01, session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED", actionctl_bin=actionctl, context=ContextConfig(enabled=True, remote_only=False, sprintctl_bin=str(sprintctl))),
-        {"scope-iterate": ActionConfig(fake_duration_seconds=duration)}, ActionctlClient(actionctl),
+        DaemonConfig(heartbeat_interval_seconds=0.01, graceful_shutdown_seconds=0.1, session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED", actionctl_bin=actionctl, context=ContextConfig(enabled=True, remote_only=False, sprintctl_bin=str(sprintctl))),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=duration)}, action_client_type(actionctl),
         {"demo": ProjectConfig(tmp_path, sprint_id=1, env={"SPRINTCTL_DB": str(sprint_path), "SPRINTCTL_BACKEND": "local"})}, claim_client=claim_client_type(str(sprintctl)),
     )
     return daemon, schema, action["id"], sprint_path, item_id
@@ -133,6 +142,122 @@ def test_crash_after_sprint_release_leaves_reclaimable_actionq_work(monkeypatch,
         replacement = db.claim(conn, schema, worker="replacement", timeout_minutes=5)
         db.complete(conn, schema, action_id=action_id, worker="replacement", actor="replacement", claim_receipt=replacement["claim_receipt"], result_ref="recovered")
         assert _text(db.get_action(conn, schema, action_id)["status"]) == "completed"
+    sys.path.insert(0, str(SPRINTCTL_ROOT))
+    from sprintctl import db as sprint_db
+    conn = sprint_db.get_connection(sprint_path)
+    try:
+        assert sprint_db.list_claims(conn, item_id, active_only=True) == []
+    finally:
+        conn.close()
+
+
+class _LostActionqRenewResponseClient(ActionctlClient):
+    """Accept the renewal in ActionQ, then model loss of its response."""
+
+    def renew(self, action_id, *, worker, timeout_minutes, claim_receipt):
+        super().renew(
+            action_id, worker=worker, timeout_minutes=timeout_minutes,
+            claim_receipt=claim_receipt,
+        )
+        raise RuntimeError("fault injection: ActionQ renewal response lost")
+
+
+def test_actionq_renewal_lost_response_stops_child_without_terminal_settlement(monkeypatch, tmp_path: Path):
+    daemon, schema, action_id, sprint_path, item_id = _make_daemon(
+        monkeypatch, tmp_path, action_client_type=_LostActionqRenewResponseClient,
+        duration=2,
+    )
+    assert daemon.run_once() is True
+    with db.connect() as conn:
+        action = db.get_action(conn, schema, action_id)
+        events = [_text(event["event_type"]) for event in db.action_events(conn, schema, action_id)]
+    assert _text(action["status"]) == "claimed"
+    assert "claim_renewed" in events
+    assert "session.paused" in events
+    assert "settlement.actionq_skipped_claim_lost" in events
+    assert not {"action_completed", "action_failed"} & set(events)
+    assert daemon._child is None
+    sys.path.insert(0, str(SPRINTCTL_ROOT))
+    from sprintctl import db as sprint_db
+    conn = sprint_db.get_connection(sprint_path)
+    try:
+        assert sprint_db.list_claims(conn, item_id, active_only=True) == []
+    finally:
+        conn.close()
+
+
+class _FailingReleaseSprintctlClient(SprintctlClaimClient):
+    """Keep the real claim active while making its release unavailable."""
+
+    def release(self, project, *, claim_id, claim_token, actor):
+        raise RuntimeError("fault injection: Sprintctl release unavailable")
+
+
+def test_sprintctl_release_failure_is_journaled_and_fails_actionq(monkeypatch, tmp_path: Path):
+    daemon, schema, action_id, sprint_path, item_id = _make_daemon(
+        monkeypatch, tmp_path, claim_client_type=_FailingReleaseSprintctlClient,
+    )
+    assert daemon.run_once() is True
+    with db.connect() as conn:
+        action = db.get_action(conn, schema, action_id)
+        events = [_text(event["event_type"]) for event in db.action_events(conn, schema, action_id)]
+    assert _text(action["status"]) == "failed"
+    assert "settlement.pending" in events
+    assert "settlement.sprint_claim_release_failed" in events
+    assert "action_failed" in events
+    assert "action_completed" not in events
+    sys.path.insert(0, str(SPRINTCTL_ROOT))
+    from sprintctl import db as sprint_db
+    conn = sprint_db.get_connection(sprint_path)
+    try:
+        assert len(sprint_db.list_claims(conn, item_id, active_only=True)) == 1
+    finally:
+        conn.close()
+
+
+class _CapturingActionctlClient(ActionctlClient):
+    def __init__(self, binary):
+        super().__init__(binary)
+        self.started = threading.Event()
+        self.claim_receipt = None
+
+    def claim(self, worker, timeout_minutes):
+        action = super().claim(worker, timeout_minutes)
+        if action is not None:
+            self.claim_receipt = action["claim_receipt"]
+        return action
+
+    def emit(self, event_type, *, action_id, actor, payload):
+        super().emit(event_type, action_id=action_id, actor=actor, payload=payload)
+        if event_type == "session.started":
+            self.started.set()
+
+
+def test_shutdown_stops_child_releases_sprint_claim_and_fences_old_receipt(monkeypatch, tmp_path: Path):
+    daemon, schema, action_id, sprint_path, item_id = _make_daemon(
+        monkeypatch, tmp_path, action_client_type=_CapturingActionctlClient,
+        duration=10,
+    )
+    worker = threading.Thread(target=daemon.run_once)
+    worker.start()
+    assert daemon.client.started.wait(timeout=5)
+    daemon.request_shutdown()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert daemon._child is None
+    assert daemon.config.session_state_path.read_text() == "{}"
+    with db.connect() as conn:
+        action = db.get_action(conn, schema, action_id)
+        events = [_text(event["event_type"]) for event in db.action_events(conn, schema, action_id)]
+        assert _text(action["status"]) == "failed"
+        assert "settlement.sprint_claim_released" in events
+        assert "session.exited" in events
+        with pytest.raises(db.ActionQError):
+            db.complete(
+                conn, schema, action_id=action_id, worker=daemon.actor,
+                actor=daemon.actor, claim_receipt=daemon.client.claim_receipt,
+                result_ref="stale-after-shutdown",
+            )
     sys.path.insert(0, str(SPRINTCTL_ROOT))
     from sprintctl import db as sprint_db
     conn = sprint_db.get_connection(sprint_path)

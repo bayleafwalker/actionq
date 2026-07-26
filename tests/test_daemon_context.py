@@ -250,9 +250,12 @@ def test_sprint_claim_renewal_loss_stops_child_and_prevents_completion(tmp_path:
     assert daemon.run_once() is True
     assert claim.renew_calls
     assert not client.completed
-    assert client.failed and "claim-lost" in client.failed[0][1]
+    assert not client.failed
     pauses = [event for event in client.events if event[0] == "session.paused"]
     assert pauses and pauses[-1][3]["reason"] == "claim-authority-lost"
+    assert "settlement.actionq_skipped_claim_lost" in [
+        event[0] for event in client.events
+    ]
 
 
 def test_sprint_claim_release_failure_journals_and_fails_queue_settlement(tmp_path: Path):
