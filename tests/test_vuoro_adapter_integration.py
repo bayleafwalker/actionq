@@ -181,13 +181,14 @@ def test_adapter_claim_renew_stale_worker_and_terminal_retry(runtime_application
     )
     assert claimed["result"]["id"] == enqueued["id"]
     assert claimed["result"]["claimed_by"] == "runner:one"
+    receipt = claimed["result"]["claim_receipt"]
 
     renewed = renew(
-        {"action_id": enqueued["id"], "timeout_minutes": 45},
+        {"action_id": enqueued["id"], "timeout_minutes": 45, "claim_receipt": receipt},
         _context(actor="runner:one", request_id="renew", idempotency_key="renew"),
     )
     stale = renew(
-        {"action_id": enqueued["id"], "timeout_minutes": 45},
+        {"action_id": enqueued["id"], "timeout_minutes": 45, "claim_receipt": receipt},
         _context(actor="runner:stale", request_id="stale", idempotency_key="stale"),
     )
     assert renewed["decision"]["status"] == "accepted"
@@ -196,13 +197,13 @@ def test_adapter_claim_renew_stale_worker_and_terminal_retry(runtime_application
     assert stale["decision"]["message"] == "claimed-by-different-worker"
 
     completed = complete(
-        {"action_id": enqueued["id"], "result_ref": "sha:abc"},
+        {"action_id": enqueued["id"], "result_ref": "sha:abc", "claim_receipt": receipt},
         _context(
             actor="runner:one", request_id="complete-1", idempotency_key="complete"
         ),
     )
     replay = complete(
-        {"action_id": enqueued["id"], "result_ref": "sha:abc"},
+        {"action_id": enqueued["id"], "result_ref": "sha:abc", "claim_receipt": receipt},
         _context(
             actor="runner:one", request_id="complete-2", idempotency_key="complete"
         ),
@@ -309,7 +310,7 @@ def test_adapter_compatibility_uses_runtime_role_and_refuses_migration_role(
     record = compatibility_record(runtime_application)
     assert record == {
         "api_version": "v1",
-        "schema_version": "1",
+            "schema_version": "2",
         "state": "compatible",
         "reason": None,
     }

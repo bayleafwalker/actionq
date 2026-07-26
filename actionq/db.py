@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -611,7 +612,8 @@ def claim(
             SET status = 'claimed',
                 claimed_at = now(),
                 claimed_by = %s,
-                claim_deadline = now() + (%s * interval '1 minute')
+                claim_deadline = now() + (%s * interval '1 minute'),
+                claim_receipt = %s
             WHERE id = (
                 SELECT id FROM {qname(schema, "actions")}
                 WHERE status = 'pending'
@@ -621,7 +623,7 @@ def claim(
             )
             RETURNING *
             """,
-            (worker, timeout_minutes),
+            (worker, timeout_minutes, str(uuid.uuid4())),
         ).fetchone()
         if row is None:
             raise NoActionAvailable("no pending actions")
@@ -635,6 +637,7 @@ def claim(
                 {
                     "claimed_by": worker,
                     "claim_deadline": json_default(row["claim_deadline"]),
+                    "claim_receipt": row["claim_receipt"],
                 },
                 provenance,
             ),
@@ -642,7 +645,7 @@ def claim(
     return dict(row)
 
 
-def _renewal_rejection_reason(current: dict[str, Any] | None, worker: str) -> str | None:
+def _renewal_rejection_reason(current: dict[str, Any] | None, worker: str, claim_receipt: str) -> str | None:
     if current is None:
         return "action-not-found"
     status = _text(current["status"])
@@ -650,6 +653,8 @@ def _renewal_rejection_reason(current: dict[str, Any] | None, worker: str) -> st
         return f"not-claimed:{status}"
     if _text(current["claimed_by"]) != worker:
         return "claimed-by-different-worker"
+    if current.get("claim_receipt") != claim_receipt:
+        return "claim-receipt-mismatch"
     deadline = current.get("claim_deadline")
     if deadline is not None:
         deadline_utc = deadline if deadline.tzinfo else deadline.replace(tzinfo=timezone.utc)
@@ -665,6 +670,7 @@ def renew(
     action_id: int,
     worker: str,
     timeout_minutes: int,
+    claim_receipt: str,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
     """Renew (extend) an existing claim's deadline as an authority command.
@@ -690,7 +696,7 @@ def renew(
             f'SELECT * FROM {qname(schema, "actions")} WHERE id = %s FOR UPDATE',
             (action_id,),
         ).fetchone()
-        rejection_reason = _renewal_rejection_reason(current, worker)
+        rejection_reason = _renewal_rejection_reason(current, worker, claim_receipt)
         if rejection_reason is not None:
             insert_event(
                 conn,
@@ -703,6 +709,7 @@ def renew(
                         "requested_by": worker,
                         "requested_action_id": action_id,
                         "requested_timeout_minutes": timeout_minutes,
+                        "requested_claim_receipt": claim_receipt,
                         "action_status": _text(current["status"])
                         if current is not None
                         else None,
@@ -745,6 +752,7 @@ def renew(
                         else None,
                         "new_deadline": json_default(row["claim_deadline"]),
                         "requested_timeout_minutes": timeout_minutes,
+                        "claim_receipt": claim_receipt,
                     },
                     provenance,
                 ),
@@ -769,6 +777,8 @@ def _transition_terminal(
     status: str,
     event_type: str,
     actor: str | None,
+    worker: str,
+    claim_receipt: str,
     result_ref: str | None = None,
     failure_reason: str | None = None,
     payload: dict[str, Any] | None = None,
@@ -786,9 +796,11 @@ def _transition_terminal(
                 failure_reason = COALESCE(%s, failure_reason)
             WHERE id = %s
               AND status IN ({allowed_sql})
+              AND claimed_by = %s
+              AND claim_receipt = %s
             RETURNING *
             """,
-            (status, result_ref, failure_reason, action_id),
+            (status, result_ref, failure_reason, action_id, worker, claim_receipt),
         ).fetchone()
         if row is None:
             raise ActionQError(f"Action #{action_id} cannot transition to {status}")
@@ -810,6 +822,8 @@ def complete(
     result_ref: str,
     actor: str | None = None,
     *,
+    worker: str,
+    claim_receipt: str,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
     return _transition_terminal(
@@ -819,6 +833,8 @@ def complete(
         status="completed",
         event_type="action_completed",
         actor=actor,
+        worker=worker,
+        claim_receipt=claim_receipt,
         result_ref=result_ref,
         payload={"result_ref": result_ref},
         allowed_statuses=("claimed",),
@@ -833,6 +849,8 @@ def fail(
     reason: str,
     actor: str | None = None,
     *,
+    worker: str,
+    claim_receipt: str,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
     return _transition_terminal(
@@ -842,6 +860,8 @@ def fail(
         status="failed",
         event_type="action_failed",
         actor=actor,
+        worker=worker,
+        claim_receipt=claim_receipt,
         failure_reason=reason,
         payload={"failure_reason": reason},
         allowed_statuses=("claimed",),
@@ -858,6 +878,8 @@ def reject(
     validator: str,
     actor: str | None = None,
     provenance: dict[str, Any] | None = None,
+    worker: str,
+    claim_receipt: str,
 ) -> dict:
     return _transition_terminal(
         conn,
@@ -866,6 +888,8 @@ def reject(
         status="rejected",
         event_type="action_rejected",
         actor=actor,
+        worker=worker,
+        claim_receipt=claim_receipt,
         failure_reason=reason,
         payload={"rejection_reason": reason, "validator": validator},
         allowed_statuses=("claimed",),
@@ -921,6 +945,7 @@ def sweep(
                     claimed_at = NULL,
                     claimed_by = NULL,
                     claim_deadline = NULL
+                    , claim_receipt = NULL
                 WHERE id = %s
                 RETURNING *
                 """,

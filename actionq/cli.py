@@ -153,8 +153,9 @@ def claim(ctx, worker: str, timeout_minutes: int) -> None:
 @click.argument("action_id", type=int)
 @click.option("--worker", required=True, help="Worker identity; must match the current claimant")
 @click.option("--timeout", "timeout_minutes", default=30, type=int, show_default=True)
+@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
 @click.pass_context
-def renew(ctx, action_id: int, worker: str, timeout_minutes: int) -> None:
+def renew(ctx, action_id: int, worker: str, timeout_minutes: int, claim_receipt: str) -> None:
     """Renew (extend) a claim's deadline as an authority command.
 
     Exits non-zero with the durable rejection reason for a stale or
@@ -168,6 +169,7 @@ def renew(ctx, action_id: int, worker: str, timeout_minutes: int) -> None:
             action_id=action_id,
             worker=worker,
             timeout_minutes=timeout_minutes,
+            claim_receipt=claim_receipt,
         )
     except db.ClaimRejected as exc:
         click.echo(str(exc), err=True)
@@ -178,13 +180,14 @@ def renew(ctx, action_id: int, worker: str, timeout_minutes: int) -> None:
 @cli.command()
 @click.argument("action_id", type=int)
 @click.option("--result", "result_ref", required=True)
-@click.option("--actor", default=None)
+@click.option("--actor", required=True, help="Current claimant identity")
+@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
 @click.pass_context
-def complete(ctx, action_id: int, result_ref: str, actor: str | None) -> None:
+def complete(ctx, action_id: int, result_ref: str, actor: str, claim_receipt: str) -> None:
     action = _app(ctx).complete(
         action_id=action_id,
         result_ref=result_ref,
-        actor=actor,
+        actor=actor, claim_receipt=claim_receipt,
     )
     _echo_json(action)
 
@@ -192,13 +195,14 @@ def complete(ctx, action_id: int, result_ref: str, actor: str | None) -> None:
 @cli.command()
 @click.argument("action_id", type=int)
 @click.option("--reason", required=True)
-@click.option("--actor", default=None)
+@click.option("--actor", required=True, help="Current claimant identity")
+@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
 @click.pass_context
-def fail(ctx, action_id: int, reason: str, actor: str | None) -> None:
+def fail(ctx, action_id: int, reason: str, actor: str, claim_receipt: str) -> None:
     action = _app(ctx).fail(
         action_id=action_id,
         reason=reason,
-        actor=actor,
+        actor=actor, claim_receipt=claim_receipt,
     )
     _echo_json(action)
 
@@ -207,14 +211,15 @@ def fail(ctx, action_id: int, reason: str, actor: str | None) -> None:
 @click.argument("action_id", type=int)
 @click.option("--reason", required=True)
 @click.option("--validator", required=True)
-@click.option("--actor", default=None)
+@click.option("--actor", required=True, help="Current claimant identity")
+@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
 @click.pass_context
-def reject(ctx, action_id: int, reason: str, validator: str, actor: str | None) -> None:
+def reject(ctx, action_id: int, reason: str, validator: str, actor: str, claim_receipt: str) -> None:
     action = _app(ctx).reject(
         action_id=action_id,
         reason=reason,
         validator=validator,
-        actor=actor,
+        actor=actor, claim_receipt=claim_receipt,
     )
     _echo_json(action)
 

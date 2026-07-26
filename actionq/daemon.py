@@ -155,9 +155,10 @@ class SessionRecord:
 
 class CoordinatorClient(Protocol):
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None: ...
+    def renew(self, action_id: int, *, worker: str, timeout_minutes: int, claim_receipt: str) -> None: ...
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None: ...
-    def complete(self, action_id: int, *, result_ref: str, actor: str) -> None: ...
-    def fail(self, action_id: int, *, reason: str, actor: str) -> None: ...
+    def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None: ...
+    def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None: ...
 
 
 class TakeupClient(Protocol):
@@ -207,17 +208,20 @@ class ActionctlClient:
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None:
         return self._run("claim", "--worker", worker, "--timeout", str(timeout_minutes), allow_empty=True)
 
+    def renew(self, action_id: int, *, worker: str, timeout_minutes: int, claim_receipt: str) -> None:
+        self._run("renew", str(action_id), "--worker", worker, "--timeout", str(timeout_minutes), "--claim-receipt", claim_receipt)
+
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None:
         args = ["emit", "--type", event_type, "--actor", actor, "--payload", json.dumps(payload, sort_keys=True)]
         if action_id is not None:
             args.extend(["--action", str(action_id)])
         self._run(*args)
 
-    def complete(self, action_id: int, *, result_ref: str, actor: str) -> None:
-        self._run("complete", str(action_id), "--result", result_ref, "--actor", actor)
+    def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None:
+        self._run("complete", str(action_id), "--result", result_ref, "--actor", actor, "--claim-receipt", claim_receipt)
 
-    def fail(self, action_id: int, *, reason: str, actor: str) -> None:
-        self._run("fail", str(action_id), "--reason", reason, "--actor", actor)
+    def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
+        self._run("fail", str(action_id), "--reason", reason, "--actor", actor, "--claim-receipt", claim_receipt)
 
 
 class SprintctlTakeupClient:
@@ -593,10 +597,13 @@ class Daemon:
 
     def _run_action(self, action: dict[str, Any]) -> None:
         action_id = int(action["id"])
+        claim_receipt = str(action.get("claim_receipt") or "")
+        if not claim_receipt:
+            raise RuntimeError(f"action #{action_id} claim did not include a claim receipt")
         action_type = str(action["action_type"])
         action_config = self.actions.get(action_type)
         if action_config is None:
-            self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.actor)
+            self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.actor, claim_receipt=claim_receipt)
             return
         project = self.projects.get(str(action.get("project") or ""))
         routing: RoutingResult | None = None
@@ -619,7 +626,7 @@ class Daemon:
                 if not (action.get("prompt") or action_config.prompt):
                     raise RoutingError("runner 'harness' requires an explicit or action-class prompt")
             except RoutingError as exc:
-                self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor)
+                self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor, claim_receipt=claim_receipt)
                 return
         session_id = f"aqs:{uuid.uuid4()}"
         ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
@@ -657,7 +664,7 @@ class Daemon:
             self.client.fail(
                 action_id,
                 reason=f"context claim acquisition failed before session start: {claim_result['error']}",
-                actor=self.actor,
+                actor=self.actor, claim_receipt=claim_receipt,
             )
             return
         # Best-effort starting git state for this project (#1115 crash-
@@ -722,7 +729,7 @@ class Daemon:
                 os.killpg(self._child.pid, signal.SIGTERM)
                 self._child.wait()
                 self.client.fail(action_id, reason=f"sprintctl takeup failed before session start: {exc}",
-                                 actor=self.actor)
+                                 actor=self.actor, claim_receipt=claim_receipt)
                 return
             self._write_state(record)
             audit_start = self._publish_audit(
@@ -733,7 +740,7 @@ class Daemon:
             self.client.emit("session.started", action_id=action_id, actor=self.actor,
                              payload={**payload, "pid": record.pid, "started_at": record.started_at,
                                      "sprint_takeup": takeup, "audit_start": audit_start})
-            outcome, exit_code = self._wait_for_child(action_id, payload, record, project, audit_actor, audit_refs)
+            outcome, exit_code = self._wait_for_child(action_id, payload, record, claim_receipt, project, audit_actor, audit_refs)
             usage_limit_reason: str | None = None
             if outcome == "failed":
                 usage_limit_reason = self._detect_and_handle_usage_limit(
@@ -752,11 +759,11 @@ class Daemon:
                      "usage_limit_paused": usage_limit_reason is not None}
             self.client.emit("session.exited", action_id=action_id, actor=self.actor, payload=exited)
             if outcome == "completed":
-                self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor)
+                self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor, claim_receipt=claim_receipt)
             else:
-                self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.actor)
+                self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.actor, claim_receipt=claim_receipt)
         except Exception as exc:
-            self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.actor)
+            self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.actor, claim_receipt=claim_receipt)
             raise
         finally:
             self._child = None
@@ -992,6 +999,7 @@ class Daemon:
         action_config: ActionConfig,
         payload: dict[str, Any],
         record: SessionRecord,
+        claim_receipt: str,
         exit_code: int,
         output_path: Path | None,
         routing: RoutingResult | None = None,
@@ -1102,6 +1110,7 @@ class Daemon:
         action_id: int,
         payload: dict[str, Any],
         record: SessionRecord,
+        claim_receipt: str,
         project: ProjectConfig | None = None,
         audit_actor: str | None = None,
         audit_refs: Sequence[str] = (),
@@ -1124,6 +1133,18 @@ class Daemon:
                     os.killpg(self._child.pid, signal.SIGTERM)
                 return "shutdown", self._child.wait()
             if time.monotonic() >= next_heartbeat:
+                try:
+                    self.client.renew(action_id, worker=self.actor,
+                                      timeout_minutes=self.config.default_timeout_minutes,
+                                      claim_receipt=claim_receipt)
+                except Exception as exc:
+                    # Renewal is authority, unlike a session heartbeat.  Once
+                    # it fails, this worker must not keep executing or settle.
+                    os.killpg(self._child.pid, signal.SIGTERM)
+                    self._child.wait()
+                    self.client.emit("session.paused", action_id=action_id, actor=self.actor,
+                                     payload={**payload, "pid": record.pid, "reason": "actionq-claim-lost", "detail": str(exc)})
+                    return "claim-lost", int(self._child.returncode or 1)
                 record.updated_at = _now()
                 self._write_state(record)
                 self.client.emit("session.heartbeat", action_id=action_id, actor=self.actor,

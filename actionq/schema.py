@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 1
+MAX_SCHEMA_VERSION = 2
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
@@ -38,6 +38,7 @@ _COLUMN_SHAPE = {
         "claimed_at": ("timestamp with time zone", "YES", None),
         "claimed_by": ("text", "YES", None),
         "claim_deadline": ("timestamp with time zone", "YES", None),
+        "claim_receipt": ("text", "YES", None),
         "completed_at": ("timestamp with time zone", "YES", None),
         "result_ref": ("text", "YES", None),
         "failure_reason": ("text", "YES", None),
@@ -868,7 +869,7 @@ def migrate(
                 continue
             if migration.version == 1 and data_tables_existed:
                 shape_issues = _shape_issues(conn, schema)
-                if shape_issues:
+                if shape_issues and migration.version == MAX_SCHEMA_VERSION:
                     raise SchemaMigrationError(
                         "refusing to stamp incompatible unversioned actionq schema: "
                         + ",".join(shape_issues)
@@ -878,7 +879,7 @@ def migrate(
                 for statement in _statements(_render(migration, schema)):
                     conn.execute(statement)
                 shape_issues = _shape_issues(conn, schema)
-                if shape_issues:
+                if shape_issues and migration.version == MAX_SCHEMA_VERSION:
                     raise SchemaMigrationError(
                         "migration did not establish the required actionq schema: "
                         + ",".join(shape_issues)

@@ -426,6 +426,7 @@ class ActionQApplication:
         action_id: int,
         worker: str,
         timeout_minutes: int,
+        claim_receipt: str,
         provenance: InvocationProvenance | None = None,
     ) -> Any:
         return self._mutate(
@@ -434,6 +435,7 @@ class ActionQApplication:
                 "action_id": action_id,
                 "worker": worker,
                 "timeout_minutes": timeout_minutes,
+                "claim_receipt": claim_receipt,
             },
             provenance=provenance,
             mutation=lambda conn, event_provenance: db.renew(
@@ -442,6 +444,7 @@ class ActionQApplication:
                 action_id=action_id,
                 worker=worker,
                 timeout_minutes=timeout_minutes,
+                claim_receipt=claim_receipt,
                 provenance=event_provenance,
             ),
         )
@@ -469,13 +472,14 @@ class ActionQApplication:
         action_id: int,
         result_ref: str,
         actor: str,
+        claim_receipt: str,
         provenance: InvocationProvenance | None = None,
     ) -> Any:
         return self._terminal(
             operation="execution.action.complete",
             action_id=action_id,
             actor=actor,
-            arguments={"result_ref": result_ref},
+            arguments={"result_ref": result_ref, "claim_receipt": claim_receipt},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.complete(
                 conn,
@@ -483,6 +487,8 @@ class ActionQApplication:
                 action_id,
                 result_ref,
                 actor=actor,
+                worker=actor,
+                claim_receipt=claim_receipt,
                 provenance=event_provenance,
             ),
         )
@@ -493,13 +499,14 @@ class ActionQApplication:
         action_id: int,
         reason: str,
         actor: str,
+        claim_receipt: str,
         provenance: InvocationProvenance | None = None,
     ) -> Any:
         return self._terminal(
             operation="execution.action.fail",
             action_id=action_id,
             actor=actor,
-            arguments={"reason": reason},
+            arguments={"reason": reason, "claim_receipt": claim_receipt},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.fail(
                 conn,
@@ -507,6 +514,8 @@ class ActionQApplication:
                 action_id,
                 reason,
                 actor=actor,
+                worker=actor,
+                claim_receipt=claim_receipt,
                 provenance=event_provenance,
             ),
         )
@@ -518,13 +527,14 @@ class ActionQApplication:
         reason: str,
         validator: str,
         actor: str,
+        claim_receipt: str,
         provenance: InvocationProvenance | None = None,
     ) -> Any:
         return self._terminal(
             operation="execution.action.reject",
             action_id=action_id,
             actor=actor,
-            arguments={"reason": reason, "validator": validator},
+            arguments={"reason": reason, "validator": validator, "claim_receipt": claim_receipt},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.reject(
                 conn,
@@ -533,6 +543,8 @@ class ActionQApplication:
                 reason=reason,
                 validator=validator,
                 actor=actor,
+                worker=actor,
+                claim_receipt=claim_receipt,
                 provenance=event_provenance,
             ),
         )
