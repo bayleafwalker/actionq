@@ -23,6 +23,7 @@ SESSION_EVENT_TYPES = (
     "settlement.pending",
     "settlement.sprint_claim_released",
     "settlement.sprint_claim_release_failed",
+    "settlement.actionq_skipped_claim_lost",
 )
 
 

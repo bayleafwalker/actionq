@@ -836,12 +836,21 @@ class Daemon:
                         "settlement.sprint_claim_released", action_id=action_id, actor=self.actor,
                         payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease)},
                     )
+                    self._after_sprint_claim_release(sprint_claim_lease)
             exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(),
                      "sprint_takeup_release": released, "audit_exit": audit_exit,
                      "usage_limit_paused": usage_limit_reason is not None,
                      "settlement_error": settlement_error}
             self.client.emit("session.exited", action_id=action_id, actor=self.actor, payload=exited)
-            if settlement_error is not None:
+            if outcome == "claim-lost":
+                # The ActionQ receipt is no longer authoritative.  Do not
+                # attempt a terminal transition, even a failure: a newer
+                # claimant owns that decision.
+                self.client.emit(
+                    "settlement.actionq_skipped_claim_lost", action_id=action_id, actor=self.actor,
+                    payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease)},
+                )
+            elif settlement_error is not None:
                 self.client.fail(action_id, reason=settlement_error, actor=self.actor, claim_receipt=claim_receipt)
             elif outcome == "completed":
                 self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor, claim_receipt=claim_receipt)
@@ -861,6 +870,14 @@ class Daemon:
         if lease is None:
             return None
         return {"claim_id": lease.claim_id, "runtime_session_id": lease.runtime_session_id}
+
+    def _after_sprint_claim_release(self, lease: SprintClaimLease) -> None:
+        """Lifecycle seam used by the fault harness to model a process crash.
+
+        Production deliberately has no side effect here.  The boundary is
+        explicit because Sprintctl release and ActionQ terminal settlement
+        are separate authorities and cannot be one transaction.
+        """
 
     def _context_candidates_request(
         self, project: ProjectConfig | None, action: dict[str, Any]

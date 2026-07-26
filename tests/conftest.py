@@ -29,6 +29,7 @@ def _needs_postgres(config) -> bool:
         Path(argument).name == "tests"
         or "integration" in argument
         or "claim_authority" in argument
+        or "cross_authority" in argument
         for argument in args
     )
 
