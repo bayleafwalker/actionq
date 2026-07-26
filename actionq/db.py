@@ -20,6 +20,9 @@ SESSION_EVENT_TYPES = (
     "session.resumed",
     "session.exited",
     "session.end-inferred",
+    "settlement.pending",
+    "settlement.sprint_claim_released",
+    "settlement.sprint_claim_release_failed",
 )
 
 

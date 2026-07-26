@@ -289,17 +289,7 @@ def sessions(ctx, project: str | None, active_only: bool, limit: int) -> None:
     _echo_json(rows)
 
 
-_EMIT_EVENT_TYPES = [
-    "coordinator_cycle",
-    "coordinator_paused",
-    "session.dispatch",
-    "session.started",
-    "session.heartbeat",
-    "session.paused",
-    "session.resumed",
-    "session.exited",
-    "session.end-inferred",
-]
+_EMIT_EVENT_TYPES = ["coordinator_cycle", "coordinator_paused", *db.SESSION_EVENT_TYPES]
 
 
 @cli.command()

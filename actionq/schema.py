@@ -869,7 +869,15 @@ def migrate(
                 continue
             if migration.version == 1 and data_tables_existed:
                 shape_issues = _shape_issues(conn, schema)
-                if shape_issues and migration.version == MAX_SCHEMA_VERSION:
+                # A genuine v1 schema predates the claim-receipt column
+                # added by v2.  It may be adopted only when that is its sole
+                # difference; all other drift remains a refusal before any
+                # migration ledger is stamped.
+                shape_issues = [
+                    issue for issue in shape_issues
+                    if issue != "column-missing:actions.claim_receipt"
+                ]
+                if shape_issues:
                     raise SchemaMigrationError(
                         "refusing to stamp incompatible unversioned actionq schema: "
                         + ",".join(shape_issues)

@@ -26,7 +26,7 @@ def _needs_postgres(config) -> bool:
     if not args:
         return True
     return any(
-        argument == "tests"
+        Path(argument).name == "tests"
         or "integration" in argument
         or "claim_authority" in argument
         for argument in args
