@@ -109,15 +109,18 @@ class FakeClient:
 
     def claim(self, worker, timeout_minutes):
         action, self.action = self.action, None
-        return action
+        return {**action, "claim_receipt": action.get("claim_receipt", "test-receipt")} if action else None
+
+    def renew(self, action_id, *, worker, timeout_minutes, claim_receipt):
+        assert claim_receipt == "test-receipt"
 
     def emit(self, event_type, *, action_id, actor, payload):
         self.events.append((event_type, action_id, actor, payload))
 
-    def complete(self, action_id, *, result_ref, actor):
+    def complete(self, action_id, *, result_ref, actor, claim_receipt):
         self.completed.append((action_id, result_ref, actor))
 
-    def fail(self, action_id, *, reason, actor):
+    def fail(self, action_id, *, reason, actor, claim_receipt):
         self.failed.append((action_id, reason, actor))
 
 

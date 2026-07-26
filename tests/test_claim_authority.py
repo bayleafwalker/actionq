@@ -60,7 +60,7 @@ def test_renew_extends_deadline_and_emits_claim_renewed(schema):
     conn = _connect_migrated(schema)
     claimed = _enqueue_and_claim(conn, schema, worker="worker:one")
 
-    renewed = db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=60)
+    renewed = db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=60, claim_receipt=claimed["claim_receipt"])
     conn.commit()
 
     assert renewed["claim_deadline"] > claimed["claim_deadline"]
@@ -81,9 +81,9 @@ def test_duplicate_renew_retry_by_same_worker_is_safe(schema):
     conn = _connect_migrated(schema)
     claimed = _enqueue_and_claim(conn, schema, worker="worker:one")
 
-    first = db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30)
+    first = db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30, claim_receipt=claimed["claim_receipt"])
     conn.commit()
-    second = db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30)
+    second = db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30, claim_receipt=claimed["claim_receipt"])
     conn.commit()
 
     assert second["claim_deadline"] >= first["claim_deadline"]
@@ -105,7 +105,7 @@ def test_renew_rejects_wrong_worker_without_mutating_state(schema):
     claimed = _enqueue_and_claim(conn, schema, worker="worker:one")
 
     with pytest.raises(db.ClaimRejected) as excinfo:
-        db.renew(conn, schema, action_id=claimed["id"], worker="worker:impostor", timeout_minutes=30)
+        db.renew(conn, schema, action_id=claimed["id"], worker="worker:impostor", timeout_minutes=30, claim_receipt=claimed["claim_receipt"])
     conn.commit()
 
     assert excinfo.value.reason == "claimed-by-different-worker"
@@ -134,7 +134,7 @@ def test_renew_rejects_expired_claim(schema):
     conn.commit()
 
     with pytest.raises(db.ClaimRejected) as excinfo:
-        db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30)
+        db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30, claim_receipt=claimed["claim_receipt"])
     conn.commit()
 
     assert excinfo.value.reason == "claim-already-expired"
@@ -151,7 +151,7 @@ def test_renew_rejects_pending_unclaimed_action(schema):
     conn.commit()
 
     with pytest.raises(db.ClaimRejected) as excinfo:
-        db.renew(conn, schema, action_id=action["id"], worker="worker:one", timeout_minutes=30)
+        db.renew(conn, schema, action_id=action["id"], worker="worker:one", timeout_minutes=30, claim_receipt="missing")
     conn.commit()
 
     assert excinfo.value.reason == "not-claimed:pending"
@@ -164,7 +164,7 @@ def test_renew_rejects_unknown_action_id(schema):
     db.migrate(conn, schema)
 
     with pytest.raises(db.ClaimRejected) as excinfo:
-        db.renew(conn, schema, action_id=999999, worker="worker:one", timeout_minutes=30)
+        db.renew(conn, schema, action_id=999999, worker="worker:one", timeout_minutes=30, claim_receipt="missing")
     conn.commit()
 
     assert excinfo.value.reason == "action-not-found"
@@ -194,13 +194,42 @@ def test_renew_after_reassignment_by_a_different_worker_is_rejected_for_the_stal
     assert reclaimed["id"] == claimed["id"]
 
     with pytest.raises(db.ClaimRejected) as excinfo:
-        db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30)
+        db.renew(conn, schema, action_id=claimed["id"], worker="worker:one", timeout_minutes=30, claim_receipt=claimed["claim_receipt"])
     conn.commit()
 
     assert excinfo.value.reason == "claimed-by-different-worker"
     current = db.get_action(conn, schema, claimed["id"])
     claimed_by = current["claimed_by"].decode() if isinstance(current["claimed_by"], bytes) else current["claimed_by"]
     assert claimed_by == "worker:two"
+
+
+def test_stale_claim_receipt_cannot_settle_reclaimed_action(schema):
+    """Expiry/sweep/reclaim fences terminal settlement, not only renewal."""
+    conn = _connect_migrated(schema)
+    first = _enqueue_and_claim(conn, schema, worker="worker:one", timeout_minutes=1)
+    conn.execute(
+        f'UPDATE "{schema}"."actions" SET claim_deadline = now() - interval \'1 minute\' WHERE id = %s',
+        (first["id"],),
+    )
+    conn.commit()
+    db.sweep(conn, schema)
+    conn.commit()
+    second = db.claim(conn, schema, worker="worker:two", timeout_minutes=30)
+    conn.commit()
+
+    with pytest.raises(db.ActionQError):
+        db.complete(
+            conn, schema, first["id"], "stale-result", actor="worker:one",
+            worker="worker:one", claim_receipt=first["claim_receipt"],
+        )
+    conn.commit()
+    current = db.get_action(conn, schema, first["id"])
+    assert current["status"] == "claimed"
+    completed = db.complete(
+        conn, schema, second["id"], "current-result", actor="worker:two",
+        worker="worker:two", claim_receipt=second["claim_receipt"],
+    )
+    assert completed["status"] == "completed"
 
 
 # -- CLI surface -----------------------------------------------------------
@@ -221,11 +250,11 @@ def test_renew_cli_exits_nonzero_with_rejection_reason(
     claimed = json.loads(runner.invoke(cli, ["claim", "--worker", "worker:one"]).output)
     assert claimed["id"] == action["id"]
 
-    ok = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:one", "--timeout", "45"])
+    ok = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:one", "--timeout", "45", "--claim-receipt", claimed["claim_receipt"]])
     assert ok.exit_code == 0, ok.output
     assert json.loads(ok.output)["id"] == action["id"]
 
-    rejected = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:impostor"])
+    rejected = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:impostor", "--claim-receipt", claimed["claim_receipt"]])
     assert rejected.exit_code == 2
     assert "claimed-by-different-worker" in rejected.output
 

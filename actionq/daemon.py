@@ -1101,7 +1101,6 @@ class Daemon:
         action_config: ActionConfig,
         payload: dict[str, Any],
         record: SessionRecord,
-        claim_receipt: str,
         exit_code: int,
         output_path: Path | None,
         routing: RoutingResult | None = None,
