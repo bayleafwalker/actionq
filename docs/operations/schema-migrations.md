@@ -10,8 +10,22 @@ The current execution contract reports:
 
 - domain: `execution`;
 - API version: `v1`;
-- supported schema versions: `1` through `1`;
+- compatibility range: schema versions `1` through `2`;
+- required runtime target: the complete packaged migration ledger through
+  schema version `2`; and
 - one SHA-256 checksum for every packaged migration.
+
+Schema version `2` adds the nullable `actions.claim_receipt` column. Every
+successful claim mints an opaque receipt, and renewal plus terminal settlement
+require the receipt for the current claim incarnation. A reclaimed action has
+a new receipt, so a prior claimant cannot renew or settle it.
+
+`actionctl check-compatibility` reports the supported range for release
+selection, but a running service requires the complete, checksum-matching
+packaged ledger and the v2 queue shape. A ledger containing only version `1`
+is therefore `incomplete`, not runtime-compatible; run the migration role to
+apply version `2` before starting runtime traffic. The migrator can adopt the
+known pre-ledger v1 shape and then apply v2, but it refuses other schema drift.
 
 `actionctl check-compatibility` performs only `SELECT` statements and exits
 with status `3` for an incompatible schema. Its JSON object is the Actionq
