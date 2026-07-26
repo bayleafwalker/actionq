@@ -32,11 +32,24 @@ from .routing import (
     resolve_routing,
     same_provider_fallback,
 )
+from .scope_iterate import (
+    PreparedScopeIterate,
+    ScopeIterateKernel,
+    ScopeIteratePolicy,
+    ScopeIterateRequest,
+    VerificationResult,
+    load_policy,
+)
 from .usage_limit import classify_usage_limit, write_handoff
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _is_shared_sprint_backend(project: ProjectConfig | None) -> bool:
+    """True for direct Postgres and served Vuoro Sprintctl authorities."""
+    return (project.env or {}).get("SPRINTCTL_BACKEND") in {"remote", "served"} if project else False
 
 
 @dataclass(frozen=True)
@@ -111,6 +124,7 @@ class ActionConfig:
     harness: str | None = None
     model: str | None = None
     prompt: str | None = None
+    scope_iterate: ScopeIteratePolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -498,6 +512,10 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             harness=(str(value["harness"]) if "harness" in value else None),
             model=(str(value["model"]) if "model" in value else None),
             prompt=(str(value["prompt"]) if "prompt" in value else None),
+            scope_iterate=(
+                load_policy(value["scope_iterate"], config_dir=path.parent.resolve())
+                if "scope_iterate" in value else None
+            ),
         )
         for name, value in raw.get("actions", {}).items()
     }
@@ -663,7 +681,7 @@ class Daemon:
             return
         project = self.projects.get(str(action.get("project") or ""))
         routing: RoutingResult | None = None
-        if action_config.runner == "harness":
+        if action_config.runner in {"harness", "scope-iterate"}:
             try:
                 routing = resolve_routing(
                     RoutingRequest(
@@ -678,9 +696,18 @@ class Daemon:
                     self.config.routing,
                 )
                 if project is None:
-                    raise RoutingError("runner 'harness' requires a configured project worktree")
-                if not (action.get("prompt") or action_config.prompt):
+                    raise RoutingError(f"runner {action_config.runner!r} requires a configured project worktree")
+                if action_config.runner == "harness" and not (action.get("prompt") or action_config.prompt):
                     raise RoutingError("runner 'harness' requires an explicit or action-class prompt")
+                if action_config.runner == "scope-iterate":
+                    if action_config.scope_iterate is None:
+                        raise RoutingError("runner 'scope-iterate' requires an explicit scope_iterate policy")
+                    if not self.config.context.enabled or not self.config.context.auto_claim:
+                        raise RoutingError(
+                            "runner 'scope-iterate' requires context.enabled and context.auto_claim"
+                        )
+                    if action.get("target_ref") is None:
+                        raise RoutingError("runner 'scope-iterate' requires an exact target_ref")
             except RoutingError as exc:
                 self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor, claim_receipt=claim_receipt)
                 return
@@ -712,7 +739,33 @@ class Daemon:
         # ``_context_claim_acquire``): a failure here must stop the action
         # before any child process starts.
         context_result = self._context_candidates_request(project, action)
-        claim_result = self._context_claim_acquire(project, context_result, session_id, ttl_seconds)
+        prepared_scope: PreparedScopeIterate | None = None
+        scope_result: VerificationResult | None = None
+        if action_config.runner == "scope-iterate":
+            assert project is not None and action_config.scope_iterate is not None
+            try:
+                target_item = self._exact_target_item(action, context_result)
+                prepared_scope = ScopeIterateKernel().prepare(
+                    ScopeIterateRequest(
+                        action_id=action_id,
+                        project=str(action["project"]),
+                        repository=project.path,
+                        action=action,
+                        sprint_item=target_item,
+                    ),
+                    action_config.scope_iterate,
+                )
+            except Exception as exc:
+                self.client.fail(
+                    action_id, reason=f"scope-iterate preparation failed: {exc}",
+                    actor=self.actor, claim_receipt=claim_receipt,
+                )
+                return
+        claim_result = self._context_claim_acquire(
+            project, context_result, session_id, ttl_seconds,
+            branch=prepared_scope.branch if prepared_scope else None,
+            exact_target=(action_config.runner == "scope-iterate"),
+        )
         self.client.emit("session.dispatch", action_id=action_id, actor=self.actor,
                          payload={**payload, "audit_dispatch": audit_dispatch,
                                  "context": context_result, "context_claim": claim_result})
@@ -728,10 +781,20 @@ class Daemon:
         # repo at its configured path (or none configured at all) simply
         # means recovery will later have no git evidence to collect.
         worktree, base_commit = None, None
-        if project is not None:
+        evidence_project = (
+            ProjectConfig(
+                prepared_scope.worktree,
+                sprint_id=project.sprint_id,
+                env=project.env,
+                default_harness=project.default_harness,
+                default_model=project.default_model,
+            )
+            if prepared_scope is not None and project is not None else project
+        )
+        if evidence_project is not None:
             try:
-                base_commit, _branch = git_state_at_start(project.path)
-                worktree = str(project.path)
+                base_commit, _branch = git_state_at_start(evidence_project.path)
+                worktree = str(evidence_project.path)
             except Exception:
                 worktree, base_commit = None, None
         record = SessionRecord(
@@ -761,15 +824,18 @@ class Daemon:
         )
         output_path = (
             self._output_path(session_id)
-            if action_config.runner in {"command", "harness"}
+            if action_config.runner in {"command", "harness", "scope-iterate"}
             else None
         )
         try:
             self._child = self._start_child(
                 action_config,
-                project=project,
+                project=evidence_project,
                 routing=routing,
-                prompt=(str(action["prompt"]) if action.get("prompt") else action_config.prompt),
+                prompt=(
+                    prepared_scope.prompt if prepared_scope is not None
+                    else (str(action["prompt"]) if action.get("prompt") else action_config.prompt)
+                ),
                 output_path=output_path,
             )
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
@@ -808,6 +874,12 @@ class Daemon:
                     payload=payload, record=record, exit_code=exit_code, output_path=output_path,
                     routing=routing,
                 )
+            if outcome == "completed" and prepared_scope is not None:
+                try:
+                    scope_result = ScopeIterateKernel().verify(prepared_scope)
+                except Exception as exc:
+                    outcome = "failed"
+                    usage_limit_reason = f"scope-iterate verification failed: {exc}"
             released = self._takeup_release(project, session_id, f"session-{outcome}")
             audit_exit = self._publish_audit(
                 project, event_type="session.exit", actor=audit_actor,
@@ -853,7 +925,15 @@ class Daemon:
             elif settlement_error is not None:
                 self.client.fail(action_id, reason=settlement_error, actor=self.actor, claim_receipt=claim_receipt)
             elif outcome == "completed":
-                self.client.complete(action_id, result_ref=f"session={session_id}", actor=self.actor, claim_receipt=claim_receipt)
+                self.client.complete(
+                    action_id,
+                    result_ref=(
+                        scope_result.result_ref if scope_result is not None
+                        else f"session={session_id}"
+                    ),
+                    actor=self.actor,
+                    claim_receipt=claim_receipt,
+                )
             else:
                 self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.actor, claim_receipt=claim_receipt)
         except Exception as exc:
@@ -896,7 +976,7 @@ class Daemon:
             return None
         if project is None or project.sprint_id is None:
             return {"attempted": False, "status": "skipped"}
-        if self.config.context.remote_only and (project.env or {}).get("SPRINTCTL_BACKEND") != "remote":
+        if self.config.context.remote_only and not _is_shared_sprint_backend(project):
             return {"attempted": False, "status": "skipped", "reason": "local-mode"}
         target_ref = action.get("target_ref")
         item_id: int | None = None
@@ -917,6 +997,9 @@ class Daemon:
         context_result: dict[str, Any] | None,
         session_id: str,
         ttl_seconds: int,
+        *,
+        branch: str | None = None,
+        exact_target: bool = False,
     ) -> dict[str, Any] | None:
         """Pre-start claim acquisition for an explicit, eligible target only.
 
@@ -944,11 +1027,16 @@ class Daemon:
         if not eligible:
             return None
         item_id = explicit_target["item_id"]
+        if exact_target and not branch:
+            return {
+                "attempted": False, "status": "failed", "item_id": item_id,
+                "error": "scope-iterate exact target claim requires its prepared branch",
+            }
         actor = f"actionq:{session_id}"
         try:
             assert project is not None
             claim = self.claim_client.start(project, item_id=item_id, actor=actor,
-                                             ttl_seconds=ttl_seconds, branch=None)
+                                             ttl_seconds=ttl_seconds, branch=branch)
             claim_id = claim.get("claim_id")
             if claim_id is None and isinstance(claim.get("claim"), dict):
                 claim_id = claim["claim"].get("claim_id")
@@ -965,10 +1053,37 @@ class Daemon:
         except Exception as exc:
             return {"attempted": True, "status": "failed", "item_id": item_id, "error": str(exc)}
 
+    @staticmethod
+    def _exact_target_item(
+        action: dict[str, Any], context_result: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        try:
+            requested = int(action["target_ref"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("target_ref must be one numeric Sprintctl item id") from exc
+        if context_result is None or context_result.get("status") != "ok":
+            raise RuntimeError("exact target context lookup did not succeed")
+        packet = context_result.get("packet") or {}
+        explicit = packet.get("explicit_target") or {}
+        if not explicit.get("found") or int(explicit.get("item_id", -1)) != requested:
+            raise RuntimeError(f"exact target item {requested} was not found in the configured sprint")
+        eligible = next(
+            (
+                candidate for candidate in packet.get("candidates") or []
+                if int(candidate.get("item_id", -1)) == requested
+                and candidate.get("rank") == 1
+                and candidate.get("claim_eligible") is True
+            ),
+            None,
+        )
+        if eligible is None:
+            raise RuntimeError(f"exact target item {requested} is not claim eligible")
+        return explicit.get("item") or eligible.get("item") or explicit
+
     def _takeup_take(self, project: ProjectConfig | None, session_id: str, pid: int) -> dict[str, Any]:
         if not self.config.takeup.enabled or project is None or project.sprint_id is None:
             return {"attempted": False, "status": "skipped"}
-        if self.config.takeup.remote_only and (project.env or {}).get("SPRINTCTL_BACKEND") != "remote":
+        if self.config.takeup.remote_only and not _is_shared_sprint_backend(project):
             return {"attempted": False, "status": "skipped", "reason": "local-mode"}
         actor = f"actionq:{session_id}"
         result = self.takeup_client.take(project, session_id=session_id, actor=actor, pid=pid)
@@ -977,7 +1092,7 @@ class Daemon:
     def _takeup_release(self, project: ProjectConfig | None, session_id: str, reason: str) -> dict[str, Any]:
         if not self.config.takeup.enabled or project is None or project.sprint_id is None:
             return {"attempted": False, "status": "skipped"}
-        if self.config.takeup.remote_only and (project.env or {}).get("SPRINTCTL_BACKEND") != "remote":
+        if self.config.takeup.remote_only and not _is_shared_sprint_backend(project):
             return {"attempted": False, "status": "skipped", "reason": "local-mode"}
         actor = f"actionq:{session_id}"
         try:
@@ -1060,9 +1175,9 @@ class Daemon:
             finally:
                 if handle is not None:
                     handle.close()
-        if action.runner == "harness":
+        if action.runner in {"harness", "scope-iterate"}:
             if project is None or routing is None or prompt is None:
-                raise RuntimeError("runner 'harness' requires project, routing, and prompt")
+                raise RuntimeError(f"runner {action.runner!r} requires project, routing, and prompt")
             harness_route = (self.config.routing.harnesses or {}).get(routing.harness)
             adapter = get_adapter(
                 routing.harness,

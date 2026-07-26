@@ -20,8 +20,10 @@ actionctl_bin = "actionctl"
 # limit = 5
 # auto_claim = true
 
-# The daemon minimum executes only the fake runner. Harness routing and the
-# compatibility dispatcher's worktree/gate pipeline land in later #969 slices.
+# Disposable smoke only. Production scope-iterate configuration must select
+# runner = "scope-iterate", enable exact-target context claims, configure a
+# harness/model route, and supply every explicit policy key documented by
+# actionq.scope_iterate.load_policy.
 [actions.scope-iterate]
 runner = "fake"
 fake_duration_seconds = 1

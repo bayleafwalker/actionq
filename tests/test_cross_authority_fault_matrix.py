@@ -7,11 +7,14 @@ import stat
 import sys
 import threading
 import uuid
+import subprocess
 
 import pytest
 
 from actionq import db
 from actionq.daemon import ActionConfig, ActionctlClient, ContextConfig, Daemon, DaemonConfig, ProjectConfig, SprintctlClaimClient
+from actionq.routing import HarnessRoute, RoutingContext
+from actionq.scope_iterate import PathACL, ScopeIteratePolicy, ToolACL
 
 
 SPRINTCTL_ROOT = Path(os.environ.get("SPRINTCTL_TEST_SOURCE", Path(__file__).resolve().parents[2] / "sprintctl"))
@@ -258,6 +261,90 @@ def test_shutdown_stops_child_releases_sprint_claim_and_fences_old_receipt(monke
                 actor=daemon.actor, claim_receipt=daemon.client.claim_receipt,
                 result_ref="stale-after-shutdown",
             )
+    sys.path.insert(0, str(SPRINTCTL_ROOT))
+    from sprintctl import db as sprint_db
+    conn = sprint_db.get_connection(sprint_path)
+    try:
+        assert sprint_db.list_claims(conn, item_id, active_only=True) == []
+    finally:
+        conn.close()
+
+
+def test_scope_kernel_verification_failure_releases_sprint_claim_before_fenced_failure(
+    monkeypatch, tmp_path: Path,
+):
+    """A zero-exit worker cannot settle success without a verified commit."""
+    schema = "aqcross_" + uuid.uuid4().hex
+    monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
+    with db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"]) as conn:
+        db.migrate(conn, schema)
+    monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+    sprint_path, item_id = _sprint_db(tmp_path)
+    with db.connect() as conn:
+        action = db.enqueue(
+            conn, schema, action_type="scope-iterate", project="demo",
+            target_ref=str(item_id), source_refs=[], priority=100,
+            parent_id=None, created_by="test:scope-fault",
+        )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(("git", "init"), cwd=repo, check=True, capture_output=True)
+    subprocess.run(("git", "config", "user.name", "Test"), cwd=repo, check=True)
+    subprocess.run(("git", "config", "user.email", "test@example.invalid"), cwd=repo, check=True)
+    (repo / "README.md").write_text("# demo\n")
+    subprocess.run(("git", "add", "README.md"), cwd=repo, check=True)
+    subprocess.run(("git", "commit", "-m", "initial"), cwd=repo, check=True, capture_output=True)
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text(
+        "{action_json}\n{sprint_item_json}\n{working_dir}\n{branch_name}\n"
+        "{allowed_scope}\n{test_command}\n"
+    )
+    policy = ScopeIteratePolicy(
+        worktree_root=(tmp_path / "worktrees").resolve(),
+        prompt_template=prompt.resolve(),
+        path_acl=PathACL(
+            ("docs/**",),
+            (".git/**", ".sprintctl/**", "secrets/**", "**/.env", "**/.env.*"),
+        ),
+        tool_acl=ToolACL(),
+        test_command=("python3", "-c", "pass"),
+    )
+    actionctl = str(Path(sys.executable).with_name("actionctl"))
+    sprintctl = _wrapper(tmp_path)
+    daemon = Daemon(
+        DaemonConfig(
+            heartbeat_interval_seconds=0.01,
+            session_state_path=tmp_path / "state.json",
+            pause_file=tmp_path / "PAUSED",
+            actionctl_bin=actionctl,
+            context=ContextConfig(
+                enabled=True, remote_only=False, sprintctl_bin=str(sprintctl),
+            ),
+            routing=RoutingContext(harnesses={"codex": HarnessRoute("codex")}),
+        ),
+        {"scope-iterate": ActionConfig(
+            runner="scope-iterate", harness="codex", model="test-model",
+            scope_iterate=policy,
+        )},
+        ActionctlClient(actionctl),
+        {"demo": ProjectConfig(
+            repo, sprint_id=1,
+            env={"SPRINTCTL_DB": str(sprint_path), "SPRINTCTL_BACKEND": "local"},
+        )},
+        claim_client=SprintctlClaimClient(str(sprintctl)),
+    )
+
+    daemon._start_child = lambda *_args, **_kwargs: subprocess.Popen(
+        [sys.executable, "-c", "pass"], text=True, start_new_session=True,
+    )
+    assert daemon.run_once() is True
+
+    with db.connect() as conn:
+        stored = db.get_action(conn, schema, action["id"])
+        events = [_text(event["event_type"]) for event in db.action_events(conn, schema, action["id"])]
+    assert _text(stored["status"]) == "failed"
+    assert "branch-ahead-of-base" in stored["failure_reason"]
+    assert events.index("settlement.sprint_claim_released") < events.index("action_failed")
     sys.path.insert(0, str(SPRINTCTL_ROOT))
     from sprintctl import db as sprint_db
     conn = sprint_db.get_connection(sprint_path)

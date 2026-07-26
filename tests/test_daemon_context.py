@@ -12,8 +12,13 @@ advisory/inferred candidate -- with that attempt failing closed. See
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
-from actionq.daemon import ActionConfig, ContextConfig, Daemon, DaemonConfig, ProjectConfig, load_config
+from actionq.daemon import (
+    ActionConfig, ContextConfig, Daemon, DaemonConfig, ProjectConfig, load_config,
+)
+from actionq.routing import HarnessRoute, RoutingContext
+from actionq.scope_iterate import PathACL, ScopeIteratePolicy, ToolACL
 
 from tests.test_daemon import FakeClient
 
@@ -113,6 +118,136 @@ def test_context_enabled_skips_for_local_project(tmp_path: Path):
     assert context.calls == []
     assert claim.calls == []
     assert client.events[0][3]["context"] == {"attempted": False, "status": "skipped", "reason": "local-mode"}
+
+
+def test_context_remote_only_accepts_served_backend(tmp_path: Path):
+    client = FakeClient({"id": 141, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
+    context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=False))
+    daemon = Daemon(
+        DaemonConfig(
+            session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
+            context=ContextConfig(enabled=True),
+        ),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=0.01)}, client,
+        {"demo": ProjectConfig(tmp_path, sprint_id=7, env={"SPRINTCTL_BACKEND": "served"})},
+        context_client=context,
+    )
+
+    assert daemon.run_once() is True
+    assert [call[1] for call in context.calls] == [5]
+    assert client.completed
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ("git", *args), cwd=repo, check=True, text=True, capture_output=True
+    ).stdout.strip()
+
+
+def _scope_policy(tmp_path: Path) -> ScopeIteratePolicy:
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("{action_json}\n{sprint_item_json}\n{working_dir}\n{branch_name}\n"
+                      "{allowed_scope}\n{test_command}\n")
+    return ScopeIteratePolicy(
+        worktree_root=(tmp_path / "worktrees").resolve(),
+        prompt_template=prompt.resolve(),
+        path_acl=PathACL(
+            ("docs/**",),
+            (".git/**", ".sprintctl/**", "secrets/**", "**/.env", "**/.env.*"),
+        ),
+        tool_acl=ToolACL(),
+        test_command=("python3", "-c", "pass"),
+    )
+
+
+def test_scope_iterate_claims_exact_target_branch_and_settles_verified_commit(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    (repo / "README.md").write_text("# demo\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "initial")
+    client = FakeClient({
+        "id": 142, "action_type": "scope-iterate", "project": "demo",
+        "target_ref": "5", "harness": "codex", "model": "test-model",
+    })
+    context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
+    claim = FakeClaim()
+    daemon = Daemon(
+        DaemonConfig(
+            heartbeat_interval_seconds=0.01,
+            session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
+            context=ContextConfig(enabled=True),
+            routing=RoutingContext(harnesses={"codex": HarnessRoute("codex")}),
+        ),
+        {"scope-iterate": ActionConfig(
+            runner="scope-iterate", harness="codex", model="test-model",
+            scope_iterate=_scope_policy(tmp_path),
+        )},
+        client,
+        {"demo": ProjectConfig(
+            repo, sprint_id=7, env={"SPRINTCTL_BACKEND": "served"},
+        )},
+        context_client=context, claim_client=claim,
+    )
+
+    def start_child(_action, *, project, **_kwargs):
+        script = (
+            "from pathlib import Path; import subprocess; "
+            "p=Path('docs/unit-b.md'); p.parent.mkdir(parents=True, exist_ok=True); "
+            "p.write_text('verified\\n'); "
+            "subprocess.run(['git','add','--','docs/unit-b.md'],check=True); "
+            "subprocess.run(['git','-c','user.name=Worker','-c',"
+            "'user.email=worker@example.invalid','commit','-m','unit b'],check=True)"
+        )
+        return subprocess.Popen(
+            ["python3", "-c", script], cwd=project.path, text=True,
+            start_new_session=True,
+        )
+
+    daemon._start_child = start_child
+    assert daemon.run_once() is True
+
+    assert claim.calls[0][1] == 5
+    assert claim.calls[0][4] == "agent/scope-iterate/142"
+    assert len(claim.release_calls) == 1
+    assert client.completed
+    assert "branch=agent/scope-iterate/142" in client.completed[0][1]
+    event_types = [event[0] for event in client.events]
+    assert event_types.index("settlement.sprint_claim_released") < len(event_types)
+
+
+def test_scope_iterate_rejects_context_target_mismatch_before_claim(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    client = FakeClient({
+        "id": 143, "action_type": "scope-iterate", "project": "demo",
+        "target_ref": "5", "harness": "codex", "model": "test-model",
+    })
+    context = FakeContext(_packet(explicit_item_id=6, found=True, eligible_rank1=True))
+    claim = FakeClaim()
+    daemon = Daemon(
+        DaemonConfig(
+            session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
+            context=ContextConfig(enabled=True),
+            routing=RoutingContext(harnesses={"codex": HarnessRoute("codex")}),
+        ),
+        {"scope-iterate": ActionConfig(
+            runner="scope-iterate", harness="codex", model="test-model",
+            scope_iterate=_scope_policy(tmp_path),
+        )},
+        client,
+        {"demo": ProjectConfig(repo, sprint_id=7, env={"SPRINTCTL_BACKEND": "served"})},
+        context_client=context, claim_client=claim,
+    )
+
+    assert daemon.run_once() is True
+    assert claim.calls == []
+    assert client.completed == []
+    assert "exact target item 5 was not found" in client.failed[0][1]
 
 
 def test_non_explicit_candidates_are_advisory_only_no_claim(tmp_path: Path):
