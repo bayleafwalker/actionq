@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "repo_id": "actionq",
+  "authority_repo_uuid": "7155f083-7902-4522-88fa-ac0a3703ece3",
   "adoption_level": "guidance-only",
   "routing": {
     "default_harness": "codex",
