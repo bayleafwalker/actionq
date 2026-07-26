@@ -175,6 +175,23 @@ class ClaimClient(Protocol):
         self, project: ProjectConfig, *, item_id: int, actor: str, ttl_seconds: int, branch: str | None
     ) -> dict[str, Any]: ...
 
+    def renew(
+        self, project: ProjectConfig, *, claim_id: int, claim_token: str,
+        actor: str, ttl_seconds: int, runtime_session_id: str,
+    ) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class SprintClaimLease:
+    """In-memory-only authority proof for the current supervised session."""
+
+    project: ProjectConfig
+    claim_id: int
+    claim_token: str
+    actor: str
+    ttl_seconds: int
+    runtime_session_id: str
+
 
 class AuditClient(Protocol):
     def publish(
@@ -297,6 +314,24 @@ class SprintctlClaimClient:
                                    check=False, timeout=30)
         if completed.returncode:
             detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim start failed"
+            raise RuntimeError(detail)
+        return json.loads(completed.stdout)
+
+    def renew(
+        self, project: ProjectConfig, *, claim_id: int, claim_token: str,
+        actor: str, ttl_seconds: int, runtime_session_id: str,
+    ) -> dict[str, Any]:
+        args = [
+            self.executable, "claim", "heartbeat", "--id", str(claim_id),
+            "--claim-token", claim_token, "--actor", actor, "--ttl", str(ttl_seconds),
+            "--runtime-session-id", runtime_session_id, "--json",
+        ]
+        environment = os.environ.copy()
+        environment.update(project.env or {})
+        completed = subprocess.run(args, cwd=project.path, env=environment, text=True,
+                                   capture_output=True, check=False, timeout=30)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim heartbeat failed"
             raise RuntimeError(detail)
         return json.loads(completed.stdout)
 
@@ -480,6 +515,7 @@ class Daemon:
         self.audit_client = audit_client or AuditctlClient(config.audit.auditctl_bin)
         self.context_client = context_client or SprintctlContextClient(config.context.sprintctl_bin)
         self.claim_client = claim_client or SprintctlClaimClient(config.context.sprintctl_bin)
+        self._sprint_claim_leases: dict[str, SprintClaimLease] = {}
         self.daemon_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
         self.actor = f"actionq-daemon:{self.daemon_id}"
         self._shutdown = False
@@ -740,7 +776,11 @@ class Daemon:
             self.client.emit("session.started", action_id=action_id, actor=self.actor,
                              payload={**payload, "pid": record.pid, "started_at": record.started_at,
                                      "sprint_takeup": takeup, "audit_start": audit_start})
-            outcome, exit_code = self._wait_for_child(action_id, payload, record, claim_receipt, project, audit_actor, audit_refs)
+            sprint_claim_lease = self._sprint_claim_leases.get(session_id)
+            outcome, exit_code = self._wait_for_child(
+                action_id, payload, record, claim_receipt, sprint_claim_lease,
+                project, audit_actor, audit_refs,
+            )
             usage_limit_reason: str | None = None
             if outcome == "failed":
                 usage_limit_reason = self._detect_and_handle_usage_limit(
@@ -766,6 +806,7 @@ class Daemon:
             self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.actor, claim_receipt=claim_receipt)
             raise
         finally:
+            self._sprint_claim_leases.pop(session_id, None)
             self._child = None
             self._write_state(None)
 
@@ -842,6 +883,15 @@ class Daemon:
             claim_id = claim.get("claim_id")
             if claim_id is None and isinstance(claim.get("claim"), dict):
                 claim_id = claim["claim"].get("claim_id")
+            claim_token = claim.get("claim_token")
+            if claim_token is None and isinstance(claim.get("claim"), dict):
+                claim_token = claim["claim"].get("claim_token")
+            if claim_id is None or not claim_token:
+                raise RuntimeError("sprintctl claim start did not return claim id and opaque token")
+            self._sprint_claim_leases[session_id] = SprintClaimLease(
+                project=project, claim_id=int(claim_id), claim_token=str(claim_token),
+                actor=actor, ttl_seconds=ttl_seconds, runtime_session_id=session_id,
+            )
             return {"attempted": True, "status": "ok", "item_id": item_id, "claim_id": claim_id}
         except Exception as exc:
             return {"attempted": True, "status": "failed", "item_id": item_id, "error": str(exc)}
@@ -1111,6 +1161,7 @@ class Daemon:
         payload: dict[str, Any],
         record: SessionRecord,
         claim_receipt: str,
+        sprint_claim_lease: SprintClaimLease | None,
         project: ProjectConfig | None = None,
         audit_actor: str | None = None,
         audit_refs: Sequence[str] = (),
@@ -1137,13 +1188,22 @@ class Daemon:
                     self.client.renew(action_id, worker=self.actor,
                                       timeout_minutes=self.config.default_timeout_minutes,
                                       claim_receipt=claim_receipt)
+                    if sprint_claim_lease is not None:
+                        self.claim_client.renew(
+                            sprint_claim_lease.project,
+                            claim_id=sprint_claim_lease.claim_id,
+                            claim_token=sprint_claim_lease.claim_token,
+                            actor=sprint_claim_lease.actor,
+                            ttl_seconds=sprint_claim_lease.ttl_seconds,
+                            runtime_session_id=sprint_claim_lease.runtime_session_id,
+                        )
                 except Exception as exc:
                     # Renewal is authority, unlike a session heartbeat.  Once
                     # it fails, this worker must not keep executing or settle.
                     os.killpg(self._child.pid, signal.SIGTERM)
                     self._child.wait()
                     self.client.emit("session.paused", action_id=action_id, actor=self.actor,
-                                     payload={**payload, "pid": record.pid, "reason": "actionq-claim-lost", "detail": str(exc)})
+                        payload={**payload, "pid": record.pid, "reason": "claim-authority-lost", "detail": str(exc)})
                     return "claim-lost", int(self._child.returncode or 1)
                 record.updated_at = _now()
                 self._write_state(record)

@@ -35,13 +35,21 @@ class FakeClaim:
     def __init__(self, fail: bool = False, response=None):
         self.calls = []
         self.fail = fail
-        self.response = response if response is not None else {"claim_id": 900}
+        self.response = response if response is not None else {"claim_id": 900, "claim_token": "test-sprint-proof"}
+        self.renew_calls = []
+        self.renew_error = None
 
     def start(self, project, *, item_id, actor, ttl_seconds, branch):
         self.calls.append((project, item_id, actor, ttl_seconds, branch))
         if self.fail:
             raise RuntimeError("sprintctl claim start: item already active")
         return self.response
+
+    def renew(self, project, *, claim_id, claim_token, actor, ttl_seconds, runtime_session_id):
+        self.renew_calls.append((project, claim_id, claim_token, actor, ttl_seconds, runtime_session_id))
+        if self.renew_error is not None:
+            raise self.renew_error
+        return {"claim_id": claim_id, "status": "active"}
 
 
 def _remote_project(tmp_path: Path, sprint_id: int = 7) -> ProjectConfig:
@@ -130,7 +138,7 @@ def test_explicit_eligible_target_acquires_pre_start_claim(tmp_path: Path):
     client = FakeClient({"id": 43, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
     packet = _packet(explicit_item_id=5, found=True, eligible_rank1=True)
     context = FakeContext(packet)
-    claim = FakeClaim(response={"claim_id": 901})
+    claim = FakeClaim(response={"claim_id": 901, "claim_token": "test-sprint-proof"})
     daemon = Daemon(
         DaemonConfig(
             session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
@@ -180,6 +188,62 @@ def test_claim_acquisition_failure_fails_closed_before_child_starts(tmp_path: Pa
     # "started then cleared" cycle to observe here, unlike the takeup
     # pre-start failure path which starts the child before failing.
     assert not daemon.config.session_state_path.exists()
+
+
+def test_claim_without_opaque_proof_fails_closed_before_child_starts(tmp_path: Path):
+    client = FakeClient({"id": 47, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
+    context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
+    claim = FakeClaim(response={"claim_id": 902})
+    daemon = Daemon(
+        DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED", context=ContextConfig(enabled=True)),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=0.01)}, client,
+        {"demo": _remote_project(tmp_path)}, context_client=context, claim_client=claim,
+    )
+
+    assert daemon.run_once() is True
+    assert "session.started" not in [event[0] for event in client.events]
+    assert client.failed and "opaque token" in client.failed[0][1]
+
+
+def test_supervision_renews_sprint_claim_without_emitting_its_proof(tmp_path: Path):
+    client = FakeClient({"id": 48, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
+    context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
+    claim = FakeClaim()
+    daemon = Daemon(
+        DaemonConfig(
+            heartbeat_interval_seconds=0.01, session_state_path=tmp_path / "state.json",
+            pause_file=tmp_path / "PAUSED", context=ContextConfig(enabled=True),
+        ),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=0.12)}, client,
+        {"demo": _remote_project(tmp_path)}, context_client=context, claim_client=claim,
+    )
+
+    assert daemon.run_once() is True
+    assert claim.renew_calls
+    rendered_events = repr(client.events)
+    assert "test-sprint-proof" not in rendered_events
+
+
+def test_sprint_claim_renewal_loss_stops_child_and_prevents_completion(tmp_path: Path):
+    client = FakeClient({"id": 49, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
+    context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
+    claim = FakeClaim()
+    claim.renew_error = RuntimeError("sprintctl claim proof rejected")
+    daemon = Daemon(
+        DaemonConfig(
+            heartbeat_interval_seconds=0.01, session_state_path=tmp_path / "state.json",
+            pause_file=tmp_path / "PAUSED", context=ContextConfig(enabled=True),
+        ),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=5)}, client,
+        {"demo": _remote_project(tmp_path)}, context_client=context, claim_client=claim,
+    )
+
+    assert daemon.run_once() is True
+    assert claim.renew_calls
+    assert not client.completed
+    assert client.failed and "claim-lost" in client.failed[0][1]
+    pauses = [event for event in client.events if event[0] == "session.paused"]
+    assert pauses and pauses[-1][3]["reason"] == "claim-authority-lost"
 
 
 def test_context_fetch_failure_is_advisory_and_session_still_starts(tmp_path: Path):
