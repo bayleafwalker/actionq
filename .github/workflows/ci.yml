@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Put PostgreSQL tools on PATH
+        run: echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
+      - run: uv sync --all-extras
+      - name: Run full suite with disposable PostgreSQL gate
+        run: uv run pytest -q
