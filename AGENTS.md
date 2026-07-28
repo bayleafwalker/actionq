@@ -61,6 +61,18 @@ The governing protocol description is `docs/protocols/action-lifecycle.md`. Reus
 - Do not expose database URLs, credentials, session secrets, runtime tokens, or
   queue payload secrets in fixtures, packets, logs, events, or documentation.
 
+## Hybrid dispatch
+
+Only `mechanical_bulk` packets are worker-eligible: low-risk implementation
+against frozen interfaces, a coordinator-owned oracle the worker cannot
+modify, and explicit registered gates that fail for each relevant incorrect
+behaviour. The entire `actionq/` authority package remains protected.
+
+Test-oracle and parity-fixture construction, tests as the primary deliverable,
+cross-layer behavioural proof, lifecycle/claim/settlement semantics, and any
+worker or dispatcher authority change are coordinator-only. One rejected
+attempt returns to the coordinator.
+
 ## Verification
 
 ```bash

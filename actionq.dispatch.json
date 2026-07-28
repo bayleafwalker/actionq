@@ -24,7 +24,10 @@
       "verify-state-protocols",
       "reconcile-project-contracts"
     ],
-    "overlays": [".agents/overlays/actionq.state-protocols.md"]
+    "overlays": [
+      ".agents/overlays/actionq.state-protocols.md",
+      ".agents/overlays/actionq.hybrid-worker.md"
+    ]
   },
   "scope": {
     "allowed_path_roots": [
@@ -48,6 +51,47 @@
       "required_on_change": true
     }
   ],
+  "hybrid": {
+    "enabled": true,
+    "worker_routes": ["mechanical_bulk"],
+    "commands": {
+      "actionq.unit.tests": "uv run --extra dev pytest tests/test_unit.py tests/test_schema.py tests/test_routing.py tests/test_harnesses.py tests/test_usage_limit.py tests/test_git_evidence.py tests/test_session_wrapper.py tests/test_verification_contracts.py -q",
+      "actionq.kernel.tests": "uv run --extra dev pytest tests/test_scope_iterate_kernel.py -q",
+      "actionq.daemon.tests": "uv run --extra dev pytest tests/test_daemon.py tests/test_daemon_routing.py tests/test_daemon_audit.py tests/test_daemon_context.py tests/test_daemon_crash_evidence.py tests/test_daemon_usage_limit.py -q"
+    },
+    "protected_paths": [
+      "actionq/**",
+      "actionq.dispatch.json",
+      ".agents/**",
+      ".claude/**",
+      ".github/**",
+      "AGENTS.md",
+      "Dockerfile",
+      ".dockerignore",
+      "ops/**",
+      "examples/**",
+      "pyproject.toml",
+      "uv.lock",
+      "tests/test_claim_authority.py",
+      "tests/test_cross_authority_fault_matrix.py",
+      "tests/test_integration_postgres.py",
+      "tests/test_scope_iterate_kernel.py",
+      "tests/conftest.py"
+    ],
+    "worktree_root": "/tmp/actionq-hybrid/worktrees",
+    "max_timeout_seconds": 1800,
+    "max_cost_usd": 3.0,
+    "soft_token_ceiling": 500000,
+    "hard_token_ceiling": 1000000,
+    "notes": [
+      "Only low-risk mechanical implementation with frozen interfaces, an externally defined worker-immutable oracle, and coordinator-authored discriminating gates is worker-eligible. Tests or verification intent that define the oracle remain coordinator-only even when their diff is small.",
+      "The whole actionq/ package is protected because every module in it carries authority a worker must not be able to widen: scope_iterate.py is the path/tool ACL and the diff-scope invariant for actionq's own worker path; harnesses/ builds worker argv and composes worker environment (build_env); daemon.py owns claim receipts, sprintctl claim coordination, child-process launch and settlement; routing.py chooses harness/provider/model; usage_limit.py is the spend control; db.py and migrations/ own claim atomicity and the append-only event ledger; cli.py and server.py are the public write contracts.",
+      "Worker-eligible surface in this repository is therefore tests/ (excluding the authority tests listed above), docs/, verification/contexts/, and README.md. A packet that needs to change actionq/ is a coordinator packet by definition.",
+      "Registered commands are the non-PostgreSQL subsets only. 'uv run --extra dev pytest tests' exits 4 in a fresh clone on a host without initdb/pg_ctl, because tests/conftest.py starts a hermetic PostgreSQL whenever the whole tests directory (or an integration/claim_authority/cross_authority path) is selected. A gate that cannot pass cold is not a gate, so no full-suite or integration command is registered; PostgreSQL verification stays with the coordinator.",
+      "Registered commands assume a warm uv cache under the worker identity: the worker's network policy is 'disabled', so a cold uv resolve would fail. Prime the cache as the worker uid before the first dispatch.",
+      "actionq's own scope-iterate runner is a separate worker path from agentops hybrid dispatch. Its ToolACL bash allowlist (git add/git commit) exists because ScopeIterateKernel.verify requires a committed diff. agentops hybrid dispatch denies the worker git entirely and adjudicates scope on the workspace diff instead. The two must never be composed: no agentops hybrid packet may register a command that invokes actionq-daemon, actionctl, or dispatcher-once."
+    ]
+  },
   "verification": {
     "command_families": ["unit", "integration", "docs", "full-suite"],
     "targeted_first": true,
