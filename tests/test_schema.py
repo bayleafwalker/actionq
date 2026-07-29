@@ -56,6 +56,7 @@ class FakeSchemaConnection:
         index_overrides: dict[str, dict] | None = None,
         dispatch_relation: bool = True,
         dispatch_binding_constraints: bool = True,
+        dispatch_check_overrides: dict[str, str] | None = None,
     ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
@@ -80,6 +81,7 @@ class FakeSchemaConnection:
         self.index_overrides = index_overrides or {}
         self.dispatch_relation = dispatch_relation
         self.dispatch_binding_constraints = dispatch_binding_constraints
+        self.dispatch_check_overrides = dispatch_check_overrides or {}
         self.executed: list[tuple[str, object]] = []
         self.closed = False
         self.rollbacks = 0
@@ -278,9 +280,9 @@ class FakeSchemaConnection:
                             dispatch_constraint("u", ["request_ref"]),
                             dispatch_constraint("u", ["identity", "environment", "operation", "idempotency_key"]),
                         ] if self.dispatch_binding_constraints else []),
-                        dispatch_constraint("c", ["schema_version"], expression="schema_version = 'v2'::text"),
-                        dispatch_constraint("c", ["request_sha256"], expression="request_sha256 ~ '^[a-f0-9]{64}$'::text"),
-                        dispatch_constraint("c", ["operation"], expression="operation = 'execution.dispatch.enqueue'::text"),
+                        dispatch_constraint("c", ["schema_version"], expression=self.dispatch_check_overrides.get("schema_version", "schema_version = 'v2'::text")),
+                        dispatch_constraint("c", ["request_sha256"], expression=self.dispatch_check_overrides.get("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text")),
+                        dispatch_constraint("c", ["operation"], expression=self.dispatch_check_overrides.get("operation", "operation = 'execution.dispatch.enqueue'::text")),
                     ])
             return _Rows(rows)
         if normalized.startswith("SELECT relation.relname AS table_name") and "pg_index" in normalized:
@@ -398,6 +400,27 @@ def test_v3_dispatch_binding_constraint_corruption_fails_runtime_compatibility()
 
     assert result.compatible is False
     assert "constraint-missing-or-invalid:dispatch-requests-request-ref-unique" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("column", "expression"),
+    [
+        ("schema_version", "schema_version = 'v2'::text OR true"),
+        ("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text OR true"),
+        ("operation", "operation = 'execution.dispatch.enqueue'::text OR true"),
+    ],
+)
+def test_v3_permissive_dispatch_check_variants_fail_runtime_compatibility(column, expression):
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_check_overrides={column: expression},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert f"constraint-missing-or-invalid:dispatch_requests.{column}" in result.detail
     assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
 
 

@@ -605,23 +605,25 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         issues.append("constraint-invalid:actions.status")
     # These checks and uniqueness constraints make the v2 binding append-only
     # in meaning: an Action cannot be rebound to another ref, digest, or
-    # idempotency owner by malformed schema drift.
+    # idempotency owner by malformed schema drift.  Match the complete
+    # canonical expression: a permissive `OR true` is not an equivalent check.
     dispatch_checks = [
         constraint for constraint in constraints
         if constraint["table"] == "dispatch_requests" and constraint["type"] == "c"
     ]
-    required_dispatch_check_fragments = (
-        "schema_version = 'v2'",
-        "request_sha256 ~ '^[a-f0-9]{64}$'",
-        "operation = 'execution.dispatch.enqueue'",
-    )
-    dispatch_expressions = [
-        _without_redundant_outer_parentheses(constraint["expression"])
-        for constraint in dispatch_checks
-    ]
-    for fragment in required_dispatch_check_fragments:
-        if not any(fragment in expression for expression in dispatch_expressions):
-            issues.append(f"constraint-missing-or-invalid:dispatch_requests:{fragment}")
+    required_dispatch_checks = {
+        "schema_version": "schema_version = 'v2'::text",
+        "request_sha256": "request_sha256 ~ '^[a-f0-9]{64}$'::text",
+        "operation": "operation = 'execution.dispatch.enqueue'::text",
+    }
+    for column, expected_expression in required_dispatch_checks.items():
+        actual = [
+            _without_redundant_outer_parentheses(constraint["expression"])
+            for constraint in dispatch_checks
+            if constraint["columns"] == (column,)
+        ]
+        if len(actual) != 1 or actual[0] != _without_redundant_outer_parentheses(expected_expression):
+            issues.append(f"constraint-missing-or-invalid:dispatch_requests.{column}")
 
     index_rows = conn.execute(
         """
