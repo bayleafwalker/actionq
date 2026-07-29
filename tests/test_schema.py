@@ -333,6 +333,16 @@ def test_migration_assets_are_contiguous_and_render_only_validated_schema():
         schema._render(migrations[0], "unsafe-name")
 
 
+def test_v3_migration_comment_is_attached_to_valid_sql_statement():
+    migration = next(item for item in schema.load_migrations() if item.version == 3)
+    statements = schema._statements(schema._render(migration, "aq"))
+
+    assert len(statements) == 2
+    assert "CREATE TABLE IF NOT EXISTS \"aq\".dispatch_requests" in statements[0]
+    assert statements[1].startswith("CREATE INDEX IF NOT EXISTS idx_dispatch_requests_created")
+    assert all("jsonb is intentionally" not in statement for statement in statements)
+
+
 def test_compatibility_is_read_only_and_fails_closed_without_ledger():
     conn = FakeSchemaConnection()
 

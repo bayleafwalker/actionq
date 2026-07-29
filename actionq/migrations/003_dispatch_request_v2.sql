@@ -1,6 +1,4 @@
--- Durable Action-root dispatch enqueue contract v2.  The bytea column is the
--- authoritative canonical request representation; jsonb is intentionally not
--- used for the snapshot because it cannot preserve serialization bytes.
+-- Durable Action-root dispatch enqueue v2 with bytea preserving exact canonical snapshot bytes.
 CREATE TABLE IF NOT EXISTS {{schema}}.dispatch_requests (
     action_id               BIGINT      PRIMARY KEY REFERENCES {{schema}}.actions(id),
     request_ref             TEXT        NOT NULL UNIQUE,
