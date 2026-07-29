@@ -57,6 +57,7 @@ class FakeSchemaConnection:
         dispatch_relation: bool = True,
         dispatch_binding_constraints: bool = True,
         dispatch_check_overrides: dict[str, str] | None = None,
+        dispatch_check_validated: dict[str, bool] | None = None,
     ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
@@ -82,6 +83,7 @@ class FakeSchemaConnection:
         self.dispatch_relation = dispatch_relation
         self.dispatch_binding_constraints = dispatch_binding_constraints
         self.dispatch_check_overrides = dispatch_check_overrides or {}
+        self.dispatch_check_validated = dispatch_check_validated or {}
         self.executed: list[tuple[str, object]] = []
         self.closed = False
         self.rollbacks = 0
@@ -261,7 +263,7 @@ class FakeSchemaConnection:
                     },
                 ]
                 if self.dispatch_relation:
-                    def dispatch_constraint(kind, columns, *, foreign=False, expression=""):
+                    def dispatch_constraint(kind, columns, *, foreign=False, expression="", validated=True):
                         return {
                             "table_name": "dispatch_requests", "relation_oid": 103,
                             "contype": kind, "columns": columns,
@@ -271,7 +273,7 @@ class FakeSchemaConnection:
                             "foreign_columns": ["id"] if foreign else [],
                             "update_action": "a", "delete_action": "a", "match_action": "s",
                             "is_deferrable": False, "is_initially_deferred": False,
-                            "is_validated": True, "expression": expression,
+                            "is_validated": validated, "expression": expression,
                         }
                     rows.extend([
                         dispatch_constraint("p", ["action_id"]),
@@ -280,9 +282,9 @@ class FakeSchemaConnection:
                             dispatch_constraint("u", ["request_ref"]),
                             dispatch_constraint("u", ["identity", "environment", "operation", "idempotency_key"]),
                         ] if self.dispatch_binding_constraints else []),
-                        dispatch_constraint("c", ["schema_version"], expression=self.dispatch_check_overrides.get("schema_version", "schema_version = 'v2'::text")),
-                        dispatch_constraint("c", ["request_sha256"], expression=self.dispatch_check_overrides.get("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text")),
-                        dispatch_constraint("c", ["operation"], expression=self.dispatch_check_overrides.get("operation", "operation = 'execution.dispatch.enqueue'::text")),
+                        dispatch_constraint("c", ["schema_version"], expression=self.dispatch_check_overrides.get("schema_version", "schema_version = 'v2'::text"), validated=self.dispatch_check_validated.get("schema_version", True)),
+                        dispatch_constraint("c", ["request_sha256"], expression=self.dispatch_check_overrides.get("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text"), validated=self.dispatch_check_validated.get("request_sha256", True)),
+                        dispatch_constraint("c", ["operation"], expression=self.dispatch_check_overrides.get("operation", "operation = 'execution.dispatch.enqueue'::text"), validated=self.dispatch_check_validated.get("operation", True)),
                     ])
             return _Rows(rows)
         if normalized.startswith("SELECT relation.relname AS table_name") and "pg_index" in normalized:
@@ -421,6 +423,19 @@ def test_v3_permissive_dispatch_check_variants_fail_runtime_compatibility(column
 
     assert result.compatible is False
     assert f"constraint-missing-or-invalid:dispatch_requests.{column}" in result.detail
+
+
+def test_v3_not_valid_dispatch_check_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_check_validated={"operation": False},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert "constraint-missing-or-invalid:dispatch_requests.operation" in result.detail
     assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
 
 

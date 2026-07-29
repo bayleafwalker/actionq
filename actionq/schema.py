@@ -618,11 +618,18 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     }
     for column, expected_expression in required_dispatch_checks.items():
         actual = [
-            _without_redundant_outer_parentheses(constraint["expression"])
+            (
+                _without_redundant_outer_parentheses(constraint["expression"]),
+                constraint["is_validated"],
+            )
             for constraint in dispatch_checks
             if constraint["columns"] == (column,)
         ]
-        if len(actual) != 1 or actual[0] != _without_redundant_outer_parentheses(expected_expression):
+        if (
+            len(actual) != 1
+            or actual[0][0] != _without_redundant_outer_parentheses(expected_expression)
+            or actual[0][1] is not True
+        ):
             issues.append(f"constraint-missing-or-invalid:dispatch_requests.{column}")
 
     index_rows = conn.execute(
