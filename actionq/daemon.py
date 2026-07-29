@@ -24,6 +24,7 @@ from typing import Any, Callable, Protocol, Sequence
 
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
 from .harnesses import HarnessInvocation, get_adapter
+from .harness_profiles import validate_harness_profile
 from .routing import (
     HarnessRoute,
     RoutingContext,
@@ -129,6 +130,9 @@ class ActionConfig:
     # identity.  The daemon remains the coordinator and retains queue/sprint
     # authority; only the harness subprocess crosses this boundary.
     worker_user: str | None = None
+    # A provider harness is selected through a named implementation profile;
+    # arbitrary version strings are not an execution-policy authority.
+    harness_profile: str | None = None
     scope_iterate: ScopeIteratePolicy | None = None
 
 
@@ -518,6 +522,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             model=(str(value["model"]) if "model" in value else None),
             prompt=(str(value["prompt"]) if "prompt" in value else None),
             worker_user=(str(value["worker_user"]) if "worker_user" in value else None),
+            harness_profile=(str(value["harness_profile"]) if "harness_profile" in value else None),
             scope_iterate=(
                 load_policy(value["scope_iterate"], config_dir=path.parent.resolve())
                 if "scope_iterate" in value else None
@@ -718,6 +723,7 @@ class Daemon:
                         r"[a-z_][a-z0-9_-]*[$]?", action_config.worker_user
                     ):
                         raise RoutingError("scope-iterate worker_user must be a safe local username")
+                    validate_harness_profile(action_config.harness_profile, routing)
             except RoutingError as exc:
                 self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor, claim_receipt=claim_receipt)
                 return

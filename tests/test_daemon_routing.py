@@ -189,6 +189,7 @@ def test_load_config_reads_trusted_routing_harness_and_action_fields(tmp_path: P
         "harness = 'caller'\n"
         "model = 'fast-build'\n"
         "worker_user = 'agentworker'\n"
+        "harness_profile = 'opencode-nixpkgs-devbox-1.18.4'\n"
         "prompt = 'Run tests.'\n",
         encoding="utf-8",
     )
@@ -199,7 +200,8 @@ def test_load_config_reads_trusted_routing_harness_and_action_fields(tmp_path: P
     assert config.routing.trusted_caller_harness == "codex"
     assert config.routing.harnesses["codex"].bin == "/opt/bin/codex"
     assert actions["scope-iterate"] == ActionConfig(
-        runner="harness", harness="caller", model="fast-build", worker_user="agentworker", prompt="Run tests."
+        runner="harness", harness="caller", model="fast-build", worker_user="agentworker",
+        harness_profile="opencode-nixpkgs-devbox-1.18.4", prompt="Run tests."
     )
     assert projects["demo"].default_model == "fast-build"
 
