@@ -110,7 +110,7 @@ _DECISION_RESULT_SCHEMA = _object(
     {"decision": _DECISION_SCHEMA, "result": {}},
     required=("decision", "result"),
 )
-_DISPATCH_V2_RESULT_SCHEMA = _object({"action_id": {"type": ["integer", "string"], "minLength": 1}, "status": {"const": "pending"}, "request_ref": {"type": "string", "minLength": 1}, "request_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}, required=("action_id", "status", "request_ref", "request_sha256"))
+_DISPATCH_V2_RESULT_SCHEMA = _object({"action_id": {"type": "integer", "minimum": 1}, "status": {"const": "pending"}, "request_ref": {"type": "string", "pattern": "^req:[0-9a-f]{32}$"}, "request_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}, required=("action_id", "status", "request_ref", "request_sha256"))
 _DISPATCH_V2_INPUT_SCHEMA = _object(
     {
         "contract_version": {"const": "v2"}, "action_type": {"const": "scope-iterate"},

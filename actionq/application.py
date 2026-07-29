@@ -773,6 +773,8 @@ class ActionQApplication:
         if not provenance.idempotency_key:
             raise db.ActionQError("served dispatch enqueue requires an idempotency key")
         normalized, raw = self._normalize_dispatch_v2(payload)
+        if normalized["requested_by"] != provenance.actor:
+            raise db.ActionQError("v2 requested_by must equal the authenticated actor")
         self._authorize(provenance, f"execution.dispatch.repo:{normalized['repo_id']}", "enqueue")
         digest = hashlib.sha256(raw).hexdigest()
         with self.connection() as conn:

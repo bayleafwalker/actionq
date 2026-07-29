@@ -35,6 +35,8 @@ def test_v2_catalog_exposes_strict_enqueue_result_without_caller_requested_by():
     assert "requested_by" not in definition["input_schema"]["properties"]
     assert definition["result_schema"]["required"] == ["action_id", "status", "request_ref", "request_sha256"]
     assert definition["result_schema"]["additionalProperties"] is False
+    assert definition["result_schema"]["properties"]["action_id"] == {"type": "integer", "minimum": 1}
+    assert definition["result_schema"]["properties"]["request_ref"]["pattern"] == "^req:[0-9a-f]{32}$"
     input_schema = definition["input_schema"]
     assert input_schema["additionalProperties"] is False
     assert input_schema["properties"]["repo_id"]["pattern"] == "^(?!ALL$).+"
@@ -46,6 +48,13 @@ def test_v2_served_path_requires_repository_scoped_authorizer_before_db_access()
     app = ActionQApplication(schema="aq", authorizer=lambda *_args: False)
     with pytest.raises(db.ActionQError, match="authorization denied"):
         app.enqueue_dispatch_v2(_request(), provenance=provenance)
+
+
+def test_v2_requested_by_must_match_authenticated_provenance_before_persistence():
+    provenance = SimpleNamespace(actor="compiler:trusted", environment="dev", request_id="r", catalog_revision="c", idempotency_key="k", basis_revision=None, authorized_repositories=("actionq",))
+    app = ActionQApplication(schema="aq", authorizer=lambda *_args: pytest.fail("must reject before authorization/database access"))
+    with pytest.raises(db.ActionQError, match="must equal the authenticated actor"):
+        app.enqueue_dispatch_v2({**_request(), "requested_by": "caller:forged"}, provenance=provenance)
 
 
 def test_http_identity_is_fail_closed_and_never_uses_spoofed_actor_headers(monkeypatch):
