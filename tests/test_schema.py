@@ -449,6 +449,25 @@ def test_v3_not_valid_dispatch_check_fails_runtime_compatibility():
     assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
 
 
+def test_unversioned_v1_adoption_allows_only_expected_later_relation_absence():
+    remaining = schema._unversioned_v1_shape_issues(
+        [
+            "column-missing:actions.claim_receipt",
+            "column-missing:dispatch_requests.request_ref",
+            "constraint-missing-or-invalid:dispatch-requests-request-ref-unique",
+            "constraint-missing-or-invalid:dispatch_requests.operation",
+            "index-missing-or-invalid:dispatch-requests.created",
+            "column-type:actions.priority",
+            "column-unexpected:dispatch_requests.forged",
+        ]
+    )
+
+    assert remaining == [
+        "column-type:actions.priority",
+        "column-unexpected:dispatch_requests.forged",
+    ]
+
+
 def test_compatibility_rejects_valid_ledger_when_queue_shape_is_missing():
     conn = FakeSchemaConnection(
         ledger_exists=True,

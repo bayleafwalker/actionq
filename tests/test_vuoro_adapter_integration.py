@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-from actionq import db
+from actionq import db, schema as schema_contract
 from actionq.application import ActionQApplication
 from actionq.vuoro import (
     SCHEMA_DIALECT,
@@ -308,7 +308,7 @@ def test_adapter_compatibility_uses_runtime_role_and_refuses_migration_role(
     record = compatibility_record(runtime_application)
     assert record == {
         "api_version": "v1",
-        "schema_version": str(schema.MAX_SCHEMA_VERSION),
+        "schema_version": str(schema_contract.MAX_SCHEMA_VERSION),
         "state": "compatible",
         "reason": None,
     }

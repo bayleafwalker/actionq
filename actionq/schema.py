@@ -717,6 +717,27 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     return tuple(sorted(issues))
 
 
+def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[str]:
+    """Keep legacy-v1 adoption strict while allowing later packaged deltas.
+
+    An unledgered installation can legitimately contain only the v1 action and
+    event relations.  Claim receipts arrive in v2 and dispatch bindings in v3;
+    their *absence* must not prevent migration 1 from recording the pre-v2
+    baseline.  Any malformed existing v3 relation remains a refusal.
+    """
+    expected_later_absence = (
+        "column-missing:actions.claim_receipt",
+        "column-missing:dispatch_requests.",
+        "constraint-missing-or-invalid:dispatch-requests-",
+        "constraint-missing-or-invalid:dispatch_requests.",
+        "index-missing-or-invalid:dispatch-requests.created",
+    )
+    return [
+        issue for issue in issues
+        if not issue.startswith(expected_later_absence)
+    ]
+
+
 def check_compatibility(
     conn,
     schema: str,
@@ -941,10 +962,7 @@ def migrate(
                 # added by v2.  It may be adopted only when that is its sole
                 # difference; all other drift remains a refusal before any
                 # migration ledger is stamped.
-                shape_issues = [
-                    issue for issue in shape_issues
-                    if issue != "column-missing:actions.claim_receipt"
-                ]
+                shape_issues = _unversioned_v1_shape_issues(shape_issues)
                 if shape_issues:
                     raise SchemaMigrationError(
                         "refusing to stamp incompatible unversioned actionq schema: "
