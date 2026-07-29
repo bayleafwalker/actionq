@@ -308,7 +308,7 @@ def test_adapter_compatibility_uses_runtime_role_and_refuses_migration_role(
     record = compatibility_record(runtime_application)
     assert record == {
         "api_version": "v1",
-            "schema_version": "2",
+        "schema_version": str(schema.MAX_SCHEMA_VERSION),
         "state": "compatible",
         "reason": None,
     }
