@@ -54,6 +54,8 @@ class FakeSchemaConnection:
         foreign_initially_deferred: bool = False,
         foreign_validated: bool = True,
         index_overrides: dict[str, dict] | None = None,
+        dispatch_relation: bool = True,
+        dispatch_binding_constraints: bool = True,
     ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
@@ -76,6 +78,8 @@ class FakeSchemaConnection:
         self.foreign_initially_deferred = foreign_initially_deferred
         self.foreign_validated = foreign_validated
         self.index_overrides = index_overrides or {}
+        self.dispatch_relation = dispatch_relation
+        self.dispatch_binding_constraints = dispatch_binding_constraints
         self.executed: list[tuple[str, object]] = []
         self.closed = False
         self.rollbacks = 0
@@ -134,6 +138,8 @@ class FakeSchemaConnection:
             if self.tables_exist:
                 query_schema = params[0]
                 for table, columns in schema._COLUMN_SHAPE.items():
+                    if table == "dispatch_requests" and not self.dispatch_relation:
+                        continue
                     rows.extend(
                         {
                             "table_name": table,
@@ -252,11 +258,37 @@ class FakeSchemaConnection:
                         "expression": "",
                     },
                 ]
+                if self.dispatch_relation:
+                    def dispatch_constraint(kind, columns, *, foreign=False, expression=""):
+                        return {
+                            "table_name": "dispatch_requests", "relation_oid": 103,
+                            "contype": kind, "columns": columns,
+                            "foreign_namespace": foreign_namespace if foreign else None,
+                            "foreign_table": "actions" if foreign else None,
+                            "foreign_oid": self.foreign_oid if foreign else None,
+                            "foreign_columns": ["id"] if foreign else [],
+                            "update_action": "a", "delete_action": "a", "match_action": "s",
+                            "is_deferrable": False, "is_initially_deferred": False,
+                            "is_validated": True, "expression": expression,
+                        }
+                    rows.extend([
+                        dispatch_constraint("p", ["action_id"]),
+                        dispatch_constraint("f", ["action_id"], foreign=True),
+                        *([
+                            dispatch_constraint("u", ["request_ref"]),
+                            dispatch_constraint("u", ["identity", "environment", "operation", "idempotency_key"]),
+                        ] if self.dispatch_binding_constraints else []),
+                        dispatch_constraint("c", ["schema_version"], expression="schema_version = 'v2'::text"),
+                        dispatch_constraint("c", ["request_sha256"], expression="request_sha256 ~ '^[a-f0-9]{64}$'::text"),
+                        dispatch_constraint("c", ["operation"], expression="operation = 'execution.dispatch.enqueue'::text"),
+                    ])
             return _Rows(rows)
         if normalized.startswith("SELECT relation.relname AS table_name") and "pg_index" in normalized:
             rows = []
             if self.tables_exist:
                 for name, (table, keys, predicate) in schema._REQUIRED_INDEXES.items():
+                    if table == "dispatch_requests" and not self.dispatch_relation:
+                        continue
                     override = self.index_overrides.get(name, {})
                     rows.append(
                         {
@@ -324,6 +356,48 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
     }
+
+
+def test_v3_dispatch_relation_missing_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_relation=False,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert result.state == "shape-mismatch"
+    assert "column-missing:dispatch_requests.action_id" in result.detail
+    with pytest.raises(schema.SchemaCompatibilityError, match="shape-mismatch"):
+        schema.require_compatible(conn, "aq")
+
+
+def test_v3_dispatch_binding_index_corruption_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        index_overrides={"dispatch-requests.created": {"predicate": "action_id > 0"}},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert "index-missing-or-invalid:dispatch-requests.created" in result.detail
+
+
+def test_v3_dispatch_binding_constraint_corruption_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_binding_constraints=False,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert "constraint-missing-or-invalid:dispatch-requests-request-ref-unique" in result.detail
     assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
 
 

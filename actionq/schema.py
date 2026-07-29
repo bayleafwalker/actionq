@@ -52,6 +52,19 @@ _COLUMN_SHAPE = {
         "actor": ("text", "YES", None),
         "payload": ("jsonb", "NO", "'{}'::jsonb"),
     },
+    "dispatch_requests": {
+        "action_id": ("bigint", "NO", None),
+        "request_ref": ("text", "NO", None),
+        "normalized_snapshot": ("bytea", "NO", None),
+        "schema_version": ("text", "NO", None),
+        "canonicalization_version": ("text", "NO", None),
+        "request_sha256": ("text", "NO", None),
+        "identity": ("text", "NO", None),
+        "environment": ("text", "NO", None),
+        "operation": ("text", "NO", None),
+        "idempotency_key": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
 }
 _REQUIRED_COLUMNS = {
     table: set(columns) for table, columns in _COLUMN_SHAPE.items()
@@ -59,6 +72,7 @@ _REQUIRED_COLUMNS = {
 _REQUIRED_CONSTRAINT_COUNTS = {
     "actions": {"p": 1, "f": 1, "c": 1},
     "events": {"p": 1, "f": 1},
+    "dispatch_requests": {"p": 1, "f": 1, "u": 2, "c": 3},
 }
 _REQUIRED_INDEXES = {
     "actions.claim-lookup": (
@@ -79,6 +93,9 @@ _REQUIRED_INDEXES = {
         "events",
         (("event_type", False, False), ("timestamp", True, True)),
         None,
+    ),
+    "dispatch-requests.created": (
+        "dispatch_requests", (("created_at", False, False), ("action_id", False, False)), None,
     ),
 }
 
@@ -540,6 +557,22 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                 foreign_columns=("id",),
             ),
         ),
+        ("dispatch-requests-primary-key", has_constraint("dispatch_requests", "p", ("action_id",))),
+        (
+            "dispatch-requests-action-foreign-key",
+            has_constraint(
+                "dispatch_requests", "f", ("action_id",),
+                foreign_namespace=schema,
+                foreign_table="actions",
+                foreign_oid=table_oids.get("actions"),
+                foreign_columns=("id",),
+            ),
+        ),
+        ("dispatch-requests-request-ref-unique", has_constraint("dispatch_requests", "u", ("request_ref",))),
+        (
+            "dispatch-requests-idempotency-binding-unique",
+            has_constraint("dispatch_requests", "u", ("identity", "environment", "operation", "idempotency_key")),
+        ),
     )
     for name, present in required_constraints:
         if not present:
@@ -570,6 +603,25 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     )
     if len(status_checks) != 1 or actual_status_expression != expected_status_expression:
         issues.append("constraint-invalid:actions.status")
+    # These checks and uniqueness constraints make the v2 binding append-only
+    # in meaning: an Action cannot be rebound to another ref, digest, or
+    # idempotency owner by malformed schema drift.
+    dispatch_checks = [
+        constraint for constraint in constraints
+        if constraint["table"] == "dispatch_requests" and constraint["type"] == "c"
+    ]
+    required_dispatch_check_fragments = (
+        "schema_version = 'v2'",
+        "request_sha256 ~ '^[a-f0-9]{64}$'",
+        "operation = 'execution.dispatch.enqueue'",
+    )
+    dispatch_expressions = [
+        _without_redundant_outer_parentheses(constraint["expression"])
+        for constraint in dispatch_checks
+    ]
+    for fragment in required_dispatch_check_fragments:
+        if not any(fragment in expression for expression in dispatch_expressions):
+            issues.append(f"constraint-missing-or-invalid:dispatch_requests:{fragment}")
 
     index_rows = conn.execute(
         """
