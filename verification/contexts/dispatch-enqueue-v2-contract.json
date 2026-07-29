@@ -1,0 +1,23 @@
+{
+  "schema_version": "test-context/v1",
+  "id": "actionq.dispatch.enqueue-v2",
+  "owner_repo": "actionq",
+  "subject": "dispatch-action-root",
+  "contract_ref": {"doc_id": "agentops.dispatch-request-v2", "revision": "a15e404+22995cf+1889f3f+8f5ab44"},
+  "source_of_truth": "postgres-actions-and-dispatch-requests",
+  "depth": 2,
+  "backends": ["postgres"],
+  "actors": ["authenticated-compiler", "observer", "denied-observer"],
+  "initial_state": ["no Action", "no ExecutionSession"],
+  "operations": [
+    {"name": "enqueue-retry-lost-response", "actors": ["authenticated-compiler"], "synchronization": "replay-after-commit-before-response"},
+    {"name": "changes-cursor", "actors": ["observer"], "synchronization": "after-event-retention"},
+    {"name": "denied-resource-read", "actors": ["denied-observer"], "synchronization": "before-db-read"}
+  ],
+  "consistency": {"target": "linearizable", "object": "identity-environment-operation-idempotency-key"},
+  "invariants": ["identical-normalized-bytes-return-one-action-binding", "different-bytes-conflict-without-second-action", "queued-action-has-no-session", "snapshot-bytes-and-sha256-are-immutable", "cursor-expiry-requires-snapshot", "wait-is-bounded-at-30-seconds"],
+  "faults": ["crash-after-commit-before-response", "event-retention-before-resume", "authorization-denial"],
+  "oracles": ["database-binding-query", "response-shape", "event-history"],
+  "implementation_anchors": ["actionq/application.py:enqueue_dispatch_v2", "actionq/application.py:dispatch_action_changes", "actionq/migrations/003_dispatch_request_v2.sql"],
+  "expansions": ["stateful-test", "fault-scenario"]
+}

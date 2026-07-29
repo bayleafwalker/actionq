@@ -110,6 +110,20 @@ _DECISION_RESULT_SCHEMA = _object(
     {"decision": _DECISION_SCHEMA, "result": {}},
     required=("decision", "result"),
 )
+_DISPATCH_V2_RESULT_SCHEMA = _object({"action_id": {"type": "integer"}, "status": {"const": "pending"}, "request_ref": {"type": "string", "minLength": 1}, "request_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}, required=("action_id", "status", "request_ref", "request_sha256"))
+_DISPATCH_V2_INPUT_SCHEMA = _object(
+    {
+        "contract_version": {"const": "v2"}, "action_type": {"const": "scope-iterate"},
+        "output_expectation": {"enum": ["plan", "audit-event", "draft-work-items", "sprint-proposal", "implementation", "review"]},
+        "repo_id": {"type": "string", "minLength": 1}, "sprint_id": {"type": ["integer", "null"]},
+        "work_item_id": _NULLABLE_STRING, "title": {"type": "string", "minLength": 1},
+        "prompt": {"type": "string"}, "harness": {"enum": ["claude", "codex", "copilot-cli", "codestral"]},
+        "model": _NULLABLE_STRING, "priority": {"enum": ["normal", "high"]},
+        "refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "dispatch_group_id": _NULLABLE_STRING,
+    },
+    required=("contract_version", "action_type", "output_expectation", "repo_id", "sprint_id", "work_item_id", "title", "prompt", "harness", "model", "priority", "refs", "dispatch_group_id"),
+)
 
 
 @dataclass(frozen=True)
@@ -212,6 +226,11 @@ def build_operations(
             ),
         )
     )
+
+    # This is the canonical v2 enqueue operation.  Legacy v1 remains named
+    # explicitly below so callers cannot silently select it.
+    name = "execution.dispatch.enqueue"
+    operations.append(AdapterOperation(_definition(name, input_schema=_DISPATCH_V2_INPUT_SCHEMA, result_schema=_DISPATCH_V2_RESULT_SCHEMA, authority="execution.enqueue", semantics="enqueue", idempotency="required"), served(name, lambda a, p, actor: app.enqueue_dispatch_v2({**a, "requested_by": actor}, provenance=p))))
 
     name = "execution.action.list"
     operations.append(
@@ -521,7 +540,7 @@ def build_operations(
         "sprint_id": _NULLABLE_INTEGER,
         "dispatch_group_id": _NULLABLE_STRING,
     }
-    name = "execution.dispatch.enqueue"
+    name = "execution.dispatch.enqueue.v1"
     operations.append(
         AdapterOperation(
             _definition(

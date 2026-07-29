@@ -8,14 +8,16 @@ from __future__ import annotations
 import json
 import os
 import sys
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import db as _db
 from . import schema as _schema_contract
-from .application import ActionQApplication
+from .application import ActionQApplication, InvocationProvenance
 
 CONTRACT_VERSION = "v1"
+V2_CONTRACT_VERSION = "v2"
 
 
 def _schema() -> str:
@@ -35,6 +37,20 @@ def _require_runtime_compatibility() -> dict:
 
 def _dispatch(payload: dict) -> dict:
     return ActionQApplication(schema=_schema()).dispatch(payload)
+
+
+def _request_provenance(headers) -> InvocationProvenance:
+    """HTTP identity is an integration hook, not an authentication provider."""
+    actor = headers.get("x-actionq-actor", "").strip()
+    environment = headers.get("x-actionq-environment", "").strip()
+    key = headers.get("idempotency-key", "").strip()
+    if not actor or not environment or not key:
+        raise _db.ActionQError("v2 enqueue requires authenticated actor, environment, and Idempotency-Key")
+    return InvocationProvenance(actor=actor, environment=environment, request_id=headers.get("x-request-id", key), catalog_revision="http-v2", idempotency_key=key)
+
+
+def _dispatch_v2(payload: dict, headers) -> dict:
+    return ActionQApplication(schema=_schema()).enqueue_dispatch_v2(payload, provenance=_request_provenance(headers))
 
 
 def _sessions(query_string: str) -> list:
@@ -76,7 +92,23 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/health":
+        action_match = re.fullmatch(r"/v2/dispatch/actions/(\d+)", parsed.path)
+        changes_match = re.fullmatch(r"/v2/dispatch/actions/(\d+)/changes", parsed.path)
+        if action_match or changes_match:
+            try:
+                provenance = _request_provenance(self.headers)
+                params = parse_qs(parsed.query or "")
+                if changes_match:
+                    body = ActionQApplication(schema=_schema()).dispatch_action_changes(int(changes_match.group(1)), cursor=params.get("cursor", [None])[0], wait_seconds=min(int(params.get("wait_seconds", ["0"])[0]), 30), provenance=provenance)
+                else:
+                    body = ActionQApplication(schema=_schema()).dispatch_action_snapshot(int(action_match.group(1)), provenance=provenance)
+                self._send_json(200, body)
+            except (ValueError, _db.ActionQError) as exc:
+                self._send_json(400, {"error": str(exc)})
+            except Exception as exc:
+                print(f"dispatch v2 read error: {exc}", file=sys.stderr, flush=True)
+                self._send_json(500, {"error": "internal server error"})
+        elif parsed.path == "/health":
             self._send_json(200, {"ok": True})
         elif parsed.path == "/compatibility":
             try:
@@ -114,12 +146,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/dispatch":
+        parsed = urlparse(self.path)
+        if parsed.path not in {"/dispatch", "/v2/dispatch"}:
             self._send_json(404, {"error": "not found"})
             return
 
         contract_header = self.headers.get("x-actionq-dispatch-contract", "")
-        if contract_header and contract_header != CONTRACT_VERSION:
+        expected_contract = V2_CONTRACT_VERSION if parsed.path == "/v2/dispatch" else CONTRACT_VERSION
+        if contract_header and contract_header != expected_contract:
             self._send_json(400, {"error": f"unsupported dispatch contract: {contract_header!r}"})
             return
 
@@ -132,7 +166,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            action = _dispatch(payload)
+            action = _dispatch_v2(payload, self.headers) if parsed.path == "/v2/dispatch" else _dispatch(payload)
         except _schema_contract.SchemaCompatibilityError as exc:
             print(f"dispatch refused: {exc}", file=sys.stderr, flush=True)
             self._send_json(503, {"error": "schema incompatible"})

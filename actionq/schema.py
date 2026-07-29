@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 2
+MAX_SCHEMA_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
@@ -787,6 +787,13 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
             schema_identifier,
             sql.Identifier("events"),
             role_identifier,
+        )
+    )
+    # The byte-exact dispatch snapshot is append-only.  Runtime code can bind
+    # it once and read it, but cannot replace or erase it after enqueue.
+    conn.execute(
+        sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+            schema_identifier, sql.Identifier("dispatch_requests"), role_identifier
         )
     )
     conn.execute(
