@@ -14,12 +14,12 @@ def _routing() -> RoutingResult:
 
 def test_provider_profile_fails_closed_until_qualified():
     with pytest.raises(RoutingError, match="not qualified"):
-        validate_harness_profile("opencode-nixpkgs-devbox-1.18.4", _routing())
+        validate_harness_profile("opencode-nixpkgs-devbox-1.18.4", _routing(), worker_user="agentworker")
 
 
 def test_unknown_provider_profile_is_rejected():
     with pytest.raises(RoutingError, match="unknown harness_profile"):
-        validate_harness_profile("opencode-anywhere-9.9.9", _routing())
+        validate_harness_profile("opencode-anywhere-9.9.9", _routing(), worker_user="agentworker")
 
 
 def test_provider_profile_is_bound_to_its_harness():
@@ -28,4 +28,14 @@ def test_provider_profile_is_bound_to_its_harness():
         model="gpt-test", transport=None, surface=None, routing_source="test",
     )
     with pytest.raises(RoutingError, match="incompatible"):
-        validate_harness_profile("opencode-nixpkgs-devbox-1.18.4", routing)
+        validate_harness_profile("opencode-nixpkgs-devbox-1.18.4", routing, worker_user="agentworker")
+
+
+@pytest.mark.parametrize("worker_user", [None, "", "agent", "root"])
+def test_provider_profile_requires_the_contained_worker_identity(worker_user):
+    with pytest.raises(RoutingError, match="requires worker_user 'agentworker'"):
+        validate_harness_profile(
+            "opencode-nixpkgs-devbox-1.18.4",
+            _routing(),
+            worker_user=worker_user,
+        )

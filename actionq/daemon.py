@@ -723,7 +723,11 @@ class Daemon:
                         r"[a-z_][a-z0-9_-]*[$]?", action_config.worker_user
                     ):
                         raise RoutingError("scope-iterate worker_user must be a safe local username")
-                    validate_harness_profile(action_config.harness_profile, routing)
+                    validate_harness_profile(
+                        action_config.harness_profile,
+                        routing,
+                        worker_user=action_config.worker_user,
+                    )
             except RoutingError as exc:
                 self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor, claim_receipt=claim_receipt)
                 return

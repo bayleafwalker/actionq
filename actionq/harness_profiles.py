@@ -19,6 +19,7 @@ class HarnessProfile:
     provider: str
     semantic_adapter: str
     qualification_state: str
+    worker_user: str
 
 
 KNOWN_PROFILES = {
@@ -28,11 +29,17 @@ KNOWN_PROFILES = {
         provider="opencode-go",
         semantic_adapter="opencode-noninteractive/v1",
         qualification_state="preflight_observed",
+        worker_user="agentworker",
     ),
 }
 
 
-def validate_harness_profile(profile_id: str | None, routing: RoutingResult) -> HarnessProfile:
+def validate_harness_profile(
+    profile_id: str | None,
+    routing: RoutingResult,
+    *,
+    worker_user: str | None,
+) -> HarnessProfile:
     if not profile_id:
         raise RoutingError("provider-backed scope-iterate requires a harness_profile")
     profile = KNOWN_PROFILES.get(profile_id)
@@ -42,6 +49,11 @@ def validate_harness_profile(profile_id: str | None, routing: RoutingResult) -> 
         raise RoutingError(
             f"harness_profile {profile_id!r} is incompatible with "
             f"{routing.harness}/{routing.provider}"
+        )
+    if worker_user != profile.worker_user:
+        raise RoutingError(
+            f"harness_profile {profile_id!r} requires worker_user "
+            f"{profile.worker_user!r}"
         )
     if profile.qualification_state != "qualified":
         raise RoutingError(
