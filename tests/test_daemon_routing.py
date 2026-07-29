@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from actionq.daemon import ActionConfig, Daemon, DaemonConfig, ProjectConfig, load_config
-from actionq.routing import HarnessRoute, RoutingContext
+from actionq.routing import HarnessRoute, RoutingContext, RoutingResult
 
 from tests.test_daemon import FakeClient
 
@@ -188,6 +188,7 @@ def test_load_config_reads_trusted_routing_harness_and_action_fields(tmp_path: P
         "runner = 'harness'\n"
         "harness = 'caller'\n"
         "model = 'fast-build'\n"
+        "worker_user = 'agentworker'\n"
         "prompt = 'Run tests.'\n",
         encoding="utf-8",
     )
@@ -198,6 +199,46 @@ def test_load_config_reads_trusted_routing_harness_and_action_fields(tmp_path: P
     assert config.routing.trusted_caller_harness == "codex"
     assert config.routing.harnesses["codex"].bin == "/opt/bin/codex"
     assert actions["scope-iterate"] == ActionConfig(
-        runner="harness", harness="caller", model="fast-build", prompt="Run tests."
+        runner="harness", harness="caller", model="fast-build", worker_user="agentworker", prompt="Run tests."
     )
     assert projects["demo"].default_model == "fast-build"
+
+
+def test_scope_iterate_worker_runs_through_contained_identity(tmp_path: Path, monkeypatch):
+    daemon = Daemon(DaemonConfig(), {}, FakeClient())
+    action = ActionConfig(runner="scope-iterate", worker_user="agentworker")
+    project = ProjectConfig(tmp_path)
+    routing = RoutingResult(
+        requested_selector="gpt-test", caller_harness=None, harness="codex",
+        provider="codex", model="gpt-test", transport=None, surface=None,
+        routing_source="test",
+    )
+    captured = {}
+
+    class Child:
+        stdin = None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return Child()
+
+    monkeypatch.setattr("actionq.daemon.subprocess.Popen", fake_popen)
+    class Adapter:
+        def build_command(self, _invocation):
+            return ["/run/current-system/sw/bin/opencode", "run"]
+
+        def build_env(self, _invocation):
+            return {"OPENCODE_CONFIG": "/etc/agentops/opencode.actionq-worker.json", "SECRET": "coordinator-only"}
+
+        def stdin_text(self, _invocation):
+            return None
+
+    monkeypatch.setattr("actionq.daemon.get_adapter", lambda *_args, **_kwargs: Adapter())
+
+    daemon._start_child(action, project=project, routing=routing, prompt="work")
+
+    assert captured["command"][:7] == [
+        "sudo", "-n", "-H", "--preserve-env=OPENCODE_CONFIG", "-u", "agentworker", "--",
+    ]
+    assert captured["env"] == {"OPENCODE_CONFIG": "/etc/agentops/opencode.actionq-worker.json"}

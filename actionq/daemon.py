@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -124,6 +125,10 @@ class ActionConfig:
     harness: str | None = None
     model: str | None = None
     prompt: str | None = None
+    # A provider-backed scope-iterate worker can run under a separate local
+    # identity.  The daemon remains the coordinator and retains queue/sprint
+    # authority; only the harness subprocess crosses this boundary.
+    worker_user: str | None = None
     scope_iterate: ScopeIteratePolicy | None = None
 
 
@@ -512,6 +517,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             harness=(str(value["harness"]) if "harness" in value else None),
             model=(str(value["model"]) if "model" in value else None),
             prompt=(str(value["prompt"]) if "prompt" in value else None),
+            worker_user=(str(value["worker_user"]) if "worker_user" in value else None),
             scope_iterate=(
                 load_policy(value["scope_iterate"], config_dir=path.parent.resolve())
                 if "scope_iterate" in value else None
@@ -708,6 +714,10 @@ class Daemon:
                         )
                     if action.get("target_ref") is None:
                         raise RoutingError("runner 'scope-iterate' requires an exact target_ref")
+                    if action_config.worker_user is not None and not re.fullmatch(
+                        r"[a-z_][a-z0-9_-]*[$]?", action_config.worker_user
+                    ):
+                        raise RoutingError("scope-iterate worker_user must be a safe local username")
             except RoutingError as exc:
                 self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor, claim_receipt=claim_receipt)
                 return
@@ -1197,10 +1207,24 @@ class Daemon:
                 handle = open(output_path, "w", encoding="utf-8")
                 stdout_target = handle
             try:
+                command = adapter.build_command(invocation)
+                env = adapter.build_env(invocation)
+                if action.worker_user is not None:
+                    # `sudo -H` supplies the worker's HOME, so provider
+                    # credentials remain with that identity.  Preserve only
+                    # the reviewed OpenCode policy path; do not pass the
+                    # coordinator environment through the privilege boundary.
+                    command = [
+                        "sudo", "-n", "-H",
+                        f"--preserve-env=OPENCODE_CONFIG",
+                        "-u", action.worker_user, "--",
+                        *command,
+                    ]
+                    env = {"OPENCODE_CONFIG": env.get("OPENCODE_CONFIG", "")}
                 child = subprocess.Popen(
-                    adapter.build_command(invocation),
+                    command,
                     cwd=invocation.worktree,
-                    env=adapter.build_env(invocation),
+                    env=env,
                     stdin=subprocess.PIPE if adapter.stdin_text(invocation) is not None else subprocess.DEVNULL,
                     stdout=stdout_target,
                     stderr=subprocess.STDOUT,
