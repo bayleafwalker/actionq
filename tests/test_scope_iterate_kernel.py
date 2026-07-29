@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 import subprocess
 from pathlib import Path
 
@@ -61,6 +62,12 @@ def test_fake_kernel_prepares_isolated_worktree_and_passes_all_post_invariants(t
     repo = repository(tmp_path)
     kernel = ScopeIterateKernel()
     prepared = kernel.prepare(request(repo), policy(tmp_path))
+
+    assert git(prepared.worktree, "remote") == ""
+    assert (prepared.worktree / ".git").is_dir()
+    for path in (prepared.worktree, *prepared.worktree.rglob("*")):
+        if not path.is_symlink():
+            assert path.stat().st_mode & stat.S_IWGRP
 
     result = kernel.run(prepared, FakeCommitWorker())
 

@@ -10,6 +10,7 @@ import fnmatch
 import json
 import os
 import shlex
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -246,8 +247,21 @@ class ScopeIterateKernel:
         if worktree.exists() and any(worktree.iterdir()):
             raise InvariantError("worktree-absent", f"non-empty path exists: {worktree}")
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        self._run(repo, ("git", "worktree", "add", "-b", branch, str(worktree), base_sha))
+        # A linked worktree keeps its Git metadata under the coordinator's
+        # checkout, which the contained worker identity must not be able to
+        # traverse or mutate.  Use a standalone, no-hardlink clone so the
+        # disposable artifact owns both its files and Git metadata.
+        self._run(
+            repo,
+            ("git", "clone", "--no-hardlinks", "--quiet", str(repo), str(worktree)),
+        )
+        self._run(
+            worktree,
+            ("git", "switch", "--quiet", "--create", branch, base_sha),
+        )
+        self._run(worktree, ("git", "remote", "remove", "origin"))
         self._run(worktree, ("git", "config", "core.fileMode", "false"))
+        self._share_with_group(worktree)
 
         try:
             prompt = self._render_prompt(request, policy, worktree, branch)
@@ -255,6 +269,15 @@ class ScopeIterateKernel:
             # Preserve a successfully-created worktree as evidence.
             raise
         return PreparedScopeIterate(request, policy, worktree, branch, base_sha, prompt)
+
+    @staticmethod
+    def _share_with_group(worktree: Path) -> None:
+        """Make the disposable clone writable by its inherited shared group."""
+        for path in (worktree, *worktree.rglob("*")):
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                continue
+            path.chmod(stat.S_IMODE(mode) | stat.S_IWGRP)
 
     def verify(self, prepared: PreparedScopeIterate) -> VerificationResult:
         worktree = prepared.worktree
