@@ -228,7 +228,7 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
         ).fetchall()
     }
     verify_conn.close()
-    assert before == after == {
+    expected_indexes = {
         "idx_actionq_actions_claim_lookup",
         "idx_actionq_actions_parent",
         "idx_actionq_actions_project",
@@ -236,8 +236,17 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
         "idx_actionq_events_action",
         "idx_actionq_events_timestamp",
         "idx_actionq_events_type_time",
-        "idx_dispatch_requests_created",
     }
+    if schema_contract.MAX_SCHEMA_VERSION >= 3:
+        expected_indexes.update(
+            {
+                "dispatch_requests_identity_environment_operation_idempotenc_key",
+                "dispatch_requests_request_ref_key",
+                "idx_dispatch_requests_created",
+            }
+        )
+    assert before <= expected_indexes
+    assert after == expected_indexes
 
 
 def test_unversioned_legacy_wrong_index_definition_is_not_stamped(runner_env):
