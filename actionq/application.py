@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import hashlib
 import json
 from typing import Any, Callable, Iterator
+import time
+import uuid
 
 from . import db
 
@@ -30,6 +32,15 @@ _INVOCATION_EVENT_TYPES = (
     "invocation.decided",
     "invocation.replayed",
 )
+_DISPATCH_V2_FIELDS = (
+    "contract_version", "action_type", "output_expectation", "repo_id", "sprint_id",
+    "work_item_id", "title", "prompt", "harness", "model", "priority", "refs",
+    "dispatch_group_id", "requested_by",
+)
+_OUTPUT_EXPECTATIONS = {"plan", "audit-event", "draft-work-items", "sprint-proposal", "implementation", "review"}
+_HARNESSES = {"claude", "codex", "copilot-cli", "codestral"}
+_PRIORITIES = {"normal", "high"}
+CANONICALIZATION_VERSION = "json-sort-utf8-v1"
 
 
 @dataclass(frozen=True)
@@ -40,6 +51,7 @@ class InvocationProvenance:
     catalog_revision: str
     idempotency_key: str
     basis_revision: str | None = None
+    authorized_repositories: tuple[str, ...] = ()
 
     def as_event_payload(self, *, operation: str) -> dict[str, Any]:
         return {
@@ -76,9 +88,16 @@ class ActionQApplication:
         *,
         schema: str | None = None,
         connection_factory: Callable[[], Any] | None = None,
+        authorizer: Callable[[InvocationProvenance, str, str], bool] | None = None,
     ) -> None:
         self.schema = db.schema_name(schema)
         self._connection_factory = connection_factory
+        self._authorizer = authorizer
+
+    def _authorize(self, provenance: InvocationProvenance, resource: str, verb: str) -> None:
+        """Fail-closed resource-scoped hook for served dispatch resources."""
+        if self._authorizer is None or not self._authorizer(provenance, resource, verb):
+            raise db.ActionQError("authorization denied for dispatch resource")
 
     def _open(self):
         return self._connection_factory() if self._connection_factory else db.connect()
@@ -723,6 +742,109 @@ class ActionQApplication:
             provenance=provenance,
             mutation=mutate,
         )
+
+    @staticmethod
+    def _normalize_dispatch_v2(payload: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+        if set(payload) != set(_DISPATCH_V2_FIELDS):
+            missing = sorted(set(_DISPATCH_V2_FIELDS) - set(payload))
+            unknown = sorted(set(payload) - set(_DISPATCH_V2_FIELDS))
+            raise db.ActionQError(f"v2 request fields must be exact; missing={missing}, unknown={unknown}")
+        value = dict(payload)
+        if value["contract_version"] != "v2" or value["action_type"] != "scope-iterate":
+            raise db.ActionQError("v2 contract_version must be 'v2' and action_type must be 'scope-iterate'")
+        if value["output_expectation"] not in _OUTPUT_EXPECTATIONS or value["harness"] not in _HARNESSES or value["priority"] not in _PRIORITIES:
+            raise db.ActionQError("v2 request contains an unsupported enum value")
+        for name in ("repo_id", "title", "requested_by"):
+            if not isinstance(value[name], str) or not value[name] or (name == "repo_id" and value[name] == "ALL"):
+                raise db.ActionQError(f"v2 {name} must be a non-empty concrete string")
+        if not isinstance(value["prompt"], str) or not isinstance(value["refs"], list) or not all(isinstance(ref, str) and ref for ref in value["refs"]):
+            raise db.ActionQError("v2 prompt must be string and refs must be strings")
+        for name in ("sprint_id",):
+            if value[name] is not None and (not isinstance(value[name], int) or isinstance(value[name], bool) or value[name] < 1):
+                raise db.ActionQError(f"v2 {name} must be null or a positive integer")
+        for name in ("work_item_id", "model", "dispatch_group_id"):
+            if value[name] is not None and (not isinstance(value[name], str) or not value[name]):
+                raise db.ActionQError(f"v2 {name} must be null or a non-empty string")
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return value, raw
+
+    def enqueue_dispatch_v2(self, payload: dict[str, Any], *, provenance: InvocationProvenance) -> dict[str, Any]:
+        """Atomically bind one immutable v2 snapshot to one pending Action root."""
+        if not provenance.idempotency_key:
+            raise db.ActionQError("served dispatch enqueue requires an idempotency key")
+        normalized, raw = self._normalize_dispatch_v2(payload)
+        if normalized["requested_by"] != provenance.actor:
+            raise db.ActionQError("v2 requested_by must equal the authenticated actor")
+        self._authorize(provenance, f"execution.dispatch.repo:{normalized['repo_id']}", "enqueue")
+        digest = hashlib.sha256(raw).hexdigest()
+        with self.connection() as conn:
+            with conn.transaction():
+                lock = "\x1f".join(("execution.dispatch.enqueue", provenance.actor, provenance.environment, provenance.idempotency_key))
+                conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock,))
+                prior = conn.execute(
+                    f"SELECT action_id, request_ref, request_sha256, normalized_snapshot FROM {db.qname(self.schema, 'dispatch_requests')} WHERE identity=%s AND environment=%s AND operation=%s AND idempotency_key=%s",
+                    (provenance.actor, provenance.environment, "execution.dispatch.enqueue", provenance.idempotency_key),
+                ).fetchone()
+                if prior:
+                    if bytes(prior["normalized_snapshot"]) != raw:
+                        raise db.ActionQError("idempotency-key-conflict")
+                    return {"action_id": prior["action_id"], "status": "pending", "request_ref": prior["request_ref"], "request_sha256": prior["request_sha256"]}
+                created_by = provenance.actor
+                action = db.enqueue(conn, self.schema, action_type="scope-iterate", project=normalized["repo_id"], target_ref=normalized["work_item_id"], source_refs=normalized["refs"], priority=50 if normalized["priority"] == "high" else 100, parent_id=None, created_by=created_by, provenance=provenance.as_event_payload(operation="execution.dispatch.enqueue"))
+                request_ref = "req:" + uuid.uuid4().hex
+                conn.execute(
+                    f"INSERT INTO {db.qname(self.schema, 'dispatch_requests')} (action_id, request_ref, normalized_snapshot, schema_version, canonicalization_version, request_sha256, identity, environment, operation, idempotency_key) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (action["id"], request_ref, raw, "v2", CANONICALIZATION_VERSION, digest, provenance.actor, provenance.environment, "execution.dispatch.enqueue", provenance.idempotency_key),
+                )
+                db.insert_event(conn, self.schema, action_id=action["id"], event_type="dispatch.v2.enqueued", actor=created_by, payload={"request_ref": request_ref, "request_sha256": digest, "schema_version": "v2", "canonicalization_version": CANONICALIZATION_VERSION, "enqueue_decision": "accepted", "provenance": provenance.as_event_payload(operation="execution.dispatch.enqueue")})
+                return {"action_id": action["id"], "status": "pending", "request_ref": request_ref, "request_sha256": digest}
+
+    def dispatch_action_snapshot(self, action_id: int, *, provenance: InvocationProvenance) -> dict[str, Any]:
+        def read(conn):
+            row = conn.execute(f"SELECT a.*, r.request_ref, r.request_sha256, r.schema_version, r.canonicalization_version FROM {db.qname(self.schema, 'actions')} a JOIN {db.qname(self.schema, 'dispatch_requests')} r ON r.action_id=a.id WHERE a.id=%s", (action_id,)).fetchone()
+            if not row: raise db.ActionQError("dispatch action not found")
+            self._authorize(provenance, f"execution.dispatch.repo:{row['project']}", "read")
+            item = dict(row); item.pop("claim_receipt", None)
+            return {"action": item, "cursor": f"event:{self._latest_event_id(conn, action_id)}"}
+        return self._read(read)
+
+    def resolve_dispatch_request(self, request_ref: str, *, provenance: InvocationProvenance) -> dict[str, Any]:
+        """Resolve an opaque request reference after repository-scoped authorization."""
+        if not request_ref or not isinstance(request_ref, str):
+            raise db.ActionQError("request_ref is required")
+        def read(conn):
+            row = conn.execute(f"SELECT r.*, a.project FROM {db.qname(self.schema, 'dispatch_requests')} r JOIN {db.qname(self.schema, 'actions')} a ON a.id=r.action_id WHERE r.request_ref=%s", (request_ref,)).fetchone()
+            if not row: raise db.ActionQError("dispatch request not found")
+            self._authorize(provenance, f"execution.dispatch.repo:{row['project']}", "read")
+            raw = bytes(row["normalized_snapshot"])
+            if hashlib.sha256(raw).hexdigest() != row["request_sha256"]:
+                raise db.ActionQError("immutable dispatch snapshot digest mismatch")
+            return {"action_id": row["action_id"], "request_ref": row["request_ref"], "request_sha256": row["request_sha256"], "schema_version": row["schema_version"], "canonicalization_version": row["canonicalization_version"], "normalized_request": json.loads(raw.decode("utf-8"))}
+        return self._read(read)
+
+    def _latest_event_id(self, conn, action_id: int) -> int:
+        row = conn.execute(f"SELECT COALESCE(MAX(id), 0) AS id FROM {db.qname(self.schema, 'events')} WHERE action_id=%s", (action_id,)).fetchone()
+        return int(row["id"])
+
+    def dispatch_action_changes(self, action_id: int, *, cursor: str | None, wait_seconds: int, provenance: InvocationProvenance) -> dict[str, Any]:
+        if wait_seconds < 0 or wait_seconds > 30: raise db.ActionQError("wait_seconds must be between 0 and 30")
+        after = 0 if cursor is None else int(cursor.removeprefix("event:")) if cursor.startswith("event:") and cursor[6:].isdigit() else (_ for _ in ()).throw(db.ActionQError("invalid event cursor"))
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            def read(conn):
+                exists = conn.execute(f"SELECT 1 FROM {db.qname(self.schema, 'dispatch_requests')} WHERE action_id=%s", (action_id,)).fetchone()
+                if not exists: raise db.ActionQError("dispatch action not found")
+                project = conn.execute(f"SELECT project FROM {db.qname(self.schema, 'actions')} WHERE id=%s", (action_id,)).fetchone()["project"]
+                self._authorize(provenance, f"execution.dispatch.repo:{project}", "read")
+                oldest = conn.execute(f"SELECT MIN(id) AS id FROM {db.qname(self.schema, 'events')} WHERE action_id=%s", (action_id,)).fetchone()["id"]
+                if cursor is not None and oldest is not None and after < int(oldest) - 1:
+                    return {"status": "cursor_expired", "snapshot_required": True, "events": [], "cursor": f"event:{self._latest_event_id(conn, action_id)}"}
+                rows = conn.execute(f"SELECT * FROM {db.qname(self.schema, 'events')} WHERE action_id=%s AND id>%s ORDER BY id ASC", (action_id, after)).fetchall()
+                latest = self._latest_event_id(conn, action_id)
+                return {"status": "ok", "snapshot_required": False, "events": [dict(row) for row in rows], "cursor": f"event:{latest}"}
+            result = self._read(read)
+            if result["events"] or wait_seconds == 0 or time.monotonic() >= deadline: return result
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
 __all__ = ["ActionQApplication", "InvocationProvenance"]

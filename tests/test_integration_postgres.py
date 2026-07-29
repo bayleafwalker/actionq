@@ -184,7 +184,9 @@ def test_deployment_migration_empty_current_retry_and_compatibility(runner_env):
 
     first = runner.invoke(cli, ["migrate", "--json-output"])
     assert first.exit_code == 0, first.output
-    assert json.loads(first.output)["applied_versions"] == [1, 2]
+    assert json.loads(first.output)["applied_versions"] == list(
+        range(schema_contract.MIN_SCHEMA_VERSION, schema_contract.MAX_SCHEMA_VERSION + 1)
+    )
 
     second = runner.invoke(cli, ["migrate", "--json-output"])
     assert second.exit_code == 0, second.output
@@ -212,7 +214,9 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
 
     assert result.exit_code == 0, result.output
     report = json.loads(result.output)
-    assert report["applied_versions"] == [1, 2]
+    assert report["applied_versions"] == list(
+        range(schema_contract.MIN_SCHEMA_VERSION, schema_contract.MAX_SCHEMA_VERSION + 1)
+    )
     assert report["adopted_legacy_schema"] is True
     assert runner.invoke(cli, ["check-compatibility"]).exit_code == 0
     verify_conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
@@ -224,7 +228,7 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
         ).fetchall()
     }
     verify_conn.close()
-    assert before == after == {
+    expected_indexes = {
         "idx_actionq_actions_claim_lookup",
         "idx_actionq_actions_parent",
         "idx_actionq_actions_project",
@@ -233,6 +237,16 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
         "idx_actionq_events_timestamp",
         "idx_actionq_events_type_time",
     }
+    if schema_contract.MAX_SCHEMA_VERSION >= 3:
+        expected_indexes.update(
+            {
+                "dispatch_requests_identity_environment_operation_idempotenc_key",
+                "dispatch_requests_request_ref_key",
+                "idx_dispatch_requests_created",
+            }
+        )
+    assert before <= expected_indexes
+    assert after == expected_indexes
 
 
 def test_unversioned_legacy_wrong_index_definition_is_not_stamped(runner_env):
@@ -356,7 +370,9 @@ def test_failed_migration_rolls_back_ledger_and_can_retry_after_repair(runner_en
     conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
     conn.commit()
     report = schema_contract.migrate(conn, schema)
-    assert report["applied_versions"] == [1, 2]
+    assert report["applied_versions"] == list(
+        range(schema_contract.MIN_SCHEMA_VERSION, schema_contract.MAX_SCHEMA_VERSION + 1)
+    )
     conn.close()
 
 
@@ -384,7 +400,7 @@ def test_deployment_migrations_serialize_across_connections(runner_env):
 
     assert not errors, errors
     assert len(reports) == 2
-    assert sorted(len(report["applied_versions"]) for report in reports) == [0, 2]
+    assert sorted(len(report["applied_versions"]) for report in reports) == [0, schema_contract.MAX_SCHEMA_VERSION]
     assert all(report["compatibility"]["compatible"] for report in reports)
 
 
@@ -396,7 +412,12 @@ def test_runtime_contract_rejects_future_schema_without_running_ddl(runner_env):
     conn.execute(
         f'INSERT INTO "{schema}"."schema_migrations" '
         "(domain, version, name, checksum) VALUES (%s, %s, %s, %s)",
-        (schema_contract.DOMAIN, 3, "003_future.sql", migration.checksum),
+        (
+            schema_contract.DOMAIN,
+            schema_contract.MAX_SCHEMA_VERSION + 1,
+            "future.sql",
+            migration.checksum,
+        ),
     )
     conn.commit()
     conn.close()
@@ -689,6 +710,13 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
             )
         )
         admin_conn.execute(
+            sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+                schema_identifier,
+                sql.Identifier("dispatch_requests"),
+                runtime_identifier,
+            )
+        )
+        admin_conn.execute(
             sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
                 schema_identifier,
                 sql.Identifier("schema_migrations"),
@@ -716,7 +744,7 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
             WHERE namespace_record.nspname = %s
             GROUP BY owner_role.rolname
             """,
-            (["actions", "events", "schema_migrations"], schema),
+            (["actions", "events", "dispatch_requests", "schema_migrations"], schema),
         ).fetchone()
         admin_conn.rollback()
         assert topology["schema_owner"] != MIGRATION_ROLE

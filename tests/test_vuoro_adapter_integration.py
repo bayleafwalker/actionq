@@ -7,7 +7,7 @@ import uuid
 
 import pytest
 
-from actionq import db
+from actionq import db, schema as schema_contract
 from actionq.application import ActionQApplication
 from actionq.vuoro import (
     SCHEMA_DIALECT,
@@ -53,6 +53,7 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
         "execution.session.list",
         "execution.session.record",
         "execution.dispatch.enqueue",
+        "execution.dispatch.enqueue.v1",
         "execution.dispatch.list",
     }
     assert not any("migrate" in name for name in names)
@@ -71,10 +72,7 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
     assert (
         "worker" not in by_name["execution.action.renew"]["input_schema"]["properties"]
     )
-    assert (
-        "requested_by"
-        not in by_name["execution.dispatch.enqueue"]["input_schema"]["properties"]
-    )
+    assert "requested_by" not in by_name["execution.dispatch.enqueue"]["input_schema"]["properties"]
 
 
 def test_registry_composition_accepts_an_injected_protocol_definition_factory():
@@ -256,7 +254,7 @@ def test_adapter_concurrent_claims_remain_unique(runtime_application):
 
 def test_adapter_dispatch_and_session_histories_use_identity(runtime_application):
     handlers = _handlers(runtime_application)
-    dispatched = handlers["execution.dispatch.enqueue"](
+    dispatched = handlers["execution.dispatch.enqueue.v1"](
         {
             "contract_version": "v1",
             "repo_id": "actionq",
@@ -310,7 +308,7 @@ def test_adapter_compatibility_uses_runtime_role_and_refuses_migration_role(
     record = compatibility_record(runtime_application)
     assert record == {
         "api_version": "v1",
-            "schema_version": "2",
+        "schema_version": str(schema_contract.MAX_SCHEMA_VERSION),
         "state": "compatible",
         "reason": None,
     }

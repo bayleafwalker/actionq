@@ -54,6 +54,10 @@ class FakeSchemaConnection:
         foreign_initially_deferred: bool = False,
         foreign_validated: bool = True,
         index_overrides: dict[str, dict] | None = None,
+        dispatch_relation: bool = True,
+        dispatch_binding_constraints: bool = True,
+        dispatch_check_overrides: dict[str, str] | None = None,
+        dispatch_check_validated: dict[str, bool] | None = None,
     ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
@@ -76,6 +80,10 @@ class FakeSchemaConnection:
         self.foreign_initially_deferred = foreign_initially_deferred
         self.foreign_validated = foreign_validated
         self.index_overrides = index_overrides or {}
+        self.dispatch_relation = dispatch_relation
+        self.dispatch_binding_constraints = dispatch_binding_constraints
+        self.dispatch_check_overrides = dispatch_check_overrides or {}
+        self.dispatch_check_validated = dispatch_check_validated or {}
         self.executed: list[tuple[str, object]] = []
         self.closed = False
         self.rollbacks = 0
@@ -134,6 +142,8 @@ class FakeSchemaConnection:
             if self.tables_exist:
                 query_schema = params[0]
                 for table, columns in schema._COLUMN_SHAPE.items():
+                    if table == "dispatch_requests" and not self.dispatch_relation:
+                        continue
                     rows.extend(
                         {
                             "table_name": table,
@@ -252,11 +262,37 @@ class FakeSchemaConnection:
                         "expression": "",
                     },
                 ]
+                if self.dispatch_relation:
+                    def dispatch_constraint(kind, columns, *, foreign=False, expression="", validated=True):
+                        return {
+                            "table_name": "dispatch_requests", "relation_oid": 103,
+                            "contype": kind, "columns": columns,
+                            "foreign_namespace": foreign_namespace if foreign else None,
+                            "foreign_table": "actions" if foreign else None,
+                            "foreign_oid": self.foreign_oid if foreign else None,
+                            "foreign_columns": ["id"] if foreign else [],
+                            "update_action": "a", "delete_action": "a", "match_action": "s",
+                            "is_deferrable": False, "is_initially_deferred": False,
+                            "is_validated": validated, "expression": expression,
+                        }
+                    rows.extend([
+                        dispatch_constraint("p", ["action_id"]),
+                        dispatch_constraint("f", ["action_id"], foreign=True),
+                        *([
+                            dispatch_constraint("u", ["request_ref"]),
+                            dispatch_constraint("u", ["identity", "environment", "operation", "idempotency_key"]),
+                        ] if self.dispatch_binding_constraints else []),
+                        dispatch_constraint("c", ["schema_version"], expression=self.dispatch_check_overrides.get("schema_version", "schema_version = 'v2'::text"), validated=self.dispatch_check_validated.get("schema_version", True)),
+                        dispatch_constraint("c", ["request_sha256"], expression=self.dispatch_check_overrides.get("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text"), validated=self.dispatch_check_validated.get("request_sha256", True)),
+                        dispatch_constraint("c", ["operation"], expression=self.dispatch_check_overrides.get("operation", "operation = 'execution.dispatch.enqueue'::text"), validated=self.dispatch_check_validated.get("operation", True)),
+                    ])
             return _Rows(rows)
         if normalized.startswith("SELECT relation.relname AS table_name") and "pg_index" in normalized:
             rows = []
             if self.tables_exist:
                 for name, (table, keys, predicate) in schema._REQUIRED_INDEXES.items():
+                    if table == "dispatch_requests" and not self.dispatch_relation:
+                        continue
                     override = self.index_overrides.get(name, {})
                     rows.append(
                         {
@@ -288,13 +324,23 @@ def _packaged_checksums() -> dict[int, str]:
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     migrations = schema.load_migrations()
 
-    assert [migration.version for migration in migrations] == [1, 2]
+    assert [migration.version for migration in migrations] == [1, 2, 3]
     rendered = schema._render(migrations[0], "aq")
     assert "{{schema}}" not in rendered
     assert '"aq".actions' in rendered
     assert len(schema._statements(rendered)) == 9
     with pytest.raises(db.ActionQError):
         schema._render(migrations[0], "unsafe-name")
+
+
+def test_v3_migration_comment_is_attached_to_valid_sql_statement():
+    migration = next(item for item in schema.load_migrations() if item.version == 3)
+    statements = schema._statements(schema._render(migration, "aq"))
+
+    assert len(statements) == 2
+    assert "CREATE TABLE IF NOT EXISTS \"aq\".dispatch_requests" in statements[0]
+    assert statements[1].startswith("CREATE INDEX IF NOT EXISTS idx_dispatch_requests_created")
+    assert all("jsonb is intentionally" not in statement for statement in statements)
 
 
 def test_compatibility_is_read_only_and_fails_closed_without_ledger():
@@ -318,13 +364,108 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "domain": "execution",
         "api_version": "v1",
         "minimum_schema_version": 1,
-        "maximum_schema_version": 2,
-        "observed_schema_version": 2,
+        "maximum_schema_version": 3,
+        "observed_schema_version": 3,
         "state": "compatible",
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
     }
+
+
+def test_v3_dispatch_relation_missing_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_relation=False,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert result.state == "shape-mismatch"
+    assert "column-missing:dispatch_requests.action_id" in result.detail
+    with pytest.raises(schema.SchemaCompatibilityError, match="shape-mismatch"):
+        schema.require_compatible(conn, "aq")
+
+
+def test_v3_dispatch_binding_index_corruption_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        index_overrides={"dispatch-requests.created": {"predicate": "action_id > 0"}},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert "index-missing-or-invalid:dispatch-requests.created" in result.detail
+
+
+def test_v3_dispatch_binding_constraint_corruption_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_binding_constraints=False,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert "constraint-missing-or-invalid:dispatch-requests-request-ref-unique" in result.detail
+
+
+@pytest.mark.parametrize(
+    ("column", "expression"),
+    [
+        ("schema_version", "schema_version = 'v2'::text OR true"),
+        ("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text OR true"),
+        ("operation", "operation = 'execution.dispatch.enqueue'::text OR true"),
+    ],
+)
+def test_v3_permissive_dispatch_check_variants_fail_runtime_compatibility(column, expression):
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_check_overrides={column: expression},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert f"constraint-missing-or-invalid:dispatch_requests.{column}" in result.detail
+
+
+def test_v3_not_valid_dispatch_check_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        dispatch_check_validated={"operation": False},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert "constraint-missing-or-invalid:dispatch_requests.operation" in result.detail
     assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
+
+
+def test_unversioned_v1_adoption_allows_only_expected_later_relation_absence():
+    remaining = schema._unversioned_v1_shape_issues(
+        [
+            "column-missing:actions.claim_receipt",
+            "column-missing:dispatch_requests.request_ref",
+            "constraint-missing-or-invalid:dispatch-requests-request-ref-unique",
+            "constraint-missing-or-invalid:dispatch_requests.operation",
+            "index-missing-or-invalid:dispatch-requests.created",
+            "column-type:actions.priority",
+            "column-unexpected:dispatch_requests.forged",
+        ]
+    )
+
+    assert remaining == [
+        "column-type:actions.priority",
+        "column-unexpected:dispatch_requests.forged",
+    ]
 
 
 def test_compatibility_rejects_valid_ledger_when_queue_shape_is_missing():
@@ -481,8 +622,8 @@ def test_sql_canonicalization_preserves_semantic_tokens():
 @pytest.mark.parametrize(
     ("applied", "state"),
     [
-        ({1: "wrong", 2: _packaged_checksums()[2]}, "checksum-mismatch"),
-        ({1: _packaged_checksums()[1], 2: _packaged_checksums()[2], 3: "future"}, "too-new"),
+        ({1: "wrong", 2: _packaged_checksums()[2], 3: _packaged_checksums()[3]}, "checksum-mismatch"),
+        ({1: _packaged_checksums()[1], 2: _packaged_checksums()[2], 3: _packaged_checksums()[3], 4: "future"}, "too-new"),
     ],
 )
 def test_compatibility_rejects_unsupported_schema(applied, state):
@@ -500,7 +641,7 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
     first = schema.migrate(conn, "aq")
     second = schema.migrate(conn, "aq")
 
-    assert first["applied_versions"] == [1, 2]
+    assert first["applied_versions"] == [1, 2, 3]
     assert second["applied_versions"] == []
     assert second["compatibility"]["compatible"] is True
     locks = [

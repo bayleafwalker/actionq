@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 2
+MAX_SCHEMA_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
@@ -52,6 +52,19 @@ _COLUMN_SHAPE = {
         "actor": ("text", "YES", None),
         "payload": ("jsonb", "NO", "'{}'::jsonb"),
     },
+    "dispatch_requests": {
+        "action_id": ("bigint", "NO", None),
+        "request_ref": ("text", "NO", None),
+        "normalized_snapshot": ("bytea", "NO", None),
+        "schema_version": ("text", "NO", None),
+        "canonicalization_version": ("text", "NO", None),
+        "request_sha256": ("text", "NO", None),
+        "identity": ("text", "NO", None),
+        "environment": ("text", "NO", None),
+        "operation": ("text", "NO", None),
+        "idempotency_key": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
 }
 _REQUIRED_COLUMNS = {
     table: set(columns) for table, columns in _COLUMN_SHAPE.items()
@@ -59,6 +72,7 @@ _REQUIRED_COLUMNS = {
 _REQUIRED_CONSTRAINT_COUNTS = {
     "actions": {"p": 1, "f": 1, "c": 1},
     "events": {"p": 1, "f": 1},
+    "dispatch_requests": {"p": 1, "f": 1, "u": 2, "c": 3},
 }
 _REQUIRED_INDEXES = {
     "actions.claim-lookup": (
@@ -79,6 +93,9 @@ _REQUIRED_INDEXES = {
         "events",
         (("event_type", False, False), ("timestamp", True, True)),
         None,
+    ),
+    "dispatch-requests.created": (
+        "dispatch_requests", (("created_at", False, False), ("action_id", False, False)), None,
     ),
 }
 
@@ -540,6 +557,22 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
                 foreign_columns=("id",),
             ),
         ),
+        ("dispatch-requests-primary-key", has_constraint("dispatch_requests", "p", ("action_id",))),
+        (
+            "dispatch-requests-action-foreign-key",
+            has_constraint(
+                "dispatch_requests", "f", ("action_id",),
+                foreign_namespace=schema,
+                foreign_table="actions",
+                foreign_oid=table_oids.get("actions"),
+                foreign_columns=("id",),
+            ),
+        ),
+        ("dispatch-requests-request-ref-unique", has_constraint("dispatch_requests", "u", ("request_ref",))),
+        (
+            "dispatch-requests-idempotency-binding-unique",
+            has_constraint("dispatch_requests", "u", ("identity", "environment", "operation", "idempotency_key")),
+        ),
     )
     for name, present in required_constraints:
         if not present:
@@ -570,6 +603,34 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
     )
     if len(status_checks) != 1 or actual_status_expression != expected_status_expression:
         issues.append("constraint-invalid:actions.status")
+    # These checks and uniqueness constraints make the v2 binding append-only
+    # in meaning: an Action cannot be rebound to another ref, digest, or
+    # idempotency owner by malformed schema drift.  Match the complete
+    # canonical expression: a permissive `OR true` is not an equivalent check.
+    dispatch_checks = [
+        constraint for constraint in constraints
+        if constraint["table"] == "dispatch_requests" and constraint["type"] == "c"
+    ]
+    required_dispatch_checks = {
+        "schema_version": "schema_version = 'v2'::text",
+        "request_sha256": "request_sha256 ~ '^[a-f0-9]{64}$'::text",
+        "operation": "operation = 'execution.dispatch.enqueue'::text",
+    }
+    for column, expected_expression in required_dispatch_checks.items():
+        actual = [
+            (
+                _without_redundant_outer_parentheses(constraint["expression"]),
+                constraint["is_validated"],
+            )
+            for constraint in dispatch_checks
+            if constraint["columns"] == (column,)
+        ]
+        if (
+            len(actual) != 1
+            or actual[0][0] != _without_redundant_outer_parentheses(expected_expression)
+            or actual[0][1] is not True
+        ):
+            issues.append(f"constraint-missing-or-invalid:dispatch_requests.{column}")
 
     index_rows = conn.execute(
         """
@@ -654,6 +715,27 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         ):
             issues.append(f"index-missing-or-invalid:{name}")
     return tuple(sorted(issues))
+
+
+def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[str]:
+    """Keep legacy-v1 adoption strict while allowing later packaged deltas.
+
+    An unledgered installation can legitimately contain only the v1 action and
+    event relations.  Claim receipts arrive in v2 and dispatch bindings in v3;
+    their *absence* must not prevent migration 1 from recording the pre-v2
+    baseline.  Any malformed existing v3 relation remains a refusal.
+    """
+    expected_later_absence = (
+        "column-missing:actions.claim_receipt",
+        "column-missing:dispatch_requests.",
+        "constraint-missing-or-invalid:dispatch-requests-",
+        "constraint-missing-or-invalid:dispatch_requests.",
+        "index-missing-or-invalid:dispatch-requests.created",
+    )
+    return [
+        issue for issue in issues
+        if not issue.startswith(expected_later_absence)
+    ]
 
 
 def check_compatibility(
@@ -789,6 +871,13 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
             role_identifier,
         )
     )
+    # The byte-exact dispatch snapshot is append-only.  Runtime code can bind
+    # it once and read it, but cannot replace or erase it after enqueue.
+    conn.execute(
+        sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+            schema_identifier, sql.Identifier("dispatch_requests"), role_identifier
+        )
+    )
     conn.execute(
         sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
             schema_identifier,
@@ -873,10 +962,7 @@ def migrate(
                 # added by v2.  It may be adopted only when that is its sole
                 # difference; all other drift remains a refusal before any
                 # migration ledger is stamped.
-                shape_issues = [
-                    issue for issue in shape_issues
-                    if issue != "column-missing:actions.claim_receipt"
-                ]
+                shape_issues = _unversioned_v1_shape_issues(shape_issues)
                 if shape_issues:
                     raise SchemaMigrationError(
                         "refusing to stamp incompatible unversioned actionq schema: "
