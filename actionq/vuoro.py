@@ -110,17 +110,17 @@ _DECISION_RESULT_SCHEMA = _object(
     {"decision": _DECISION_SCHEMA, "result": {}},
     required=("decision", "result"),
 )
-_DISPATCH_V2_RESULT_SCHEMA = _object({"action_id": {"type": "integer"}, "status": {"const": "pending"}, "request_ref": {"type": "string", "minLength": 1}, "request_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}, required=("action_id", "status", "request_ref", "request_sha256"))
+_DISPATCH_V2_RESULT_SCHEMA = _object({"action_id": {"type": ["integer", "string"], "minLength": 1}, "status": {"const": "pending"}, "request_ref": {"type": "string", "minLength": 1}, "request_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}, required=("action_id", "status", "request_ref", "request_sha256"))
 _DISPATCH_V2_INPUT_SCHEMA = _object(
     {
         "contract_version": {"const": "v2"}, "action_type": {"const": "scope-iterate"},
         "output_expectation": {"enum": ["plan", "audit-event", "draft-work-items", "sprint-proposal", "implementation", "review"]},
-        "repo_id": {"type": "string", "minLength": 1}, "sprint_id": {"type": ["integer", "null"]},
-        "work_item_id": _NULLABLE_STRING, "title": {"type": "string", "minLength": 1},
+        "repo_id": {"type": "string", "minLength": 1, "pattern": "^(?!ALL$).+"}, "sprint_id": {"type": ["integer", "null"], "minimum": 1},
+        "work_item_id": {"type": ["string", "null"], "minLength": 1}, "title": {"type": "string", "minLength": 1},
         "prompt": {"type": "string"}, "harness": {"enum": ["claude", "codex", "copilot-cli", "codestral"]},
-        "model": _NULLABLE_STRING, "priority": {"enum": ["normal", "high"]},
+        "model": {"type": ["string", "null"], "minLength": 1}, "priority": {"enum": ["normal", "high"]},
         "refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "dispatch_group_id": _NULLABLE_STRING,
+        "dispatch_group_id": {"type": ["string", "null"], "minLength": 1},
     },
     required=("contract_version", "action_type", "output_expectation", "repo_id", "sprint_id", "work_item_id", "title", "prompt", "harness", "model", "priority", "refs", "dispatch_group_id"),
 )
@@ -167,6 +167,7 @@ def _provenance(context: Any, *, operation: str) -> InvocationProvenance:
         catalog_revision=context.catalog_revision,
         basis_revision=context.basis_revision,
         idempotency_key=context.idempotency_key or "",
+        authorized_repositories=tuple(getattr(identity, "authorized_repositories", ())),
     )
 
 

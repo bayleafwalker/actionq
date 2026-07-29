@@ -20,6 +20,25 @@ CONTRACT_VERSION = "v1"
 V2_CONTRACT_VERSION = "v2"
 
 
+class AuthenticatedDispatchIdentity:
+    """Trusted upstream result; request headers never define an identity."""
+    def __init__(self, actor: str, environment: str, repositories: tuple[str, ...]):
+        self.actor, self.environment, self.repositories = actor, environment, repositories
+
+
+def _no_authenticator(_headers) -> AuthenticatedDispatchIdentity:
+    raise _db.ActionQError("v2 dispatch authentication is not configured")
+
+
+_served_authenticator = _no_authenticator
+
+
+def set_served_authenticator_for_testing(authenticator) -> None:
+    """Inject a trusted middleware bridge in tests or deployment composition."""
+    global _served_authenticator
+    _served_authenticator = authenticator
+
+
 def _schema() -> str:
     return os.environ.get("ACTIONQ_SCHEMA", "actionq")
 
@@ -40,17 +59,23 @@ def _dispatch(payload: dict) -> dict:
 
 
 def _request_provenance(headers) -> InvocationProvenance:
-    """HTTP identity is an integration hook, not an authentication provider."""
-    actor = headers.get("x-actionq-actor", "").strip()
-    environment = headers.get("x-actionq-environment", "").strip()
+    identity = _served_authenticator(headers)
     key = headers.get("idempotency-key", "").strip()
-    if not actor or not environment or not key:
-        raise _db.ActionQError("v2 enqueue requires authenticated actor, environment, and Idempotency-Key")
-    return InvocationProvenance(actor=actor, environment=environment, request_id=headers.get("x-request-id", key), catalog_revision="http-v2", idempotency_key=key)
+    if not identity.actor or not identity.environment or not identity.repositories or not key:
+        raise _db.ActionQError("v2 enqueue requires authenticated repository-scoped identity and Idempotency-Key")
+    return InvocationProvenance(actor=identity.actor, environment=identity.environment, request_id=headers.get("x-request-id", key), catalog_revision="http-v2", idempotency_key=key, authorized_repositories=tuple(identity.repositories))
+
+
+def _served_authorizer(provenance: InvocationProvenance, resource: str, _verb: str) -> bool:
+    prefix = "execution.dispatch.repo:"
+    return resource.startswith(prefix) and resource[len(prefix):] in provenance.authorized_repositories
 
 
 def _dispatch_v2(payload: dict, headers) -> dict:
-    return ActionQApplication(schema=_schema()).enqueue_dispatch_v2(payload, provenance=_request_provenance(headers))
+    if "requested_by" in payload:
+        raise _db.ActionQError("requested_by is derived from authenticated identity and must not be supplied")
+    provenance = _request_provenance(headers)
+    return ActionQApplication(schema=_schema(), authorizer=_served_authorizer).enqueue_dispatch_v2({**payload, "requested_by": provenance.actor}, provenance=provenance)
 
 
 def _sessions(query_string: str) -> list:
@@ -94,14 +119,17 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         action_match = re.fullmatch(r"/v2/dispatch/actions/(\d+)", parsed.path)
         changes_match = re.fullmatch(r"/v2/dispatch/actions/(\d+)/changes", parsed.path)
-        if action_match or changes_match:
+        request_match = re.fullmatch(r"/v2/dispatch/requests/(req:[A-Za-z0-9_-]+)", parsed.path)
+        if action_match or changes_match or request_match:
             try:
                 provenance = _request_provenance(self.headers)
                 params = parse_qs(parsed.query or "")
                 if changes_match:
-                    body = ActionQApplication(schema=_schema()).dispatch_action_changes(int(changes_match.group(1)), cursor=params.get("cursor", [None])[0], wait_seconds=min(int(params.get("wait_seconds", ["0"])[0]), 30), provenance=provenance)
+                    body = ActionQApplication(schema=_schema(), authorizer=_served_authorizer).dispatch_action_changes(int(changes_match.group(1)), cursor=params.get("cursor", [None])[0], wait_seconds=min(int(params.get("wait_seconds", ["0"])[0]), 30), provenance=provenance)
+                elif request_match:
+                    body = ActionQApplication(schema=_schema(), authorizer=_served_authorizer).resolve_dispatch_request(request_match.group(1), provenance=provenance)
                 else:
-                    body = ActionQApplication(schema=_schema()).dispatch_action_snapshot(int(action_match.group(1)), provenance=provenance)
+                    body = ActionQApplication(schema=_schema(), authorizer=_served_authorizer).dispatch_action_snapshot(int(action_match.group(1)), provenance=provenance)
                 self._send_json(200, body)
             except (ValueError, _db.ActionQError) as exc:
                 self._send_json(400, {"error": str(exc)})

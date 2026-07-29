@@ -17,6 +17,7 @@
   "consistency": {"target": "linearizable", "object": "identity-environment-operation-idempotency-key"},
   "invariants": ["identical-normalized-bytes-return-one-action-binding", "different-bytes-conflict-without-second-action", "queued-action-has-no-session", "snapshot-bytes-and-sha256-are-immutable", "cursor-expiry-requires-snapshot", "wait-is-bounded-at-30-seconds"],
   "faults": ["crash-after-commit-before-response", "event-retention-before-resume", "authorization-denial"],
+  "limitations": ["No event-retention worker/configuration is introduced in Stage B. cursor_expired behavior is implemented for externally retained events, but deterministic retention integration verification remains unavailable until that owner supplies a retention mechanism and this environment has disposable PostgreSQL binaries."],
   "oracles": ["database-binding-query", "response-shape", "event-history"],
   "implementation_anchors": ["actionq/application.py:enqueue_dispatch_v2", "actionq/application.py:dispatch_action_changes", "actionq/migrations/003_dispatch_request_v2.sql"],
   "expansions": ["stateful-test", "fault-scenario"]
