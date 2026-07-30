@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1225,8 +1226,11 @@ class Daemon:
                     # credentials remain with that identity.  Preserve only
                     # the reviewed OpenCode policy path; do not pass the
                     # coordinator environment through the privilege boundary.
+                    sudo_bin = shutil.which("sudo")
+                    if sudo_bin is None:
+                        raise RuntimeError("contained worker requires an approved sudo executable")
                     command = [
-                        "sudo", "-n", "-H",
+                        sudo_bin, "-n", "-H",
                         f"--preserve-env=OPENCODE_CONFIG",
                         "-u", action.worker_user, "--",
                         *command,

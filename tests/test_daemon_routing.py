@@ -226,6 +226,7 @@ def test_scope_iterate_worker_runs_through_contained_identity(tmp_path: Path, mo
         return Child()
 
     monkeypatch.setattr("actionq.daemon.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("actionq.daemon.shutil.which", lambda name: "/run/wrappers/bin/sudo" if name == "sudo" else None)
     class Adapter:
         def build_command(self, _invocation):
             return ["/run/current-system/sw/bin/opencode", "run"]
@@ -241,6 +242,6 @@ def test_scope_iterate_worker_runs_through_contained_identity(tmp_path: Path, mo
     daemon._start_child(action, project=project, routing=routing, prompt="work")
 
     assert captured["command"][:7] == [
-        "sudo", "-n", "-H", "--preserve-env=OPENCODE_CONFIG", "-u", "agentworker", "--",
+        "/run/wrappers/bin/sudo", "-n", "-H", "--preserve-env=OPENCODE_CONFIG", "-u", "agentworker", "--",
     ]
     assert captured["env"] == {"OPENCODE_CONFIG": "/etc/agentops/opencode.actionq-worker.json"}
