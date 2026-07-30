@@ -7,8 +7,10 @@ artifact and the invariants that make it safe to hand to a worker.
 from __future__ import annotations
 
 import fnmatch
+import grp
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -90,6 +92,7 @@ class ScopeIteratePolicy:
     test_command: tuple[str, ...] = ("pytest",)
     branch_prefix: str = "agent/scope-iterate"
     fake_commit_path: str = "docs/actionq-dispatch-smoke.md"
+    shared_group: str | None = None
 
     def __post_init__(self) -> None:
         if not self.worktree_root.is_absolute():
@@ -101,6 +104,10 @@ class ScopeIteratePolicy:
         _validate_relative_path(self.fake_commit_path, field="fake_commit_path")
         if not self.branch_prefix or self.branch_prefix.startswith(("/", "-")):
             raise PolicyError("branch_prefix must be a safe relative Git ref prefix")
+        if self.shared_group is not None and not re.fullmatch(
+            r"[a-z_][a-z0-9_-]*[$]?", self.shared_group
+        ):
+            raise PolicyError("shared_group must be a safe local group name")
 
 
 @dataclass(frozen=True)
@@ -155,7 +162,7 @@ def load_policy(raw: Mapping[str, Any], *, config_dir: Path) -> ScopeIteratePoli
     allowed = {
         "worktree_root", "prompt_template", "path_allow", "path_deny",
         "allowed_tools", "bash_allow", "bash_deny", "network",
-        "test_command", "branch_prefix", "fake_commit_path",
+        "test_command", "branch_prefix", "fake_commit_path", "shared_group",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -199,6 +206,7 @@ def load_policy(raw: Mapping[str, Any], *, config_dir: Path) -> ScopeIteratePoli
         test_command=test_argv,
         branch_prefix=str(raw.get("branch_prefix", "agent/scope-iterate")),
         fake_commit_path=str(raw.get("fake_commit_path", "docs/actionq-dispatch-smoke.md")),
+        shared_group=(str(raw["shared_group"]) if raw.get("shared_group") is not None else None),
     )
 
 
@@ -261,7 +269,7 @@ class ScopeIterateKernel:
         )
         self._run(worktree, ("git", "remote", "remove", "origin"))
         self._run(worktree, ("git", "config", "core.fileMode", "false"))
-        self._share_with_group(worktree)
+        self._share_with_group(worktree, policy.shared_group)
 
         try:
             prompt = self._render_prompt(request, policy, worktree, branch)
@@ -271,12 +279,24 @@ class ScopeIterateKernel:
         return PreparedScopeIterate(request, policy, worktree, branch, base_sha, prompt)
 
     @staticmethod
-    def _share_with_group(worktree: Path) -> None:
+    def _share_with_group(worktree: Path, shared_group: str | None) -> None:
         """Make the disposable clone writable by its inherited shared group."""
+        shared_gid: int | None = None
+        if shared_group is not None:
+            try:
+                shared_gid = grp.getgrnam(shared_group).gr_gid
+            except KeyError as exc:
+                raise PolicyError(f"shared_group does not exist: {shared_group}") from exc
+            if shared_gid not in os.getgroups():
+                raise PolicyError(
+                    f"coordinator is not a member of shared_group: {shared_group}"
+                )
         for path in (worktree, *worktree.rglob("*")):
             mode = path.lstat().st_mode
             if stat.S_ISLNK(mode):
                 continue
+            if shared_gid is not None:
+                os.chown(path, -1, shared_gid)
             path.chmod(stat.S_IMODE(mode) | stat.S_IWGRP)
 
     def verify(self, prepared: PreparedScopeIterate) -> VerificationResult:

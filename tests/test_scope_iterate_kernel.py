@@ -150,10 +150,25 @@ def test_load_policy_requires_explicit_production_boundaries(tmp_path):
         ],
         "network": "none",
         "test_command": ["pytest", "-q"],
+        "shared_group": "agentdispatch",
     }, config_dir=tmp_path)
 
     assert parsed.worktree_root == (tmp_path / "state/worktrees").resolve()
     assert parsed.test_command == ("pytest", "-q")
+    assert parsed.shared_group == "agentdispatch"
+
+
+def test_policy_rejects_unsafe_shared_group(tmp_path):
+    with pytest.raises(PolicyError, match="shared_group"):
+        ScopeIteratePolicy(
+            worktree_root=tmp_path.resolve(),
+            prompt_template=(tmp_path / "prompt.md").resolve(),
+            path_acl=PathACL(
+                ("**",),
+                (".git/**", ".sprintctl/**", "secrets/**", "**/.env", "**/.env.*"),
+            ),
+            shared_group="../../root",
+        )
 
 
 def test_invalid_prompt_is_rejected_but_artifact_is_preserved(tmp_path):
