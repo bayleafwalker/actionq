@@ -192,6 +192,7 @@ class TakeupClient(Protocol):
 
 class ContextClient(Protocol):
     def fetch(self, project: ProjectConfig, *, item_id: int | None, limit: int) -> dict[str, Any]: ...
+    def fetch_item(self, project: ProjectConfig, *, item_id: int) -> dict[str, Any]: ...
 
 
 class ClaimClient(Protocol):
@@ -316,6 +317,27 @@ class SprintctlContextClient:
             detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl context-candidates failed"
             raise RuntimeError(detail)
         return json.loads(completed.stdout)
+
+    def fetch_item(self, project: ProjectConfig, *, item_id: int) -> dict[str, Any]:
+        environment = os.environ.copy()
+        environment.update(project.env or {})
+        completed = subprocess.run(
+            [self.executable, "item", "show", "--id", str(item_id), "--json"],
+            cwd=project.path,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl item show failed"
+            raise RuntimeError(detail)
+        packet = json.loads(completed.stdout)
+        item = packet.get("item")
+        if not isinstance(item, dict) or int(item.get("id", 0)) != item_id:
+            raise RuntimeError("sprintctl item show returned a mismatched item")
+        return item
 
 
 class SprintctlClaimClient:
@@ -766,7 +788,12 @@ class Daemon:
         if action_config.runner == "scope-iterate":
             assert project is not None and action_config.scope_iterate is not None
             try:
-                target_item = self._exact_target_item(action, context_result)
+                self._exact_target_item(action, context_result)
+                target_item_id = int(action["target_ref"])
+                target_item = self.context_client.fetch_item(
+                    project, item_id=target_item_id
+                )
+                target_item = {**target_item, "claim_eligible": True}
                 prepared_scope = ScopeIterateKernel().prepare(
                     ScopeIterateRequest(
                         action_id=action_id,
