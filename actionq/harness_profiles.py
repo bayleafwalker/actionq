@@ -28,7 +28,7 @@ KNOWN_PROFILES = {
         harness="opencode",
         provider="opencode-go",
         semantic_adapter="opencode-noninteractive/v1",
-        qualification_state="preflight_observed",
+        qualification_state="qualified",
         worker_user="agentworker",
     ),
 }

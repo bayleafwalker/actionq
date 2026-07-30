@@ -12,9 +12,11 @@ def _routing() -> RoutingResult:
     )
 
 
-def test_provider_profile_fails_closed_until_qualified():
-    with pytest.raises(RoutingError, match="not qualified"):
-        validate_harness_profile("opencode-nixpkgs-devbox-1.18.4", _routing(), worker_user="agentworker")
+def test_qualified_provider_profile_is_accepted_for_its_contained_identity():
+    profile = validate_harness_profile(
+        "opencode-nixpkgs-devbox-1.18.4", _routing(), worker_user="agentworker"
+    )
+    assert profile.qualification_state == "qualified"
 
 
 def test_unknown_provider_profile_is_rejected():
