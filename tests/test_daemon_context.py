@@ -24,16 +24,29 @@ from tests.test_daemon import FakeClient
 
 
 class FakeContext:
-    def __init__(self, packet=None, fail: bool = False):
+    def __init__(self, packet=None, fail: bool = False, item=None):
         self.calls = []
+        self.item_calls = []
         self.packet = packet
         self.fail = fail
+        self.item = item
 
     def fetch(self, project, *, item_id, limit):
         self.calls.append((project, item_id, limit))
         if self.fail:
             raise RuntimeError("sprintctl context-candidates: connection refused")
         return self.packet
+
+    def fetch_item(self, project, *, item_id):
+        self.item_calls.append((project, item_id))
+        if self.fail:
+            raise RuntimeError("sprintctl item show: connection refused")
+        return self.item or {
+            "id": item_id,
+            "title": "Exact item",
+            "description": "Implement the exact requested change.",
+            "status": "pending",
+        }
 
 
 class FakeClaim:
@@ -173,7 +186,15 @@ def test_scope_iterate_claims_exact_target_branch_and_settles_verified_commit(tm
         "id": 142, "action_type": "scope-iterate", "project": "demo",
         "target_ref": "5", "harness": "codex", "model": "test-model",
     })
-    context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
+    context = FakeContext(
+        _packet(explicit_item_id=5, found=True, eligible_rank1=True),
+        item={
+            "id": 5,
+            "title": "Exact item",
+            "description": "Create the governed smoke artifact.",
+            "status": "pending",
+        },
+    )
     claim = FakeClaim()
     daemon = Daemon(
         DaemonConfig(
@@ -193,7 +214,10 @@ def test_scope_iterate_claims_exact_target_branch_and_settles_verified_commit(tm
         context_client=context, claim_client=claim,
     )
 
+    captured = {}
+
     def start_child(_action, *, project, **_kwargs):
+        captured["prompt"] = _kwargs["prompt"]
         script = (
             "from pathlib import Path; import subprocess; "
             "p=Path('docs/unit-b.md'); p.parent.mkdir(parents=True, exist_ok=True); "
@@ -210,7 +234,10 @@ def test_scope_iterate_claims_exact_target_branch_and_settles_verified_commit(tm
     daemon._start_child = start_child
     assert daemon.run_once() is True
 
+    assert not client.failed, client.failed
     assert claim.calls[0][1] == 5
+    assert context.item_calls[0][1] == 5
+    assert "Create the governed smoke artifact." in captured["prompt"]
     assert claim.calls[0][4] == "agent/scope-iterate/142"
     assert len(claim.release_calls) == 1
     assert client.completed
