@@ -55,6 +55,10 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
         "execution.dispatch.enqueue",
         "execution.dispatch.enqueue.v1",
         "execution.dispatch.list",
+        "execution.group.realize",
+        "execution.group.stop-new-claims",
+        "execution.group.show",
+        "execution.group.list",
     }
     assert not any("migrate" in name for name in names)
     for definition in catalog:

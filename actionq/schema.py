@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 4
+MAX_SCHEMA_VERSION = 5
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
@@ -73,6 +73,27 @@ _COLUMN_SHAPE = {
         "idempotency_key": ("text", "NO", None),
         "created_at": ("timestamp with time zone", "NO", "now()"),
     },
+    "execution_groups": {
+        "id": ("uuid", "NO", None),
+        "plan_ref": ("text", "NO", None),
+        "spec_sha256": ("text", "NO", None),
+        "spec_snapshot": ("bytea", "NO", None),
+        "max_parallel": ("integer", "NO", None),
+        "failure_policy": ("text", "NO", None),
+        "claim_state": ("text", "NO", "'active'::text"),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+        "created_by": ("text", "NO", None),
+        "stopped_at": ("timestamp with time zone", "YES", None),
+        "stopped_by": ("text", "YES", None),
+        "stop_reason": ("text", "YES", None),
+    },
+    "execution_group_members": {
+        "group_id": ("uuid", "NO", None),
+        "action_id": ("bigint", "NO", None),
+        "ordinal": ("integer", "NO", None),
+        "envelope_digest": ("text", "NO", None),
+        "envelope_snapshot": ("bytea", "NO", None),
+    },
 }
 _REQUIRED_COLUMNS = {
     table: set(columns) for table, columns in _COLUMN_SHAPE.items()
@@ -81,6 +102,8 @@ _REQUIRED_CONSTRAINT_COUNTS = {
     "actions": {"p": 1, "f": 1, "c": 1},
     "events": {"p": 1, "f": 1},
     "dispatch_requests": {"p": 1, "f": 1, "u": 2, "c": 3},
+    "execution_groups": {"p": 1, "u": 2, "c": 3},
+    "execution_group_members": {"p": 1, "f": 2, "u": 2, "c": 1},
 }
 _REQUIRED_INDEXES = {
     "actions.claim-lookup": (
@@ -104,6 +127,12 @@ _REQUIRED_INDEXES = {
     ),
     "dispatch-requests.created": (
         "dispatch_requests", (("created_at", False, False), ("action_id", False, False)), None,
+    ),
+    "execution-group-members.group": (
+        "execution_group_members", (("group_id", False, False),), None,
+    ),
+    "execution-group-members.action": (
+        "execution_group_members", (("action_id", False, False),), None,
     ),
 }
 
@@ -581,6 +610,39 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
             "dispatch-requests-idempotency-binding-unique",
             has_constraint("dispatch_requests", "u", ("identity", "environment", "operation", "idempotency_key")),
         ),
+        ("execution-groups-primary-key", has_constraint("execution_groups", "p", ("id",))),
+        ("execution-groups-plan-ref-unique", has_constraint("execution_groups", "u", ("plan_ref",))),
+        ("execution-groups-spec-sha256-unique", has_constraint("execution_groups", "u", ("spec_sha256",))),
+        (
+            "execution-group-members-primary-key",
+            has_constraint("execution_group_members", "p", ("group_id", "action_id")),
+        ),
+        (
+            "execution-group-members-group-foreign-key",
+            has_constraint(
+                "execution_group_members", "f", ("group_id",),
+                foreign_namespace=schema, foreign_table="execution_groups",
+                foreign_oid=table_oids.get("execution_groups"), foreign_columns=("id",),
+                delete_action="r",
+            ),
+        ),
+        (
+            "execution-group-members-action-foreign-key",
+            has_constraint(
+                "execution_group_members", "f", ("action_id",),
+                foreign_namespace=schema, foreign_table="actions",
+                foreign_oid=table_oids.get("actions"), foreign_columns=("id",),
+                delete_action="r",
+            ),
+        ),
+        (
+            "execution-group-members-action-unique",
+            has_constraint("execution_group_members", "u", ("action_id",)),
+        ),
+        (
+            "execution-group-members-ordinal-unique",
+            has_constraint("execution_group_members", "u", ("group_id", "ordinal")),
+        ),
     )
     for name, present in required_constraints:
         if not present:
@@ -640,6 +702,27 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
             or actual[0][1] is not True
         ):
             issues.append(f"constraint-missing-or-invalid:dispatch_requests.{column}")
+
+    required_group_checks = {
+        ("execution_groups", "max_parallel"): "max_parallel >= 1 AND max_parallel <= 32",
+        ("execution_groups", "failure_policy"): "failure_policy = 'continue-independent'::text",
+        ("execution_groups", "claim_state"): "claim_state = ANY (ARRAY['active'::text, 'stopped'::text])",
+        ("execution_group_members", "ordinal"): "ordinal >= 0",
+    }
+    for (table, column), expected_expression in required_group_checks.items():
+        actual = [
+            (_without_redundant_outer_parentheses(constraint["expression"]), constraint["is_validated"])
+            for constraint in constraints
+            if constraint["table"] == table
+            and constraint["type"] == "c"
+            and constraint["columns"] == (column,)
+        ]
+        if (
+            len(actual) != 1
+            or actual[0][0] != _without_redundant_outer_parentheses(expected_expression)
+            or actual[0][1] is not True
+        ):
+            issues.append(f"constraint-missing-or-invalid:{table}.{column}")
 
     index_rows = conn.execute(
         """
@@ -748,6 +831,13 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
         "constraint-missing-or-invalid:dispatch-requests-",
         "constraint-missing-or-invalid:dispatch_requests.",
         "index-missing-or-invalid:dispatch-requests.created",
+        "column-missing:execution_groups.",
+        "column-missing:execution_group_members.",
+        "constraint-missing-or-invalid:execution-groups-",
+        "constraint-missing-or-invalid:execution-group-members-",
+        "constraint-missing-or-invalid:execution_groups.",
+        "constraint-missing-or-invalid:execution_group_members.",
+        "index-missing-or-invalid:execution-group-members.",
     )
     return [
         issue for issue in issues
@@ -914,6 +1004,16 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
     conn.execute(
         sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
             schema_identifier, sql.Identifier("dispatch_requests"), role_identifier
+        )
+    )
+    conn.execute(
+        sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
+            schema_identifier, sql.Identifier("execution_groups"), role_identifier
+        )
+    )
+    conn.execute(
+        sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+            schema_identifier, sql.Identifier("execution_group_members"), role_identifier
         )
     )
     conn.execute(

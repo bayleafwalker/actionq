@@ -108,3 +108,24 @@ or unreconciled attempts remain quarantined.
 
 Provider-backed model calls, allowlisted HTTPS egress, Kubernetes Jobs, image
 registry rollout, and generalized scheduling are not part of this proof.
+
+## Bounded execution groups
+
+`execution-group/v1` is an immutable projection over ordinary pending ActionQ
+actions. A coordinator realizes a content-addressed plan once, preserving the
+exact released `execution-envelope/v1` bytes and digest for every ordered
+member. Reusing the same `plan_ref` with the identical canonical specification
+returns the existing group; any different specification is rejected.
+
+The pilot controls are limited to `max_parallel` (1 through 32),
+`continue-independent`, and permanent `stop-new-claims`. Claims serialize on
+the group row before capacity is admitted. Stopping leaves pending members
+pending but unclaimable; it neither interrupts already claimed members nor
+changes their ordinary terminal settlement. Swept or requeued members remain
+fenced after a stop.
+
+Groups do not define dependencies, ordering, retries, rollback, group-wide
+cancellation, or a group terminal result. Sprintctl remains authoritative for
+plan dependencies, readiness, and acceptance. Group reads expose member
+identity, status, and envelope digests, never frozen envelope bytes or claim
+credentials.
