@@ -69,14 +69,15 @@ class PublicationDaemon(Daemon):
     def _runnerctl_json(self, *args, input_value=None):
         self.commands.append((args, input_value))
         if args[0] == "journal-recover":
-            return self.recovered
+            return (publication() if self.recovered == "complete-unregistered" else self.recovered)
         if args[0] == "settlement-query":
             return None
         if args[0] == "journal-list":
             return ([{"action_id": 2032, "attempt_id": "attempt-old",
                       "status": "incomplete", "latest_stage": "bundle",
                       "source_commit": "b" * 40, "candidate_commit": "c" * 40}]
-                    if self.recovered == "incomplete" else [])
+                    if self.recovered == "incomplete" else
+                    ([publication()] if self.recovered == "complete-unregistered" else []))
         if args[0] == "journal-resume":
             return publication()
         if args[0] in {"settlement-ack", "publish"}:
@@ -139,16 +140,22 @@ def test_daemon_restart_resumes_exact_interrupted_attempt_without_packet():
     assert resume_args[-2:] == ("--attempt-id", "attempt-old")
 
 
-def test_fresh_daemon_claim_resumes_registers_and_settles_without_harness():
+@pytest.mark.parametrize("journal_state,expected_command", [
+    ("incomplete", "journal-resume"),
+    ("complete-unregistered", "journal-recover"),
+])
+def test_fresh_daemon_claim_resumes_registers_and_settles_without_harness(
+    journal_state, expected_command,
+):
     client = Client()
     client.frozen.append({"event_type": "runner.contract.frozen", "payload": {"contract": {
         "attempt_id": "attempt-old", "source_commit": "b" * 40,
     }}})
-    daemon = PublicationDaemon(client, recovered="incomplete")
+    daemon = PublicationDaemon(client, recovered=journal_state)
     action = {"id": 2032, "action_type": "scope-iterate",
               "claim_receipt": "new-live-receipt"}
     assert daemon._resume_and_settle_interrupted_publication(action) is True
-    assert [args[0] for args, _ in daemon.commands][:2] == ["journal-list", "journal-resume"]
+    assert [args[0] for args, _ in daemon.commands][:2] == ["journal-list", expected_command]
     assert len(client.registered) == 1
     assert client.completed == [(2032, JOURNAL_REF, "runner:devbox", "new-live-receipt")]
     assert client.reconciled == [(2032, "attempt-old")]

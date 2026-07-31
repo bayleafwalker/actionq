@@ -247,7 +247,10 @@ def test_publication_registration_and_cancellation_serialize_on_action_row(
     assert len(registrations) == (1 if history == "register-then-cancel" else 0)
 
 
-def test_reclaimed_claim_resumes_registers_and_settles_real_postgres(signed_runner_proof):
+@pytest.mark.parametrize("journal_state", ("incomplete", "complete-unregistered"))
+def test_reclaimed_claim_resumes_registers_and_settles_real_postgres(
+    signed_runner_proof, journal_state,
+):
     """Durable journal + ActionQ history suffice; no prior daemon state or packet."""
     schema = _schema()
     action, old_claim = _publication_fixture(schema)
@@ -309,8 +312,11 @@ def test_reclaimed_claim_resumes_registers_and_settles_real_postgres(signed_runn
     class RecoveryDaemon(Daemon):
         def _runnerctl_json(self, *args, input_value=None):
             if args[0] == "journal-list":
-                return [{**publication, "status": "incomplete", "latest_stage": "objects"}]
+                return ([{**publication, "status": "incomplete", "latest_stage": "objects"}]
+                        if journal_state == "incomplete" else [publication])
             if args[0] == "journal-resume":
+                return publication
+            if args[0] == "journal-recover":
                 return publication
             if args[0] == "settlement-ack":
                 return {"ok": True}

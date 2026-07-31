@@ -881,20 +881,27 @@ class Daemon:
             for event in history.get("events", [])
             if event.get("event_type") == "runner.contract.frozen"
         }
+        registered_attempts = {
+            (event.get("payload", {}).get("attempt_id"),
+             event.get("payload", {}).get("journal_ref"))
+            for event in history.get("events", [])
+            if event.get("event_type") == "publication.registered"
+        }
         attempts = self._runnerctl_json(
             "journal-list", "--artifact-root", str(self.config.artifact_root),
             "--action-id", str(action["id"]),
         )
         interrupted = next(
             (value for value in attempts
-             if value.get("status") == "incomplete"
-             and (value.get("attempt_id"), value.get("source_commit")) in frozen),
+             if (value.get("attempt_id"), value.get("source_commit")) in frozen
+             and (value.get("attempt_id"), value.get("journal_ref")) not in registered_attempts),
             None,
         )
         if interrupted is None:
             return False
+        command = "journal-resume" if interrupted.get("status") == "incomplete" else "journal-recover"
         publication = self._runnerctl_json(
-            "journal-resume", "--artifact-root", str(self.config.artifact_root),
+            command, "--artifact-root", str(self.config.artifact_root),
             "--action-id", str(action["id"]), "--attempt-id", str(interrupted["attempt_id"]),
         )
         receipt = str(action.get("claim_receipt") or "")
