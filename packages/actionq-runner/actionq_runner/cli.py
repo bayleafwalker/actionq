@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .identity import sign_runner_request, verify_runner_request
 from .executor import execute
+from .oci import oci_execute, oci_preflight
 from .publisher import acknowledge_settlement, list_publications, publish, query_settlement, recover_publication, resume_publication
 from .staging import mark_reconciled, open_staging
 
@@ -20,6 +21,10 @@ def main() -> None:
     sign.add_argument("--resource", required=True)
     sign.add_argument("--request-id", required=True)
     commands.add_parser("execute")
+    oci_preflight_command = commands.add_parser("oci-preflight")
+    oci_preflight_command.add_argument("--engine", required=True)
+    oci_execute_command = commands.add_parser("oci-execute")
+    oci_execute_command.add_argument("--packet-stdin", action="store_true", required=True)
     publish_command = commands.add_parser("publish")
     publish_command.add_argument("--packet-stdin", action="store_true", required=True)
     journal_list = commands.add_parser("journal-list")
@@ -44,6 +49,13 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "execute":
         raise SystemExit(execute(json.load(__import__("sys").stdin)))
+    if args.command == "oci-preflight":
+        print(json.dumps(oci_preflight(args.engine), sort_keys=True, separators=(",", ":")))
+        return
+    if args.command == "oci-execute":
+        result = oci_execute(json.load(__import__("sys").stdin))
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        raise SystemExit(int(result["exit_code"]))
     if args.command == "publish":
         print(json.dumps(publish(json.load(__import__("sys").stdin)), sort_keys=True, separators=(",", ":")))
         return

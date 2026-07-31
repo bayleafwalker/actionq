@@ -29,6 +29,7 @@ SESSION_EVENT_TYPES = (
     "settlement.actionq_skipped_claim_lost",
     "publication.available",
     "publication.settled",
+    "workspace.destroyed",
 )
 
 
