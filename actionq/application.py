@@ -405,7 +405,7 @@ class ActionQApplication:
         )
 
     def list_actions(self, **filters: Any) -> list[dict[str, Any]]:
-        return self._read(lambda conn: db.list_actions(conn, self.schema, **filters))
+        return self._read(lambda conn: [db.redact_action(row) for row in db.list_actions(conn, self.schema, **filters)])
 
     def show_action(self, action_id: int) -> dict[str, Any] | None:
         def read(conn):
@@ -413,7 +413,7 @@ class ActionQApplication:
             if action is None:
                 return None
             return {
-                "action": action,
+                "action": db.redact_action(action),
                 "events": db.action_events(conn, self.schema, action_id),
             }
 
@@ -454,7 +454,7 @@ class ActionQApplication:
                 "action_id": action_id,
                 "worker": worker,
                 "timeout_minutes": timeout_minutes,
-                "claim_receipt": claim_receipt,
+                "claim_receipt_digest": db.receipt_digest(claim_receipt),
             },
             provenance=provenance,
             mutation=lambda conn, event_provenance: db.renew(
@@ -498,7 +498,7 @@ class ActionQApplication:
             operation="execution.action.complete",
             action_id=action_id,
             actor=actor,
-            arguments={"result_ref": result_ref, "claim_receipt": claim_receipt},
+            arguments={"result_ref": result_ref, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.complete(
                 conn,
@@ -525,7 +525,7 @@ class ActionQApplication:
             operation="execution.action.fail",
             action_id=action_id,
             actor=actor,
-            arguments={"reason": reason, "claim_receipt": claim_receipt},
+            arguments={"reason": reason, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.fail(
                 conn,
@@ -553,7 +553,7 @@ class ActionQApplication:
             operation="execution.action.reject",
             action_id=action_id,
             actor=actor,
-            arguments={"reason": reason, "validator": validator, "claim_receipt": claim_receipt},
+            arguments={"reason": reason, "validator": validator, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.reject(
                 conn,
@@ -602,21 +602,22 @@ class ActionQApplication:
             operation="execution.action.sweep",
             arguments={"actor": actor},
             provenance=provenance,
-            mutation=lambda conn, event_provenance: db.sweep(
-                conn,
-                self.schema,
-                actor=actor,
-                provenance=event_provenance,
-            ),
+            mutation=lambda conn, event_provenance: {
+                "reclaimed": db.sweep(conn, self.schema, actor=actor, provenance=event_provenance),
+                "cancelled": db.reap_cancellations(conn, self.schema, actor=actor),
+            },
         )
 
-    def acknowledge_cancellation(self, *, action_id: int, cancel_request_id: str, runner: str) -> Any:
+    def acknowledge_cancellation(self, *, action_id: int, cancel_request_id: str, runner: str,
+                                 former_claim_receipt: str) -> Any:
         return self._mutate(
             operation="execution.action.cancel-ack",
-            arguments={"action_id": action_id, "cancel_request_id": cancel_request_id, "runner": runner},
+            arguments={"action_id": action_id, "cancel_request_id": cancel_request_id, "runner": runner,
+                       "former_claim_receipt_digest": db.receipt_digest(former_claim_receipt)},
             provenance=None,
             mutation=lambda conn, _provenance: db.acknowledge_cancellation(
-                conn, self.schema, action_id, cancel_request_id=cancel_request_id, runner=runner
+                conn, self.schema, action_id, cancel_request_id=cancel_request_id, runner=runner,
+                former_claim_receipt=former_claim_receipt,
             ),
         )
 

@@ -42,6 +42,8 @@ _COLUMN_SHAPE = {
         "cancel_request_id": ("uuid", "YES", None),
         "cancel_stop_deadline": ("timestamp with time zone", "YES", None),
         "stop_acknowledged": ("boolean", "YES", None),
+        "cancel_former_claimed_by": ("text", "YES", None),
+        "cancel_former_receipt_digest": ("text", "YES", None),
         "completed_at": ("timestamp with time zone", "YES", None),
         "result_ref": ("text", "YES", None),
         "failure_reason": ("text", "YES", None),
@@ -731,6 +733,11 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
     """
     expected_later_absence = (
         "column-missing:actions.claim_receipt",
+        "column-missing:actions.cancel_request_id",
+        "column-missing:actions.cancel_stop_deadline",
+        "column-missing:actions.stop_acknowledged",
+        "column-missing:actions.cancel_former_claimed_by",
+        "column-missing:actions.cancel_former_receipt_digest",
         "column-missing:dispatch_requests.",
         "constraint-missing-or-invalid:dispatch-requests-",
         "constraint-missing-or-invalid:dispatch_requests.",
@@ -740,6 +747,27 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
         issue for issue in issues
         if not issue.startswith(expected_later_absence)
     ]
+
+
+def _has_legacy_v1_status_constraint(conn, schema: str) -> bool:
+    row = conn.execute(
+        """SELECT pg_get_expr(c.conbin, c.conrelid, true) AS expression
+           FROM pg_constraint c
+           JOIN pg_class r ON r.oid=c.conrelid
+           JOIN pg_namespace n ON n.oid=r.relnamespace
+           WHERE n.nspname=%s AND r.relname='actions' AND c.conname='actions_status_check'""",
+        (schema,),
+    ).fetchone()
+    if row is None:
+        return False
+    actual = _without_redundant_outer_parentheses(str(_row_value(row, "expression")))
+    expected = _without_redundant_outer_parentheses(
+        "status = ANY (ARRAY[" + ", ".join(
+            f"'{status}'::text" for status in
+            ("pending", "claimed", "completed", "failed", "rejected", "cancelled")
+        ) + "])"
+    )
+    return actual == expected
 
 
 def check_compatibility(
@@ -967,6 +995,9 @@ def migrate(
                 # difference; all other drift remains a refusal before any
                 # migration ledger is stamped.
                 shape_issues = _unversioned_v1_shape_issues(shape_issues)
+                if (_has_legacy_v1_status_constraint(conn, schema)
+                        and "constraint-invalid:actions.status" in shape_issues):
+                    shape_issues.remove("constraint-invalid:actions.status")
                 if shape_issues:
                     raise SchemaMigrationError(
                         "refusing to stamp incompatible unversioned actionq schema: "

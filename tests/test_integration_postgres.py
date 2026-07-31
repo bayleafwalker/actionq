@@ -245,6 +245,8 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
                 "idx_dispatch_requests_created",
             }
         )
+    if schema_contract.MAX_SCHEMA_VERSION >= 4:
+        expected_indexes.add("idx_actions_cancelling_deadline")
     assert before <= expected_indexes
     assert after == expected_indexes
 

@@ -100,6 +100,7 @@ class ContextConfig:
 class DaemonConfig:
     poll_interval_seconds: float = 30.0
     heartbeat_interval_seconds: float = 60.0
+    cancellation_poll_interval_seconds: float = 2.0
     graceful_shutdown_seconds: float = 30.0
     default_timeout_minutes: int = 30
     session_state_path: Path = Path("~/.local/state/actionq/sessions.json")
@@ -183,6 +184,9 @@ class CoordinatorClient(Protocol):
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None: ...
     def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None: ...
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None: ...
+    def show(self, action_id: int) -> dict[str, Any]: ...
+    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str, runner: str,
+                                 former_claim_receipt: str) -> None: ...
 
 
 class TakeupClient(Protocol):
@@ -274,8 +278,10 @@ class ActionctlClient:
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
         self._run("fail", str(action_id), "--reason", reason, "--actor", actor, "--claim-receipt", claim_receipt)
 
-    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str, runner: str) -> None:
-        self._run("cancel-ack", str(action_id), "--cancel-request-id", cancel_request_id, "--runner", runner)
+    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str, runner: str,
+                                 former_claim_receipt: str) -> None:
+        self._run("cancel-ack", str(action_id), "--cancel-request-id", cancel_request_id,
+                  "--runner", runner, "--former-claim-receipt", former_claim_receipt)
 
 
 class SprintctlTakeupClient:
@@ -495,6 +501,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
     config = DaemonConfig(
         poll_interval_seconds=float(global_raw.get("poll_interval_seconds", 30)),
         heartbeat_interval_seconds=float(global_raw.get("heartbeat_interval_seconds", 60)),
+        cancellation_poll_interval_seconds=float(global_raw.get("cancellation_poll_interval_seconds", 2)),
         graceful_shutdown_seconds=float(global_raw.get("graceful_shutdown_seconds", 30)),
         default_timeout_minutes=int(global_raw.get("default_timeout_minutes", 30)),
         session_state_path=state_path,
@@ -1425,6 +1432,7 @@ class Daemon:
     ) -> tuple[str, int]:
         assert self._child is not None
         next_heartbeat = time.monotonic() + self.config.heartbeat_interval_seconds
+        next_cancel_poll = time.monotonic()
         while self._child.poll() is None:
             if self._shutdown:
                 audit_pause = self._publish_audit(
@@ -1440,19 +1448,31 @@ class Daemon:
                 except subprocess.TimeoutExpired:
                     os.killpg(self._child.pid, signal.SIGTERM)
                 return "shutdown", self._child.wait()
-            if time.monotonic() >= next_heartbeat:
+            if time.monotonic() >= next_cancel_poll:
                 try:
-                    current = self.client.show(action_id)
-                    action = current.get("action", current)
-                    if action.get("status") == "cancelling":
+                    current = self.client.show(action_id) if hasattr(self.client, "show") else None
+                    action = current.get("action", current) if isinstance(current, dict) else None
+                    if isinstance(action, dict) and action.get("status") == "cancelling":
                         os.killpg(self._child.pid, signal.SIGTERM)
                         try:
                             self._child.wait(timeout=self.config.graceful_shutdown_seconds)
                         except subprocess.TimeoutExpired:
                             os.killpg(self._child.pid, signal.SIGKILL)
                             self._child.wait()
-                        self.client.acknowledge_cancellation(action_id, cancel_request_id=str(action["cancel_request_id"]), runner=self.actor)
+                        self.client.acknowledge_cancellation(
+                            action_id, cancel_request_id=str(action["cancel_request_id"]),
+                            runner=self.actor, former_claim_receipt=claim_receipt,
+                        )
                         return "cancelled", int(self._child.returncode or 0)
+                except Exception as exc:
+                    os.killpg(self._child.pid, signal.SIGTERM)
+                    self._child.wait()
+                    self.client.emit("session.paused", action_id=action_id, actor=self.actor,
+                        payload={**payload, "pid": record.pid, "reason": "cancellation-control-lost", "detail": str(exc)})
+                    return "claim-lost", int(self._child.returncode or 1)
+                next_cancel_poll = time.monotonic() + self.config.cancellation_poll_interval_seconds
+            if time.monotonic() >= next_heartbeat:
+                try:
                     self.client.renew(action_id, worker=self.actor,
                                       timeout_minutes=self.config.default_timeout_minutes,
                                       claim_receipt=claim_receipt)

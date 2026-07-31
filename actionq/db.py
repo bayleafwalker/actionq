@@ -54,6 +54,10 @@ class ClaimRejected(ActionQError):
         self.requested_by = requested_by
 
 
+def receipt_digest(receipt: str) -> str:
+    return "sha256:" + hashlib.sha256(receipt.encode("utf-8")).hexdigest()
+
+
 def _import_psycopg():
     try:
         import psycopg
@@ -337,6 +341,14 @@ def get_action(conn, schema: str, action_id: int) -> dict | None:
         (action_id,),
     ).fetchone()
     return dict(row) if row else None
+
+
+def redact_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Remove one-time claim authority from general-purpose read surfaces."""
+    result = dict(action)
+    result.pop("claim_receipt", None)
+    result.pop("cancel_former_receipt_digest", None)
+    return result
 
 
 def _rate_limited_source(created_by: str) -> bool:
@@ -642,7 +654,7 @@ def claim(
                 {
                     "claimed_by": worker,
                     "claim_deadline": json_default(row["claim_deadline"]),
-                    "claim_receipt": row["claim_receipt"],
+                    "claim_receipt_digest": receipt_digest(row["claim_receipt"]),
                 },
                 provenance,
             ),
@@ -714,7 +726,7 @@ def renew(
                         "requested_by": worker,
                         "requested_action_id": action_id,
                         "requested_timeout_minutes": timeout_minutes,
-                        "requested_claim_receipt": claim_receipt,
+                        "requested_claim_receipt_digest": receipt_digest(claim_receipt),
                         "action_status": _text(current["status"])
                         if current is not None
                         else None,
@@ -757,7 +769,7 @@ def renew(
                         else None,
                         "new_deadline": json_default(row["claim_deadline"]),
                         "requested_timeout_minutes": timeout_minutes,
-                        "claim_receipt": claim_receipt,
+                        "claim_receipt_digest": receipt_digest(claim_receipt),
                     },
                     provenance,
                 ),
@@ -932,29 +944,47 @@ def cancel(
             updated = conn.execute(
                 f"""UPDATE {qname(schema, 'actions')} SET status='cancelling', cancel_request_id=%s,
                     cancel_stop_deadline=now() + interval '30 seconds', stop_acknowledged=false,
-                    claim_receipt=NULL, claim_deadline=NULL WHERE id=%s RETURNING *""",
-                (request_id, action_id),
+                    cancel_former_claimed_by=%s, cancel_former_receipt_digest=%s,
+                    claim_receipt=NULL, claim_deadline=NULL
+                    WHERE id=%s RETURNING *""",
+                (request_id, row["claimed_by"], receipt_digest(row["claim_receipt"] or ""), action_id),
             ).fetchone()
             event_type = "action_cancelling"
             receipt = row["claim_receipt"] or ""
             payload = {"reason": reason, "cancelled_by": actor, "cancel_request_id": request_id,
                        "former_claimed_by": row["claimed_by"],
-                       "former_receipt_digest": "sha256:" + hashlib.sha256(receipt.encode()).hexdigest()}
+                       "former_receipt_digest": receipt_digest(receipt)}
         insert_event(conn, schema, action_id=action_id, event_type=event_type, actor=actor,
                      payload=event_payload_with_provenance(payload, provenance))
     return dict(updated)
 
 
-def acknowledge_cancellation(conn, schema: str, action_id: int, *, cancel_request_id: str, runner: str) -> dict:
+def acknowledge_cancellation(
+    conn, schema: str, action_id: int, *, cancel_request_id: str, runner: str,
+    former_claim_receipt: str,
+) -> dict:
     """Idempotently finalize a fenced cancellation after supervisor stop confirmation."""
     with conn.transaction():
+        proof = receipt_digest(former_claim_receipt)
+        row = conn.execute(
+            f"""SELECT * FROM {qname(schema, 'actions')} WHERE id=%s FOR UPDATE""", (action_id,)
+        ).fetchone()
+        if (row is not None and row["status"] == "cancelled"
+                and str(row["cancel_request_id"]) == cancel_request_id
+                and row["cancel_former_claimed_by"] == runner
+                and row["cancel_former_receipt_digest"] == proof):
+            return dict(row)
+        if (row is None or row["status"] != "cancelling"
+                or str(row["cancel_request_id"]) != cancel_request_id
+                or row["cancel_former_claimed_by"] != runner
+                or row["cancel_former_receipt_digest"] != proof):
+            raise ActionQError(f"Action #{action_id} cancellation acknowledgement rejected")
         row = conn.execute(
             f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
-                stop_acknowledged=true WHERE id=%s AND status='cancelling'
-                AND cancel_request_id=%s RETURNING *""", (action_id, cancel_request_id)
+                stop_acknowledged=true, claimed_at=NULL, claimed_by=NULL,
+                claim_deadline=NULL, claim_receipt=NULL
+                WHERE id=%s RETURNING *""", (action_id,)
         ).fetchone()
-        if row is None:
-            raise ActionQError(f"Action #{action_id} cancellation acknowledgement rejected")
         insert_event(conn, schema, action_id=action_id, event_type="action_cancelled",
                      actor=runner, payload={"cancel_request_id": cancel_request_id, "stop_acknowledged": True})
     return dict(row)
@@ -964,7 +994,9 @@ def reap_cancellations(conn, schema: str, *, actor: str = "actionctl:cancel-reap
     with conn.transaction():
         rows = conn.execute(
             f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
-                stop_acknowledged=false WHERE status='cancelling' AND cancel_stop_deadline < now()
+                stop_acknowledged=false, claimed_at=NULL, claimed_by=NULL,
+                claim_deadline=NULL, claim_receipt=NULL
+                WHERE status='cancelling' AND cancel_stop_deadline < now()
                 RETURNING *"""
         ).fetchall()
         for row in rows:

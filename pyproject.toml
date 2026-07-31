@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "actionq"
-version = "0.1.9"
+version = "0.1.10"
 description = "Operational-domain action queue for deterministic agent dispatch"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
+    "actionq-contracts==0.1.0",
     "click>=8.1",
     "psycopg[binary]>=3.1",
 ]
@@ -53,3 +54,9 @@ actionq = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.workspace]
+members = ["packages/actionq-contracts", "packages/actionq-runner"]
+
+[tool.uv.sources]
+actionq-contracts = { workspace = true }

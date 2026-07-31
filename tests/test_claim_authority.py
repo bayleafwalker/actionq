@@ -61,9 +61,88 @@ def test_controller_cancel_fences_claim_before_acknowledgement(schema):
     assert cancelling["claim_receipt"] is None
     with pytest.raises(db.ActionQError):
         db.complete(conn, schema, claimed["id"], "result:late", worker="worker:one", claim_receipt=claimed["claim_receipt"])
-    acked = db.acknowledge_cancellation(conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]), runner="runner:one")
+    with pytest.raises(db.ActionQError):
+        db.acknowledge_cancellation(
+            conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+            runner="worker:one", former_claim_receipt="wrong",
+        )
+    acked = db.acknowledge_cancellation(
+        conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+        runner="worker:one", former_claim_receipt=claimed["claim_receipt"],
+    )
     assert acked["status"] == "cancelled"
     assert acked["stop_acknowledged"] is True
+    assert acked["claimed_by"] is None
+    duplicate = db.acknowledge_cancellation(
+        conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+        runner="worker:one", former_claim_receipt=claimed["claim_receipt"],
+    )
+    assert duplicate["status"] == "cancelled"
+
+
+def test_general_reads_do_not_disclose_claim_receipt(schema):
+    conn = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(conn, schema)
+    assert claimed["claim_receipt"]
+    assert "claim_receipt" not in db.redact_action(db.get_action(conn, schema, claimed["id"]))
+    assert "claim_receipt" not in db.redact_action(db.list_actions(conn, schema)[0])
+
+
+def test_cancellation_deadline_reaper_finalizes_without_ack(schema):
+    conn = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(conn, schema)
+    cancelling = db.cancel(conn, schema, claimed["id"], "runner unavailable", actor="controller")
+    conn.execute(
+        f"UPDATE {db.qname(schema, 'actions')} SET cancel_stop_deadline=now() - interval '1 second' WHERE id=%s",
+        (claimed["id"],),
+    )
+    conn.commit()
+    reaped = db.reap_cancellations(conn, schema)
+    assert [row["id"] for row in reaped] == [claimed["id"]]
+    assert reaped[0]["status"] == "cancelled"
+    assert reaped[0]["stop_acknowledged"] is False
+    assert reaped[0]["claimed_by"] is None
+    with pytest.raises(db.ActionQError):
+        db.acknowledge_cancellation(
+            conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+            runner="worker:one", former_claim_receipt="wrong",
+        )
+
+
+def test_cancel_and_complete_serialize_on_action_row(schema):
+    setup = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(setup, schema)
+    setup.close()
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def complete():
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        barrier.wait()
+        try:
+            db.complete(conn, schema, claimed["id"], "result:ok", worker="worker:one",
+                        claim_receipt=claimed["claim_receipt"])
+            conn.commit(); outcomes.append("completed")
+        except db.ActionQError:
+            conn.rollback(); outcomes.append("complete-rejected")
+        finally:
+            conn.close()
+
+    def cancel():
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        barrier.wait()
+        try:
+            db.cancel(conn, schema, claimed["id"], "operator stop", actor="controller")
+            conn.commit(); outcomes.append("cancelling")
+        except db.ActionQError:
+            conn.rollback(); outcomes.append("cancel-rejected")
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=complete), threading.Thread(target=cancel)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=5)
+    assert sorted(outcomes) in (["cancel-rejected", "completed"], ["cancelling", "complete-rejected"])
 
 
 # -- db.renew: grant path -------------------------------------------------

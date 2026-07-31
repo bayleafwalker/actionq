@@ -2,11 +2,19 @@ version = 1
 revision = 3
 requires-python = ">=3.11"
 
+[manifest]
+members = [
+    "actionq",
+    "actionq-contracts",
+    "actionq-runner",
+]
+
 [[package]]
 name = "actionq"
-version = "0.1.9"
+version = "0.1.10"
 source = { editable = "." }
 dependencies = [
+    { name = "actionq-contracts" },
     { name = "click" },
     { name = "psycopg", extra = ["binary"] },
 ]
@@ -18,11 +26,28 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "actionq-contracts", editable = "packages/actionq-contracts" },
     { name = "click", specifier = ">=8.1" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "actionq-contracts"
+version = "0.1.0"
+source = { editable = "packages/actionq-contracts" }
+
+[[package]]
+name = "actionq-runner"
+version = "0.1.0"
+source = { editable = "packages/actionq-runner" }
+dependencies = [
+    { name = "actionq-contracts" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "actionq-contracts", editable = "packages/actionq-contracts" }]
 
 [[package]]
 name = "click"

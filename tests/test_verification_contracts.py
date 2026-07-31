@@ -17,8 +17,8 @@ def test_action_claim_context_has_stable_protocol_anchors():
     assert "at-most-one-completed-claim-per-action-incarnation" in packet["invariants"]
 
 
-def test_protocol_document_records_current_ownership_limit():
+def test_protocol_document_records_terminal_fencing():
     protocol = (ROOT / "docs/protocols/action-lifecycle.md").read_text(encoding="utf-8")
 
-    assert "claimed_by` is metadata, not proof" in protocol
-    assert "do not claim exclusive terminal authority" in protocol
+    assert "Terminal transitions require matching worker and claim receipt" in protocol
+    assert "expired-but-unswept claimant cannot settle" in protocol

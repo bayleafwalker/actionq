@@ -20,7 +20,7 @@ An action is the smallest state object. The authoritative mutable projection is 
 | `complete` | Action is `claimed` by matching receipt and its lease is live | Status `completed`, result and timestamp stored, claim metadata cleared, event appended | No action changes |
 | `fail` / `reject` | Action is `claimed` by matching receipt and its lease is live | Terminal status and reason stored, claim metadata cleared, event appended | No action changes |
 | `cancel` | `pending` or `claimed` | Pending becomes `cancelled`; claimed becomes `cancelling` with receipt/lease revoked and a bounded stop deadline | No action changes |
-| `cancel acknowledge` | Matching cancellation request on `cancelling` | Status `cancelled`, stop acknowledgement recorded, event appended | No action changes |
+| `cancel acknowledge` | Matching cancellation request, former runner identity, and revoked receipt proof on `cancelling` | Status `cancelled`, claim metadata cleared, stop acknowledgement recorded, event appended | No action changes |
 | `sweep` | Status is `claimed` and deadline is in the past | Status returns to `pending`; claim metadata cleared; timeout event appended | Transaction rolls back |
 
 ## Claim/lease authority commands (work item #1117)
@@ -40,9 +40,7 @@ silently mutating state or silently succeeding.
   or an unknown action id -- is rejected. The rejection is a durable
   `claim_renewal_rejected` event recording the requester, the requested
   timeout, and the actual state found; the action row is left completely
-  unchanged. This is the first authority-command boundary in this repo
-  with a real, tested claimant check (contrast with the ownership
-  limitation below, which still applies to `complete`/`fail`/`reject`).
+  unchanged.
 - Reduced state remains visible through the existing read surfaces
   (`show`, `ls`, `events`): a claim's validity is `claim_deadline` versus
   `now()`, and its request/decision history is the ordered event stream
@@ -70,7 +68,8 @@ A retry with the same key and normalized arguments returns the original durable
 decision without repeating the lifecycle mutation. A different argument set
 under that key is rejected as an idempotency conflict. This served retry
 contract does not retrofit idempotency onto the legacy CLI when no invocation
-provenance is supplied, and it is not a fencing token for terminal transitions.
+provenance is supplied. Terminal authority is fenced separately by the live
+claim receipt and lease.
 
 ## Consistency target
 

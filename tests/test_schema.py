@@ -221,6 +221,7 @@ class FakeSchemaConnection:
                             self.status_expression
                             or (
                                 "status = ANY (ARRAY['pending'::text, 'claimed'::text, "
+                                "'cancelling'::text, "
                                 "'completed'::text, 'failed'::text, 'rejected'::text, "
                                 "'cancelled'::text])"
                                 + (" OR true" if self.permissive_status else "")
@@ -324,7 +325,7 @@ def _packaged_checksums() -> dict[int, str]:
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     migrations = schema.load_migrations()
 
-    assert [migration.version for migration in migrations] == [1, 2, 3]
+    assert [migration.version for migration in migrations] == [1, 2, 3, 4]
     rendered = schema._render(migrations[0], "aq")
     assert "{{schema}}" not in rendered
     assert '"aq".actions' in rendered
@@ -364,8 +365,8 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "domain": "execution",
         "api_version": "v1",
         "minimum_schema_version": 1,
-        "maximum_schema_version": 3,
-        "observed_schema_version": 3,
+        "maximum_schema_version": 4,
+        "observed_schema_version": 4,
         "state": "compatible",
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
@@ -622,8 +623,8 @@ def test_sql_canonicalization_preserves_semantic_tokens():
 @pytest.mark.parametrize(
     ("applied", "state"),
     [
-        ({1: "wrong", 2: _packaged_checksums()[2], 3: _packaged_checksums()[3]}, "checksum-mismatch"),
-        ({1: _packaged_checksums()[1], 2: _packaged_checksums()[2], 3: _packaged_checksums()[3], 4: "future"}, "too-new"),
+        ({1: "wrong", 2: _packaged_checksums()[2], 3: _packaged_checksums()[3], 4: _packaged_checksums()[4]}, "checksum-mismatch"),
+        ({**_packaged_checksums(), 5: "future"}, "too-new"),
     ],
 )
 def test_compatibility_rejects_unsupported_schema(applied, state):
@@ -641,7 +642,7 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
     first = schema.migrate(conn, "aq")
     second = schema.migrate(conn, "aq")
 
-    assert first["applied_versions"] == [1, 2, 3]
+    assert first["applied_versions"] == [1, 2, 3, 4]
     assert second["applied_versions"] == []
     assert second["compatibility"]["compatible"] is True
     locks = [
