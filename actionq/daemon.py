@@ -24,7 +24,10 @@ import tomllib
 import uuid
 from typing import Any, Callable, Protocol, Sequence
 
-from actionq_contracts import EXECUTION_ENVELOPE_V1, ExecutionEnvelope, require_compatible, sha256_digest
+from actionq_contracts import (
+    EXECUTION_ENVELOPE_V1, EXECUTION_V1, Execution, ExecutionEnvelope,
+    require_compatible, sha256_digest,
+)
 
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
 from .harnesses import HarnessInvocation, get_adapter
@@ -114,6 +117,10 @@ class DaemonConfig:
     runner_private_key_path: Path = Path("~/.local/state/actionq/runner-identity.pem")
     runner_id: str = "runner:devbox"
     enforce_worker_isolation: bool = True
+    # Explicit durable #2032 CAS root.  None preserves legacy runners that do
+    # not produce immutable candidates; scope-iterate publication is enabled
+    # only when an operator provisions this owner-controlled path.
+    artifact_root: Path | None = None
     takeup: TakeupConfig = TakeupConfig()
     audit: AuditConfig = AuditConfig()
     context: ContextConfig = ContextConfig()
@@ -142,6 +149,7 @@ class ActionConfig:
     # A provider harness is selected through a named implementation profile;
     # arbitrary version strings are not an execution-policy authority.
     harness_profile: str | None = None
+    publish_candidate: bool = False
     scope_iterate: ScopeIteratePolicy | None = None
 
 
@@ -573,6 +581,10 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
         )).expanduser(),
         runner_id=str(global_raw.get("runner_id", "runner:devbox")),
         enforce_worker_isolation=bool(global_raw.get("enforce_worker_isolation", True)),
+        artifact_root=(
+            Path(str(global_raw["artifact_root"])).expanduser()
+            if global_raw.get("artifact_root") else None
+        ),
         takeup=TakeupConfig(
             enabled=bool(takeup_raw.get("enabled", False)),
             remote_only=bool(takeup_raw.get("remote_only", True)),
@@ -626,6 +638,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             prompt=(str(value["prompt"]) if "prompt" in value else None),
             worker_user=(str(value["worker_user"]) if "worker_user" in value else None),
             harness_profile=(str(value["harness_profile"]) if "harness_profile" in value else None),
+            publish_candidate=bool(value.get("publish_candidate", False)),
             scope_iterate=(
                 load_policy(value["scope_iterate"], config_dir=path.parent.resolve())
                 if "scope_iterate" in value else None
@@ -742,6 +755,9 @@ class Daemon:
         git_evidence = None
         if record.worktree and record.base_commit:
             git_evidence = collect_git_evidence_bounded(Path(record.worktree), record.base_commit)
+        publication_reconciled = self._reconcile_terminal_publication(
+            record.action_id, record.action_type,
+        )
         self.client.emit(
             "session.end-inferred",
             action_id=record.action_id,
@@ -761,6 +777,7 @@ class Daemon:
                 "reason": "daemon-startup-stale-state",
                 "sprint_takeup_release": released,
                 "git": git_evidence,
+                "publication_reconciled": publication_reconciled,
             },
         )
         self._write_state(None)
@@ -780,8 +797,151 @@ class Daemon:
         action = self.client.claim(self.config.runner_id, self.config.default_timeout_minutes)
         if action is None:
             return False
+        if self._settle_recovered_publication(action):
+            return True
         self._run_action(action)
         return True
+
+    def _runnerctl_json(self, *args: str, input_value: dict[str, Any] | None = None) -> Any:
+        completed = subprocess.run(
+            [self.config.runnerctl_bin, *args],
+            input=(json.dumps(input_value, sort_keys=True) if input_value is not None else None),
+            text=True, capture_output=True, check=False,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr.strip() or "actionq-runner publication command failed")
+        return json.loads(completed.stdout)
+
+    def _publication_policy(self, action: dict[str, Any]) -> ActionConfig | None:
+        policy = self.actions.get(str(action.get("action_type") or ""))
+        return policy if policy is not None and policy.publish_candidate else None
+
+    def _ack_publication_settlement(
+        self, publication: dict[str, Any], *, terminal_status: str, result_ref: str,
+    ) -> None:
+        assert self.config.artifact_root is not None
+        self._runnerctl_json("settlement-ack", "--packet-stdin", input_value={
+            "artifact_root": str(self.config.artifact_root),
+            "action_id": int(publication["action_id"]),
+            "attempt_id": str(publication["attempt_id"]),
+            "journal_ref": str(publication["journal_ref"]),
+            "terminal_status": terminal_status,
+            "result_ref": result_ref,
+        })
+
+    def _complete_published(
+        self, action_id: int, *, claim_receipt: str, publication: dict[str, Any],
+    ) -> None:
+        result_ref = str(publication["journal_ref"])
+        try:
+            self.client.complete(
+                action_id, result_ref=result_ref, actor=self.config.runner_id,
+                claim_receipt=claim_receipt,
+            )
+        except Exception:
+            current = self.client.show(action_id).get("action", {})
+            if current.get("status") != "completed" or current.get("result_ref") != result_ref:
+                raise
+        self._ack_publication_settlement(
+            publication, terminal_status="completed", result_ref=result_ref,
+        )
+        self.client.emit(
+            "publication.settled", action_id=action_id, actor=self.actor,
+            payload={"attempt_id": publication["attempt_id"], "journal_ref": result_ref},
+        )
+
+    def _settle_recovered_publication(self, action: dict[str, Any]) -> bool:
+        if self._publication_policy(action) is None:
+            return False
+        if self.config.artifact_root is None:
+            raise RuntimeError("publish_candidate requires a provisioned artifact_root")
+        publication = self._runnerctl_json(
+            "journal-recover", "--artifact-root", str(self.config.artifact_root),
+            "--action-id", str(action["id"]),
+        )
+        if publication is None:
+            return False
+        receipt = str(action.get("claim_receipt") or "")
+        if not receipt:
+            raise RuntimeError("recovered publication settlement requires a live claim receipt")
+        self._complete_published(int(action["id"]), claim_receipt=receipt, publication=publication)
+        if hasattr(self.client, "reconcile_runner_spool"):
+            self.client.reconcile_runner_spool(
+                int(action["id"]), attempt_id=str(publication["attempt_id"]),
+            )
+        return True
+
+    def _reconcile_terminal_publication(self, action_id: int, action_type: str) -> bool:
+        policy = self.actions.get(action_type)
+        if policy is None or not policy.publish_candidate or self.config.artifact_root is None:
+            return False
+        publication = self._runnerctl_json(
+            "journal-recover", "--artifact-root", str(self.config.artifact_root),
+            "--action-id", str(action_id),
+        )
+        if publication is None:
+            return False
+        settled = self._runnerctl_json(
+            "settlement-query", "--artifact-root", str(self.config.artifact_root),
+            "--action-id", str(action_id), "--attempt-id", str(publication["attempt_id"]),
+        )
+        if settled is not None:
+            return True
+        current = self.client.show(action_id).get("action", {})
+        result_ref = str(publication["journal_ref"])
+        if current.get("status") != "completed" or current.get("result_ref") != result_ref:
+            return False
+        self._ack_publication_settlement(
+            publication, terminal_status="completed", result_ref=result_ref,
+        )
+        self.client.emit(
+            "publication.settled", action_id=action_id, actor=self.actor,
+            payload={"attempt_id": publication["attempt_id"], "journal_ref": result_ref,
+                     "recovered_after_response_loss": True},
+        )
+        return True
+
+    def _publish_scope_candidate(
+        self, *, action_id: int, envelope: ExecutionEnvelope,
+        scope_result: VerificationResult, exit_code: int, output_path: Path | None,
+        test_command: tuple[str, ...],
+    ) -> dict[str, Any]:
+        if self.config.artifact_root is None:
+            raise RuntimeError("publish_candidate requires a provisioned artifact_root")
+        redacted_log = ""
+        if output_path is not None and output_path.exists():
+            redacted_log = output_path.read_text(encoding="utf-8", errors="replace")
+        execution = Execution(
+            action_id=action_id, attempt_id=envelope.attempt_id,
+            command_id=envelope.command_id, exit_code=exit_code, timed_out=False,
+        )
+        publication = self._runnerctl_json("publish", "--packet-stdin", input_value={
+            "artifact_root": str(self.config.artifact_root),
+            "action_id": action_id,
+            "attempt_id": envelope.attempt_id,
+            "worktree": str(scope_result.worktree),
+            "source_commit": scope_result.base_sha,
+            "candidate_commit": scope_result.head_sha,
+            "execution_envelope": envelope.as_dict(),
+            "execution": asdict(execution),
+            "verification_outcome": "passed",
+            "verification_evidence": {
+                "command": list(test_command), "outcome": "passed",
+                "source_commit": scope_result.base_sha,
+                "candidate_commit": scope_result.head_sha,
+                "changed_paths": list(scope_result.changed_paths),
+            },
+            "redacted_log": redacted_log,
+        })
+        self.client.emit(
+            "publication.available", action_id=action_id, actor=self.actor,
+            payload={"attempt_id": envelope.attempt_id,
+                     "journal_ref": publication["journal_ref"]},
+        )
+        return publication
+
+    def _after_publication(self, _publication: dict[str, Any]) -> None:
+        """Fault-injection seam for the artifact/PostgreSQL crash boundary."""
 
     def _run_action(self, action: dict[str, Any]) -> None:
         action_id = int(action["id"])
@@ -795,6 +955,18 @@ class Daemon:
         action_config = self.actions.get(action_type)
         if action_config is None:
             self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.config.runner_id, claim_receipt=claim_receipt)
+            return
+        if action_config.publish_candidate and action_config.runner != "scope-iterate":
+            self.client.fail(
+                action_id, reason="publication-policy: immutable candidates require scope-iterate",
+                actor=self.config.runner_id, claim_receipt=claim_receipt,
+            )
+            return
+        if action_config.publish_candidate and self.config.artifact_root is None:
+            self.client.fail(
+                action_id, reason="publication-policy: artifact_root is not provisioned",
+                actor=self.config.runner_id, claim_receipt=claim_receipt,
+            )
             return
         project = self.projects.get(str(action.get("project") or ""))
         routing: RoutingResult | None = None
@@ -1039,6 +1211,16 @@ class Daemon:
                 except Exception as exc:
                     outcome = "failed"
                     usage_limit_reason = f"scope-iterate verification failed: {exc}"
+            publication: dict[str, Any] | None = None
+            if (outcome == "completed" and scope_result is not None
+                    and action_config.publish_candidate):
+                assert action_config.scope_iterate is not None
+                publication = self._publish_scope_candidate(
+                    action_id=action_id, envelope=envelope, scope_result=scope_result,
+                    exit_code=exit_code, output_path=output_path,
+                    test_command=action_config.scope_iterate.test_command,
+                )
+                self._after_publication(publication)
             released = self._takeup_release(project, session_id, f"session-{outcome}")
             audit_exit = self._publish_audit(
                 project, event_type="session.exit", actor=audit_actor,
@@ -1087,15 +1269,20 @@ class Daemon:
             elif settlement_error is not None:
                 self.client.fail(action_id, reason=settlement_error, actor=self.config.runner_id, claim_receipt=claim_receipt)
             elif outcome == "completed":
-                self.client.complete(
-                    action_id,
-                    result_ref=(
-                        scope_result.result_ref if scope_result is not None
-                        else f"session={session_id}"
-                    ),
-                    actor=self.config.runner_id,
-                    claim_receipt=claim_receipt,
-                )
+                if publication is not None:
+                    self._complete_published(
+                        action_id, claim_receipt=claim_receipt, publication=publication,
+                    )
+                else:
+                    self.client.complete(
+                        action_id,
+                        result_ref=(
+                            scope_result.result_ref if scope_result is not None
+                            else f"session={session_id}"
+                        ),
+                        actor=self.config.runner_id,
+                        claim_receipt=claim_receipt,
+                    )
             else:
                 self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.config.runner_id, claim_receipt=claim_receipt)
             if outcome not in {"claim-lost"} and settlement_error is None and hasattr(self.client, "reconcile_runner_spool"):

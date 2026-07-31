@@ -1,6 +1,7 @@
 # C-minimum daemon configuration. Keep this at ~/.config/actionq/config.toml
 # on devbox, with ACTIONQ_URL supplied through the environment.
 [global]
+artifact_root = "/var/lib/actionq/artifacts"
 poll_interval_seconds = 30
 heartbeat_interval_seconds = 60
 graceful_shutdown_seconds = 30
@@ -27,3 +28,6 @@ actionctl_bin = "actionctl"
 [actions.scope-iterate]
 runner = "fake"
 fake_duration_seconds = 1
+# Production scope-iterate actions set this true after provisioning the
+# owner-only durable [global].artifact_root above.
+publish_candidate = false

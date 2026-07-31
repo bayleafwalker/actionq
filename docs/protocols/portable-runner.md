@@ -37,3 +37,40 @@ publication. ActionQ settlement is separate; only a successful terminal
 reconciliation marks the spool eligible for its bounded retention policy.
 Timeout reaping records process state as unknown and leaves an unreconciled
 spool intact.
+
+## Immutable candidate publication
+
+For an action class with `publish_candidate = true`, the trusted supervisor
+publishes only after the scope-iterate kernel has produced a clean, verified
+candidate commit. The operator must provision `[global].artifact_root` as
+owner-only durable storage outside temporary directories, checkouts, caches,
+runtime directories, and the private runner spool.
+
+`actionq-runner publish` creates a verified full-history Git bundle and stores
+the exact bundle bytes, released execution/candidate/verification/publication
+records, changed-path manifest, verification evidence, and redacted log in an
+atomic create-only filesystem CAS. Every object is addressed as
+`artifact:sha256:<digest>` over its exact stored bytes. A private canonical
+`publication-receipt/v1` object binds the Git source/candidate commit and tree
+OIDs to every artifact reference; its artifact reference is the ActionQ
+terminal `result_ref`. This receipt is implementation-owned #2032 journal
+state, not a new shared runner contract.
+Redacted logs are deterministically capped at 1 MiB and the receipt records the
+30-day retention policy. This slice does not implement deletion; operators
+must preserve active/unreconciled evidence, while integrated or released
+bundles and receipts remain pinned indefinitely.
+
+Publication and terminal ActionQ mutation are separate retry boundaries. A
+durable journal records bundle, object, completed-receipt, and settlement
+stages without claim receipts or credentials. After reclaim, the daemon
+recovers a completed receipt for the action and settles it under the new live
+claim instead of rerunning the harness. If the completion response is lost,
+the daemon reads ActionQ history and acknowledges local settlement only when
+the authoritative terminal status and result reference match. The guarantee
+is content-idempotent publication plus at-most-once terminal mutation under a
+live claim—not exactly-once processing.
+
+The pilot never pushes Git, opens pull requests, promotes pre-#2032 spool
+records, deletes canonical bundles/receipts, or performs generalized garbage
+collection. A later trusted Git publisher may consume an accepted bundle but
+cannot run the harness that created it.
