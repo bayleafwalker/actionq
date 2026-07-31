@@ -53,6 +53,19 @@ def _enqueue_and_claim(conn, schema_name: str, worker: str = "worker:one", timeo
     return claimed
 
 
+def test_controller_cancel_fences_claim_before_acknowledgement(schema):
+    conn = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(conn, schema)
+    cancelling = db.cancel(conn, schema, claimed["id"], "operator stop", actor="controller")
+    assert cancelling["status"] == "cancelling"
+    assert cancelling["claim_receipt"] is None
+    with pytest.raises(db.ActionQError):
+        db.complete(conn, schema, claimed["id"], "result:late", worker="worker:one", claim_receipt=claimed["claim_receipt"])
+    acked = db.acknowledge_cancellation(conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]), runner="runner:one")
+    assert acked["status"] == "cancelled"
+    assert acked["stop_acknowledged"] is True
+
+
 # -- db.renew: grant path -------------------------------------------------
 
 

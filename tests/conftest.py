@@ -38,6 +38,14 @@ def _start_postgres() -> dict:
     import psycopg
     from psycopg import sql
 
+    external_url = os.environ.get("ACTIONQ_TEST_URL")
+    if external_url:
+        runtime_url = external_url.replace("//actionq:", "//actionq_runtime:")
+        migration_url = external_url.replace("//actionq:", "//actionq_migration:")
+        return {"external": True, "pg_ctl": None,
+                "urls": {"admin": external_url, "migration": migration_url, "runtime": runtime_url},
+                "previous_env": {name: os.environ.get(name) for name in ("ACTIONQ_TEST_URL", "ACTIONQ_TEST_MIGRATION_URL", "ACTIONQ_TEST_RUNTIME_URL", "ACTIONQ_RUNTIME_ROLE")}}
+
     binaries = {command: shutil.which(command) for command in ("initdb", "pg_ctl")}
     missing = sorted(command for command, path in binaries.items() if path is None)
     if missing:
@@ -151,21 +159,13 @@ def pytest_unconfigure(config) -> None:
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
-    subprocess.run(
-        [
-            str(_POSTGRES_STATE["pg_ctl"]),
-            "-D",
-            str(_POSTGRES_STATE["data"]),
-            "-m",
-            "fast",
-            "-w",
-            "stop",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    shutil.rmtree(_POSTGRES_STATE["root"], ignore_errors=True)
+    if not _POSTGRES_STATE.get("external"):
+        subprocess.run(
+            [str(_POSTGRES_STATE["pg_ctl"]), "-D", str(_POSTGRES_STATE["data"]), "-m", "fast", "-w", "stop"],
+            check=False, capture_output=True, text=True,
+        )
+    if not _POSTGRES_STATE.get("external"):
+        shutil.rmtree(_POSTGRES_STATE["root"], ignore_errors=True)
     _POSTGRES_STATE = None
 
 

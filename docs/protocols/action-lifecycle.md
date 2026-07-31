@@ -17,9 +17,10 @@ An action is the smallest state object. The authoritative mutable projection is 
 | `enqueue` | Valid parent/depth and producer below rate limit | Insert `pending` action and `action_enqueued` event | Transaction rolls back |
 | `claim` | At least one `pending` action | Selected action becomes `claimed`; owner/deadline set; `action_claimed` appended | No action changes |
 | `renew` | Action `claimed` by exactly the requesting worker, deadline not yet passed | `claim_deadline` extended from now; `claim_renewed` appended | No action changes; a durable `claim_renewal_rejected` event is appended instead (see below) |
-| `complete` | Action status is `claimed` | Status `completed`, result and timestamp stored, event appended | No action changes |
-| `fail` / `reject` | Action status is `claimed` | Terminal status and reason stored, event appended | No action changes |
-| `cancel` | Status is `pending` or `claimed` | Status `cancelled`, reason stored, event appended | No action changes |
+| `complete` | Action is `claimed` by matching receipt and its lease is live | Status `completed`, result and timestamp stored, claim metadata cleared, event appended | No action changes |
+| `fail` / `reject` | Action is `claimed` by matching receipt and its lease is live | Terminal status and reason stored, claim metadata cleared, event appended | No action changes |
+| `cancel` | `pending` or `claimed` | Pending becomes `cancelled`; claimed becomes `cancelling` with receipt/lease revoked and a bounded stop deadline | No action changes |
+| `cancel acknowledge` | Matching cancellation request on `cancelling` | Status `cancelled`, stop acknowledgement recorded, event appended | No action changes |
 | `sweep` | Status is `claimed` and deadline is in the past | Status returns to `pending`; claim metadata cleared; timeout event appended | Transaction rolls back |
 
 ## Claim/lease authority commands (work item #1117)
@@ -77,9 +78,15 @@ provenance is supplied, and it is not a fencing token for terminal transitions.
 - Action/event target: one transaction establishes a serializable-looking lifecycle pair for each successful command; the implementation does not currently claim serializable isolation for arbitrary multi-action histories.
 - Queue ordering is priority then creation time among rows visible and unlocked to the claiming statement. `SKIP LOCKED` optimizes safe contention, not global fairness.
 
-## Ownership limitation
+## Terminal fencing and cancellation
 
-`claimed_by` is metadata, not proof for the terminal transitions (`complete`/`fail`/`reject`): they check only `status = claimed`, not a claim token, epoch, or matching worker. A worker that timed out may therefore still attempt a terminal transition after the action is reassigned. Until fencing is added for those commands specifically, do not claim exclusive terminal authority or stale-owner rejection for complete/fail/reject.
+Terminal transitions require matching worker and claim receipt while the lease is
+live; the row update and event commit are the fencing linearization point. An
+expired-but-unswept claimant cannot settle. Controller cancellation locks the
+row, records a cancellation request, clears the live receipt/lease, and moves
+the action to `cancelling`. This commit fences renewal, settlement, and sweep.
+The supervisor acknowledges process death or a bounded reaper finalizes without
+claiming that a process stopped before that evidence exists.
 
 `renew` is a narrower exception: it does check `claimed_by` against the requesting worker (see "Claim/lease authority commands" above), because that specific comparison is implemented and tested. This does not extend to the terminal transitions -- they remain as described in this section until a separate, explicitly authorized change adds claimant proof there too.
 

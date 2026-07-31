@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import time
@@ -797,11 +798,14 @@ def _transition_terminal(
             SET status = %s,
                 completed_at = now(),
                 result_ref = COALESCE(%s, result_ref),
-                failure_reason = COALESCE(%s, failure_reason)
+                failure_reason = COALESCE(%s, failure_reason),
+                claimed_at = NULL, claimed_by = NULL, claim_deadline = NULL,
+                claim_receipt = NULL
             WHERE id = %s
               AND status IN ({allowed_sql})
               AND claimed_by = %s
               AND claim_receipt = %s
+              AND claim_deadline > now()
             RETURNING *
             """,
             (status, result_ref, failure_reason, action_id, worker, claim_receipt),
@@ -910,18 +914,63 @@ def cancel(
     *,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
-    return _transition_terminal(
-        conn,
-        schema,
-        action_id=action_id,
-        status="cancelled",
-        event_type="action_cancelled",
-        actor=actor,
-        failure_reason=reason,
-        payload={"reason": reason, "cancelled_by": actor},
-        allowed_statuses=("pending", "claimed"),
-        provenance=provenance,
-    )
+    with conn.transaction():
+        row = conn.execute(
+            f"SELECT * FROM {qname(schema, 'actions')} WHERE id = %s FOR UPDATE", (action_id,)
+        ).fetchone()
+        if row is None or row["status"] not in ("pending", "claimed"):
+            raise ActionQError(f"Action #{action_id} cannot be cancelled")
+        if row["status"] == "pending":
+            updated = conn.execute(
+                f"UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(), failure_reason=%s WHERE id=%s RETURNING *",
+                (reason, action_id),
+            ).fetchone()
+            event_type = "action_cancelled"
+            payload = {"reason": reason, "cancelled_by": actor, "stop_acknowledged": True}
+        else:
+            request_id = str(uuid.uuid4())
+            updated = conn.execute(
+                f"""UPDATE {qname(schema, 'actions')} SET status='cancelling', cancel_request_id=%s,
+                    cancel_stop_deadline=now() + interval '30 seconds', stop_acknowledged=false,
+                    claim_receipt=NULL, claim_deadline=NULL WHERE id=%s RETURNING *""",
+                (request_id, action_id),
+            ).fetchone()
+            event_type = "action_cancelling"
+            receipt = row["claim_receipt"] or ""
+            payload = {"reason": reason, "cancelled_by": actor, "cancel_request_id": request_id,
+                       "former_claimed_by": row["claimed_by"],
+                       "former_receipt_digest": "sha256:" + hashlib.sha256(receipt.encode()).hexdigest()}
+        insert_event(conn, schema, action_id=action_id, event_type=event_type, actor=actor,
+                     payload=event_payload_with_provenance(payload, provenance))
+    return dict(updated)
+
+
+def acknowledge_cancellation(conn, schema: str, action_id: int, *, cancel_request_id: str, runner: str) -> dict:
+    """Idempotently finalize a fenced cancellation after supervisor stop confirmation."""
+    with conn.transaction():
+        row = conn.execute(
+            f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
+                stop_acknowledged=true WHERE id=%s AND status='cancelling'
+                AND cancel_request_id=%s RETURNING *""", (action_id, cancel_request_id)
+        ).fetchone()
+        if row is None:
+            raise ActionQError(f"Action #{action_id} cancellation acknowledgement rejected")
+        insert_event(conn, schema, action_id=action_id, event_type="action_cancelled",
+                     actor=runner, payload={"cancel_request_id": cancel_request_id, "stop_acknowledged": True})
+    return dict(row)
+
+
+def reap_cancellations(conn, schema: str, *, actor: str = "actionctl:cancel-reaper") -> list[dict]:
+    with conn.transaction():
+        rows = conn.execute(
+            f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
+                stop_acknowledged=false WHERE status='cancelling' AND cancel_stop_deadline < now()
+                RETURNING *"""
+        ).fetchall()
+        for row in rows:
+            insert_event(conn, schema, action_id=row["id"], event_type="action_cancelled", actor=actor,
+                         payload={"cancel_request_id": str(row["cancel_request_id"]), "stop_acknowledged": False})
+    return [dict(row) for row in rows]
 
 
 def sweep(

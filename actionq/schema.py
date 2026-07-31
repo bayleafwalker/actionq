@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 3
+MAX_SCHEMA_VERSION = 4
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
@@ -39,6 +39,9 @@ _COLUMN_SHAPE = {
         "claimed_by": ("text", "YES", None),
         "claim_deadline": ("timestamp with time zone", "YES", None),
         "claim_receipt": ("text", "YES", None),
+        "cancel_request_id": ("uuid", "YES", None),
+        "cancel_stop_deadline": ("timestamp with time zone", "YES", None),
+        "stop_acknowledged": ("boolean", "YES", None),
         "completed_at": ("timestamp with time zone", "YES", None),
         "result_ref": ("text", "YES", None),
         "failure_reason": ("text", "YES", None),
@@ -589,6 +592,7 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
         + ", ".join(f"'{status}'::text" for status in (
             "pending",
             "claimed",
+            "cancelling",
             "completed",
             "failed",
             "rejected",
