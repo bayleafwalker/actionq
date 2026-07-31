@@ -198,6 +198,8 @@ class CoordinatorClient(Protocol):
     def renew(self, action_id: int, *, worker: str, timeout_minutes: int, claim_receipt: str) -> None: ...
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None: ...
     def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None: ...
+    def register_publication(self, action_id: int, *, publication: dict[str, Any],
+                             actor: str, claim_receipt: str) -> dict[str, Any]: ...
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None: ...
     def show(self, action_id: int) -> dict[str, Any]: ...
     def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
@@ -315,6 +317,27 @@ class ActionctlClient:
         proof = self._proof(runner_id=actor, operation="execution.action.complete", resource=f"action:{action_id}")
         self._run("complete", str(action_id), "--result", result_ref, "--proof-stdin",
                   input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
+
+    def register_publication(self, action_id: int, *, publication: dict[str, Any],
+                             actor: str, claim_receipt: str) -> dict[str, Any]:
+        attempt_id = str(publication["attempt_id"])
+        resource = f"action:{action_id}:publication:{attempt_id}"
+        proof = self._proof(
+            runner_id=actor, operation="execution.action.register-publication", resource=resource,
+        )
+        result = self._run(
+            "register-publication", str(action_id), "--proof-stdin",
+            input_text=json.dumps({
+                "claim_receipt": claim_receipt,
+                "runner_proof": proof,
+                "attempt_id": attempt_id,
+                "journal_ref": str(publication["journal_ref"]),
+                "source_commit": str(publication["source_commit"]),
+                "candidate_commit": str(publication["candidate_commit"]),
+            }),
+        )
+        assert result is not None
+        return result
 
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
         proof = self._proof(runner_id=actor, operation="execution.action.fail", resource=f"action:{action_id}")
@@ -755,6 +778,9 @@ class Daemon:
         git_evidence = None
         if record.worktree and record.base_commit:
             git_evidence = collect_git_evidence_bounded(Path(record.worktree), record.base_commit)
+        publication_resumed = self._resume_interrupted_publication(
+            record.action_id, record.action_type, record.session_id,
+        )
         publication_reconciled = self._reconcile_terminal_publication(
             record.action_id, record.action_type,
         )
@@ -778,6 +804,7 @@ class Daemon:
                 "sprint_takeup_release": released,
                 "git": git_evidence,
                 "publication_reconciled": publication_reconciled,
+                "publication_resumed": publication_resumed,
             },
         )
         self._write_state(None)
@@ -816,8 +843,31 @@ class Daemon:
         policy = self.actions.get(str(action.get("action_type") or ""))
         return policy if policy is not None and policy.publish_candidate else None
 
+    def _resume_interrupted_publication(
+        self, action_id: int, action_type: str, attempt_id: str,
+    ) -> bool:
+        policy = self.actions.get(action_type)
+        if policy is None or not policy.publish_candidate or self.config.artifact_root is None:
+            return False
+        attempts = self._runnerctl_json(
+            "journal-list", "--artifact-root", str(self.config.artifact_root),
+            "--action-id", str(action_id),
+        )
+        interrupted = next(
+            (value for value in attempts
+             if value.get("attempt_id") == attempt_id and value.get("status") == "incomplete"),
+            None,
+        )
+        if interrupted is None:
+            return False
+        self._runnerctl_json(
+            "journal-resume", "--artifact-root", str(self.config.artifact_root),
+            "--action-id", str(action_id), "--attempt-id", attempt_id,
+        )
+        return True
+
     def _ack_publication_settlement(
-        self, publication: dict[str, Any], *, terminal_status: str, result_ref: str,
+        self, publication: dict[str, Any], *, authoritative_decision: dict[str, Any],
     ) -> None:
         assert self.config.artifact_root is not None
         self._runnerctl_json("settlement-ack", "--packet-stdin", input_value={
@@ -825,8 +875,9 @@ class Daemon:
             "action_id": int(publication["action_id"]),
             "attempt_id": str(publication["attempt_id"]),
             "journal_ref": str(publication["journal_ref"]),
-            "terminal_status": terminal_status,
-            "result_ref": result_ref,
+            "terminal_status": "completed",
+            "result_ref": str(publication["journal_ref"]),
+            "authoritative_decision": authoritative_decision,
         })
 
     def _complete_published(
@@ -839,11 +890,32 @@ class Daemon:
                 claim_receipt=claim_receipt,
             )
         except Exception:
-            current = self.client.show(action_id).get("action", {})
-            if current.get("status") != "completed" or current.get("result_ref") != result_ref:
+            history = self.client.show(action_id)
+            current = history.get("action", {})
+            completed = any(
+                event.get("event_type") == "action_completed"
+                and event.get("payload", {}).get("result_ref") == result_ref
+                for event in history.get("events", [])
+            )
+            if (current.get("status") != "completed"
+                    or current.get("result_ref") != result_ref or not completed):
                 raise
+        else:
+            history = self.client.show(action_id)
+            current = history.get("action", {})
+            completed = any(
+                event.get("event_type") == "action_completed"
+                and event.get("payload", {}).get("result_ref") == result_ref
+                for event in history.get("events", [])
+            )
+            if (current.get("status") != "completed"
+                    or current.get("result_ref") != result_ref or not completed):
+                raise RuntimeError("ActionQ completion lacks matching terminal history")
         self._ack_publication_settlement(
-            publication, terminal_status="completed", result_ref=result_ref,
+            publication, authoritative_decision={
+                "action_id": action_id, "status": "completed", "result_ref": result_ref,
+                "completed_at": str(current.get("completed_at") or ""),
+            },
         )
         self.client.emit(
             "publication.settled", action_id=action_id, actor=self.actor,
@@ -860,6 +932,17 @@ class Daemon:
             "--action-id", str(action["id"]),
         )
         if publication is None:
+            return False
+        history = self.client.show(int(action["id"]))
+        registered = any(
+            event.get("event_type") == "publication.registered"
+            and event.get("payload", {}).get("attempt_id") == publication.get("attempt_id")
+            and event.get("payload", {}).get("journal_ref") == publication.get("journal_ref")
+            and event.get("payload", {}).get("source_commit") == publication.get("source_commit")
+            and event.get("payload", {}).get("candidate_commit") == publication.get("candidate_commit")
+            for event in history.get("events", [])
+        )
+        if not registered:
             return False
         receipt = str(action.get("claim_receipt") or "")
         if not receipt:
@@ -887,12 +970,22 @@ class Daemon:
         )
         if settled is not None:
             return True
-        current = self.client.show(action_id).get("action", {})
+        history = self.client.show(action_id)
+        current = history.get("action", {})
         result_ref = str(publication["journal_ref"])
-        if current.get("status") != "completed" or current.get("result_ref") != result_ref:
+        completed = any(
+            event.get("event_type") == "action_completed"
+            and event.get("payload", {}).get("result_ref") == result_ref
+            for event in history.get("events", [])
+        )
+        if (current.get("status") != "completed"
+                or current.get("result_ref") != result_ref or not completed):
             return False
         self._ack_publication_settlement(
-            publication, terminal_status="completed", result_ref=result_ref,
+            publication, authoritative_decision={
+                "action_id": action_id, "status": "completed", "result_ref": result_ref,
+                "completed_at": str(current.get("completed_at") or ""),
+            },
         )
         self.client.emit(
             "publication.settled", action_id=action_id, actor=self.actor,
@@ -1219,6 +1312,10 @@ class Daemon:
                     action_id=action_id, envelope=envelope, scope_result=scope_result,
                     exit_code=exit_code, output_path=output_path,
                     test_command=action_config.scope_iterate.test_command,
+                )
+                self.client.register_publication(
+                    action_id, publication=publication, actor=self.config.runner_id,
+                    claim_receipt=claim_receipt,
                 )
                 self._after_publication(publication)
             released = self._takeup_release(project, session_id, f"session-{outcome}")

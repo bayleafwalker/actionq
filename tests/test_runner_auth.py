@@ -118,3 +118,128 @@ def test_ack_replay_is_bound_to_exact_operation_and_resource(signed_runner_proof
                 operation="execution.action.cancel-ack", resource="action:1:cancel:other",
                 action_id=None, allow_replay=True,
             )
+
+
+def _publication_fixture(schema: str):
+    with db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"]) as migration:
+        db.migrate(migration, schema)
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        action = db.enqueue(
+            conn, schema, action_type="scope-iterate", project="demo", target_ref="2032",
+            source_refs=[], priority=100, parent_id=None, created_by="human:test",
+        )
+        claimed = db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+    return action, claimed
+
+
+def _publication_arguments(action_id: int, receipt: str, proof: dict):
+    return {
+        "action_id": action_id,
+        "attempt_id": "attempt-2032",
+        "journal_ref": "artifact:sha256:" + "a" * 64,
+        "source_commit": "b" * 40,
+        "candidate_commit": "c" * 40,
+        "claim_receipt": receipt,
+        "runner_proof": proof,
+    }
+
+
+def test_publication_registration_is_fenced_sanitized_and_exactly_replayable(signed_runner_proof):
+    schema = _schema()
+    action, claimed = _publication_fixture(schema)
+    proof = signed_runner_proof(
+        "worker:one", "execution.action.register-publication",
+        f"action:{action['id']}:publication:attempt-2032",
+    )
+    app = ActionQApplication(
+        schema=schema,
+        connection_factory=lambda: db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]),
+    )
+    arguments = _publication_arguments(action["id"], claimed["claim_receipt"], proof)
+    registered = app.register_publication(**arguments)
+    replay = app.register_publication(**arguments)
+    assert replay == registered
+    assert registered["claim_receipt_digest"] == db.receipt_digest(claimed["claim_receipt"])
+    with pytest.raises(db.ActionQError, match="conflicts"):
+        app.register_publication(**{**arguments, "journal_ref": "artifact:sha256:" + "d" * 64})
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        events = db.action_events(conn, schema, action["id"])
+    publications = [event for event in events if event["event_type"] == "publication.registered"]
+    assert len(publications) == 1
+    payload = publications[0]["payload"]
+    assert payload["journal_ref"] == arguments["journal_ref"]
+    assert claimed["claim_receipt"] not in db.to_json(payload)
+    assert not any("worktree" in key or "path" in key for key in payload)
+
+
+@pytest.mark.parametrize("history", ("expired", "reclaimed", "cancelled"))
+def test_publication_registration_rejects_nonlive_claim_histories(signed_runner_proof, history):
+    schema = _schema()
+    action, claimed = _publication_fixture(schema)
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        if history == "expired":
+            conn.execute(
+                f"UPDATE {db.qname(schema, 'actions')} SET claim_deadline=now() - interval '1 second' WHERE id=%s",
+                (action["id"],),
+            )
+        elif history == "reclaimed":
+            conn.execute(
+                f"UPDATE {db.qname(schema, 'actions')} SET claim_deadline=now() - interval '1 second' WHERE id=%s",
+                (action["id"],),
+            )
+            db.sweep(conn, schema)
+            db.claim(conn, schema, worker="worker:test", timeout_minutes=30)
+        else:
+            db.cancel(conn, schema, action["id"], "controller cancellation", actor="controller")
+    proof = signed_runner_proof(
+        "worker:one", "execution.action.register-publication",
+        f"action:{action['id']}:publication:attempt-2032",
+    )
+    app = ActionQApplication(
+        schema=schema,
+        connection_factory=lambda: db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]),
+    )
+    with pytest.raises(db.ActionQError, match="publication registration rejected"):
+        app.register_publication(**_publication_arguments(action["id"], claimed["claim_receipt"], proof))
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        events = db.action_events(conn, schema, action["id"])
+    assert not any(event["event_type"] == "publication.registered" for event in events)
+
+
+@pytest.mark.parametrize("history", ("register-then-cancel", "cancel-then-register"))
+def test_publication_registration_and_cancellation_serialize_on_action_row(
+    signed_runner_proof, history,
+):
+    """Real PostgreSQL Depth-2 histories at the upload/terminal boundary."""
+    schema = _schema()
+    action, claimed = _publication_fixture(schema)
+    proof = signed_runner_proof(
+        "worker:one", "execution.action.register-publication",
+        f"action:{action['id']}:publication:attempt-2032",
+    )
+    app = ActionQApplication(
+        schema=schema,
+        connection_factory=lambda: db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]),
+    )
+    arguments = _publication_arguments(action["id"], claimed["claim_receipt"], proof)
+    if history == "register-then-cancel":
+        app.register_publication(**arguments)
+        with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+            db.cancel(conn, schema, action["id"], "controller cancellation", actor="controller")
+    else:
+        with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+            db.cancel(conn, schema, action["id"], "controller cancellation", actor="controller")
+        with pytest.raises(db.ActionQError, match="publication registration rejected"):
+            app.register_publication(**arguments)
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        current = db.get_action(conn, schema, action["id"])
+        events = db.action_events(conn, schema, action["id"])
+        with pytest.raises(db.ActionQError, match="cannot transition"):
+            db.complete(
+                conn, schema, action["id"], "artifact:sha256:" + "a" * 64,
+                actor="worker:one", worker="worker:one",
+                claim_receipt=claimed["claim_receipt"],
+            )
+    assert current["status"] == "cancelling"
+    registrations = [event for event in events if event["event_type"] == "publication.registered"]
+    assert len(registrations) == (1 if history == "register-then-cancel" else 0)

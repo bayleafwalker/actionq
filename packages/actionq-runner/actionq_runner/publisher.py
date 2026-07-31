@@ -301,10 +301,8 @@ def _make_bundle(worktree: Path, temporary: Path) -> bytes:
     return temporary.read_bytes()
 
 
-def publish(
-    packet: Mapping[str, Any], *, fault_after: str | None = None, allow_unsafe_test_root: bool = False,
-) -> dict[str, Any]:
-    """Validate and immutably publish one candidate; safe to retry after restart."""
+def _preflight(packet: Mapping[str, Any], *, allow_unsafe_test_root: bool) -> tuple[Path, dict[str, Any]]:
+    """Return a sanitized, normalized recovery intent without writing anything."""
     _reject_forbidden(packet)  # No filesystem mutation may precede this check.
     required = {
         "artifact_root", "action_id", "attempt_id", "worktree", "source_commit", "candidate_commit",
@@ -342,7 +340,8 @@ def publish(
         raise ValueError("redacted_log must be text")
     log_bytes = log.encode("utf-8")
     if len(log_bytes) > MAX_REDACTED_LOG_BYTES:
-        log_bytes = log_bytes[:MAX_REDACTED_LOG_BYTES - len(_TRUNCATED)] + _TRUNCATED
+        prefix = log_bytes[:MAX_REDACTED_LOG_BYTES - len(_TRUNCATED)].decode("utf-8", "ignore")
+        log = prefix + _TRUNCATED.decode("ascii")
 
     if _run_git(worktree, "status", "--porcelain=v1", "--untracked-files=all") != "":
         raise ValueError("candidate worktree must be clean")
@@ -359,20 +358,97 @@ def publish(
     candidate_tree = str(_run_git(worktree, "rev-parse", f"{candidate}^{{tree}}")).strip()
     paths = _changed_paths(worktree, source, candidate)
 
-    artifact_root = Path(str(packet["artifact_root"]))
-    resolved_artifact_root = artifact_root.resolve()
+    supplied_artifact_root = Path(str(packet["artifact_root"]))
+    resolved_artifact_root = supplied_artifact_root.resolve()
     if (resolved_artifact_root == worktree or worktree in resolved_artifact_root.parents
             or resolved_artifact_root in worktree.parents):
         raise ValueError("artifact_root may not be in or contain the worktree")
+    artifact_root = _existing_root(
+        supplied_artifact_root, allow_unsafe_test_root=allow_unsafe_test_root,
+    )
+    return artifact_root, {
+        "action_id": action_id, "attempt_id": attempt_id, "worktree": os.fspath(worktree),
+        "source_commit": source, "candidate_commit": candidate, "source_tree": source_tree,
+        "candidate_tree": candidate_tree, "changed_paths": list(paths),
+        "execution_envelope": envelope, "execution": execution,
+        "verification_outcome": outcome, "verification_evidence": packet["verification_evidence"],
+        "redacted_log": log,
+    }
+
+
+def _intent_payload(event: Mapping[str, Any]) -> dict[str, Any]:
+    if event.get("contract_id") != JOURNAL_CONTRACT or event.get("stage") != "intent":
+        raise RuntimeError("publication intent is invalid")
+    intent = {key: value for key, value in event.items() if key not in {"contract_id", "stage"}}
+    expected = {
+        "action_id", "attempt_id", "worktree", "source_commit", "candidate_commit", "source_tree",
+        "candidate_tree", "changed_paths", "execution_envelope", "execution",
+        "verification_outcome", "verification_evidence", "redacted_log",
+    }
+    if set(intent) != expected:
+        raise RuntimeError("publication intent fields are invalid")
+    _reject_forbidden(intent, "intent")
+    action_id, attempt_id = intent["action_id"], intent["attempt_id"]
+    if not isinstance(action_id, int) or action_id <= 0 or not isinstance(attempt_id, str) or not attempt_id:
+        raise RuntimeError("publication intent attempt identity is invalid")
+    for field in ("source_commit", "candidate_commit", "source_tree", "candidate_tree"):
+        try:
+            _exact_oid(intent[field], field)
+        except ValueError as exc:
+            raise RuntimeError("publication intent Git identity is invalid") from exc
+    paths = intent["changed_paths"]
+    if (not isinstance(paths, list) or paths != sorted(paths) or len(paths) != len(set(paths))
+            or any(not isinstance(path, str) or path.startswith("/") or ".." in Path(path).parts for path in paths)):
+        raise RuntimeError("publication intent changed paths are invalid")
+    envelope, execution = intent["execution_envelope"], intent["execution"]
+    try:
+        if require_compatible(envelope) != EXECUTION_ENVELOPE_V1 or require_compatible(execution) != EXECUTION_V1:
+            raise ValueError("wrong execution contract")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("publication intent execution contracts are invalid") from exc
+    if (envelope["action_id"] != action_id or execution["action_id"] != action_id
+            or envelope["attempt_id"] != attempt_id or execution["attempt_id"] != attempt_id
+            or envelope["source_commit"] != intent["source_commit"]
+            or envelope["command_id"] != execution["command_id"]):
+        raise RuntimeError("publication intent execution binding is invalid")
+    if intent["verification_outcome"] not in {"passed", "failed", "skipped"}:
+        raise RuntimeError("publication intent verification outcome is invalid")
+    if not isinstance(intent["redacted_log"], str):
+        raise RuntimeError("publication intent redacted log is invalid")
+    canonical_bytes(intent["verification_evidence"])
+    return intent
+
+
+def _continue_publication(
+    artifact_root: Path, journal: _Journal, intent: Mapping[str, Any], *,
+    fault_after: str | None, allow_unsafe_test_root: bool,
+) -> dict[str, Any]:
+    """Continue solely from durable sanitized intent and stage events."""
+    action_id, attempt_id = int(intent["action_id"]), str(intent["attempt_id"])
+    source, candidate = str(intent["source_commit"]), str(intent["candidate_commit"])
+    source_tree, candidate_tree = str(intent["source_tree"]), str(intent["candidate_tree"])
+    paths = tuple(str(path) for path in intent["changed_paths"])
+    envelope, execution = dict(intent["execution_envelope"]), dict(intent["execution"])
+    outcome = str(intent["verification_outcome"])
+    evidence_bytes = canonical_bytes(intent["verification_evidence"])
+    log_bytes = str(intent["redacted_log"]).encode("utf-8")
     store = FilesystemCAS(artifact_root, allow_unsafe_test_root=allow_unsafe_test_root)
-    journal = _Journal(store.root, action_id, attempt_id)
     prior_bundle = journal.read("bundle")
     if prior_bundle:
-        if prior_bundle.get("source_commit") != source or prior_bundle.get("candidate_commit") != candidate:
+        expected_bundle = {
+            "action_id": action_id, "attempt_id": attempt_id, "source_commit": source,
+            "candidate_commit": candidate, "source_tree": source_tree, "candidate_tree": candidate_tree,
+        }
+        if any(prior_bundle.get(key) != value for key, value in expected_bundle.items()):
             raise RuntimeError("journal belongs to a different candidate")
         bundle_ref = str(prior_bundle["bundle_ref"])
         store.get(bundle_ref)
     else:
+        worktree = Path(str(intent["worktree"])).resolve(strict=True)
+        if _run_git(worktree, "status", "--porcelain=v1", "--untracked-files=all") != "":
+            raise ValueError("candidate worktree must be clean")
+        if _run_git(worktree, "rev-parse", "HEAD").strip() != candidate:
+            raise ValueError("candidate commit is promotion-stale")
         descriptor, temporary_name = tempfile.mkstemp(prefix=".bundle-", dir=store.root)
         os.close(descriptor)
         temporary = Path(temporary_name)
@@ -439,10 +515,27 @@ def publish(
     return state
 
 
+def publish(
+    packet: Mapping[str, Any], *, fault_after: str | None = None, allow_unsafe_test_root: bool = False,
+) -> dict[str, Any]:
+    """Validate, persist sanitized intent, and immutably publish one candidate."""
+    artifact_root, intent = _preflight(packet, allow_unsafe_test_root=allow_unsafe_test_root)
+    journal = _Journal(artifact_root, int(intent["action_id"]), str(intent["attempt_id"]))
+    # Intent is the first durable publication write. Exact create-only replay
+    # prevents an attempt identity from being rebound to a different packet.
+    journal.write("intent", intent)
+    persisted = journal.read("intent")
+    assert persisted is not None
+    return _continue_publication(
+        artifact_root, journal, _intent_payload(persisted), fault_after=fault_after,
+        allow_unsafe_test_root=allow_unsafe_test_root,
+    )
+
+
 def _existing_root(root: Path | str, *, allow_unsafe_test_root: bool = False) -> Path:
     path = Path(root)
     if not path.is_absolute() or not path.is_dir() or path.is_symlink():
-        raise ValueError("artifact_root must be an existing absolute directory")
+        raise ValueError("artifact_root must be a provisioned existing absolute directory")
     info = path.stat()
     if info.st_uid != os.geteuid() or info.st_mode & 0o077:
         raise PermissionError("artifact_root must be owner-only")
@@ -464,7 +557,7 @@ def _existing_root(root: Path | str, *, allow_unsafe_test_root: bool = False) ->
 def list_publications(
     artifact_root: Path | str, action_id: int, *, allow_unsafe_test_root: bool = False,
 ) -> list[dict[str, Any]]:
-    """List complete private journal roots, newest durable event first."""
+    """List complete publications and safe summaries of interrupted attempts."""
     if not isinstance(action_id, int) or action_id <= 0:
         raise ValueError("action_id must be positive")
     root = _existing_root(artifact_root, allow_unsafe_test_root=allow_unsafe_test_root)
@@ -476,14 +569,60 @@ def list_publications(
         if attempt.is_symlink() or not attempt.is_dir():
             raise RuntimeError("unsafe publication journal entry")
         journal = _Journal(root, action_id, attempt.name)
+        intent_event = journal.read("intent")
+        if intent_event is None:
+            raise RuntimeError("publication journal is missing its intent")
+        intent = _intent_payload(intent_event)
         complete = journal.read("complete")
         if complete is not None:
             state = {key: value for key, value in complete.items() if key not in {"contract_id", "stage"}}
-            publications.append((
-                (attempt / "complete.json").stat().st_mtime_ns,
-                state,
-            ))
+            publications.append(((attempt / "complete.json").stat().st_mtime_ns, state))
+            continue
+        latest_stage = "intent"
+        summary: dict[str, Any] = {
+            "action_id": action_id, "attempt_id": attempt.name, "status": "incomplete",
+            "latest_stage": latest_stage, "source_commit": intent["source_commit"],
+            "candidate_commit": intent["candidate_commit"], "source_tree": intent["source_tree"],
+            "candidate_tree": intent["candidate_tree"],
+        }
+        latest_path = attempt / "intent.json"
+        bundle = journal.read("bundle")
+        if bundle is not None:
+            latest_stage, latest_path = "bundle", attempt / "bundle.json"
+            summary.update({"latest_stage": latest_stage, "bundle_ref": bundle["bundle_ref"]})
+        objects = journal.read("objects")
+        if objects is not None:
+            latest_stage, latest_path = "objects", attempt / "objects.json"
+            summary.update({
+                "latest_stage": latest_stage, "journal_ref": objects["journal_ref"],
+                "records": objects["records"],
+            })
+        publications.append((latest_path.stat().st_mtime_ns, summary))
     return [value for _, value in sorted(publications, key=lambda item: (-item[0], item[1]["attempt_id"]))]
+
+
+def resume_publication(
+    artifact_root: Path | str, action_id: int, attempt_id: str, *,
+    fault_after: str | None = None, allow_unsafe_test_root: bool = False,
+) -> dict[str, Any]:
+    """Resume an interrupted publication using only its durable intent."""
+    if not isinstance(action_id, int) or action_id <= 0:
+        raise ValueError("action_id must be positive")
+    root = _existing_root(artifact_root, allow_unsafe_test_root=allow_unsafe_test_root)
+    directory = root / "journals" / str(action_id) / attempt_id
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("publication intent does not exist")
+    journal = _Journal(root, action_id, attempt_id)
+    event = journal.read("intent")
+    if event is None:
+        raise ValueError("publication intent does not exist")
+    intent = _intent_payload(event)
+    if intent["action_id"] != action_id or intent["attempt_id"] != attempt_id:
+        raise RuntimeError("publication intent identity mismatch")
+    return _continue_publication(
+        root, journal, intent, fault_after=fault_after,
+        allow_unsafe_test_root=allow_unsafe_test_root,
+    )
 
 
 def recover_publication(
@@ -491,7 +630,11 @@ def recover_publication(
     allow_unsafe_test_root: bool = False,
 ) -> dict[str, Any] | None:
     """Recover a complete publication and verify every referenced CAS byte."""
-    values = list_publications(artifact_root, action_id, allow_unsafe_test_root=allow_unsafe_test_root)
+    values = [
+        value for value in list_publications(
+            artifact_root, action_id, allow_unsafe_test_root=allow_unsafe_test_root,
+        ) if value.get("status") != "incomplete"
+    ]
     if attempt_id is not None:
         values = [value for value in values if value["attempt_id"] == attempt_id]
     if not values:
@@ -511,7 +654,10 @@ def acknowledge_settlement(
 ) -> dict[str, Any]:
     """Append the one idempotent ActionQ settlement acknowledgement."""
     _reject_forbidden(packet)
-    required = {"artifact_root", "action_id", "attempt_id", "journal_ref", "terminal_status", "result_ref"}
+    required = {
+        "artifact_root", "action_id", "attempt_id", "journal_ref", "terminal_status", "result_ref",
+        "authoritative_decision",
+    }
     if set(packet) != required:
         raise ValueError("invalid settlement acknowledgement packet")
     action_id, attempt_id = packet["action_id"], packet["attempt_id"]
@@ -522,15 +668,25 @@ def acknowledge_settlement(
     if publication is None or publication["journal_ref"] != packet["journal_ref"]:
         raise ValueError("settlement acknowledgement does not bind a complete publication")
     status = packet["terminal_status"]
-    if status not in {"completed", "failed", "cancelled", "rejected"}:
-        raise ValueError("invalid terminal status")
+    if status != "completed":
+        raise ValueError("publication settlement acknowledgement requires completed status")
     result_ref = str(packet["result_ref"])
-    if not (_DIGEST.fullmatch(result_ref) or re.fullmatch(r"sha256:[0-9a-f]{64}", result_ref)):
-        raise ValueError("result_ref must be a content digest")
+    if result_ref != packet["journal_ref"]:
+        raise ValueError("completed ActionQ result_ref must equal the publication journal_ref")
+    decision = packet["authoritative_decision"]
+    if not isinstance(decision, Mapping) or set(decision) != {
+        "action_id", "status", "result_ref", "completed_at",
+    }:
+        raise ValueError("authoritative_decision fields are ambiguous")
+    if (decision["action_id"] != action_id or decision["status"] != "completed"
+            or decision["result_ref"] != result_ref
+            or not isinstance(decision["completed_at"], str) or not decision["completed_at"]):
+        raise ValueError("authoritative_decision does not match completed publication settlement")
     value = {
         "contract_id": JOURNAL_CONTRACT, "stage": "settlement", "action_id": action_id,
         "attempt_id": attempt_id, "journal_ref": packet["journal_ref"],
         "terminal_status": status, "result_ref": result_ref,
+        "authoritative_decision": dict(decision),
     }
     journal = _Journal(Path(str(packet["artifact_root"])), action_id, str(attempt_id))
     journal.write("settlement", {key: item for key, item in value.items() if key not in {"contract_id", "stage"}})
@@ -551,5 +707,5 @@ def query_settlement(
 
 __all__ = [
     "ArtifactStore", "FilesystemCAS", "MAX_REDACTED_LOG_BYTES", "acknowledge_settlement", "artifact_ref",
-    "list_publications", "publish", "query_settlement", "recover_publication",
+    "list_publications", "publish", "query_settlement", "recover_publication", "resume_publication",
 ]

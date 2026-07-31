@@ -21,6 +21,7 @@ class Client:
         self.result_ref = None
         self.status = "completed"
         self.reconciled = []
+        self.registered = []
 
     def complete(self, action_id, *, result_ref, actor, claim_receipt):
         self.completed.append((action_id, result_ref, actor, claim_receipt))
@@ -29,7 +30,22 @@ class Client:
             raise RuntimeError("response lost after commit")
 
     def show(self, action_id):
-        return {"action": {"id": action_id, "status": self.status, "result_ref": self.result_ref}}
+        events = []
+        if self.result_ref is not None:
+            events.append({"event_type": "action_completed", "payload": {"result_ref": self.result_ref}})
+        events.extend(self.registered)
+        return {"action": {"id": action_id, "status": self.status, "result_ref": self.result_ref,
+                           "completed_at": "2026-07-31T12:00:00Z"},
+                "events": events}
+
+    def register_publication(self, action_id, *, publication, actor, claim_receipt):
+        event = {"event_type": "publication.registered", "payload": {
+            key: publication[key] for key in (
+                "attempt_id", "journal_ref", "source_commit", "candidate_commit"
+            )
+        }}
+        self.registered.append(event)
+        return event
 
     def emit(self, event_type, *, action_id, actor, payload):
         self.events.append((event_type, action_id, actor, payload))
@@ -54,13 +70,20 @@ class PublicationDaemon(Daemon):
             return self.recovered
         if args[0] == "settlement-query":
             return None
+        if args[0] == "journal-list":
+            return ([{"action_id": 2032, "attempt_id": "attempt-old",
+                      "status": "incomplete", "latest_stage": "bundle"}]
+                    if self.recovered == "incomplete" else [])
+        if args[0] == "journal-resume":
+            return publication()
         if args[0] in {"settlement-ack", "publish"}:
             return ({"ok": True} if args[0] == "settlement-ack" else self.recovered)
         raise AssertionError(args)
 
 
 def publication():
-    return {"action_id": 2032, "attempt_id": "attempt-old", "journal_ref": JOURNAL_REF}
+    return {"action_id": 2032, "attempt_id": "attempt-old", "journal_ref": JOURNAL_REF,
+            "source_commit": "b" * 40, "candidate_commit": "c" * 40}
 
 
 def test_completion_response_loss_is_reconciled_before_settlement_ack():
@@ -73,12 +96,17 @@ def test_completion_response_loss_is_reconciled_before_settlement_ack():
         "artifact_root": "/durable/actionq", "action_id": 2032,
         "attempt_id": "attempt-old", "journal_ref": JOURNAL_REF,
         "terminal_status": "completed", "result_ref": JOURNAL_REF,
+        "authoritative_decision": {"action_id": 2032, "status": "completed",
+                                   "result_ref": JOURNAL_REF,
+                                   "completed_at": "2026-07-31T12:00:00Z"},
     }
     assert [event[0] for event in client.events] == ["publication.settled"]
 
 
 def test_reclaimed_action_settles_recovered_publication_without_execution():
     client = Client()
+    client.register_publication(2032, publication=publication(), actor="runner:devbox",
+                                claim_receipt="old-memory-only")
     daemon = PublicationDaemon(client, recovered=publication())
     action = {
         "id": 2032, "action_type": "scope-iterate", "claim_receipt": "new-live-receipt",
@@ -87,6 +115,25 @@ def test_reclaimed_action_settles_recovered_publication_without_execution():
     assert client.completed[0][1] == JOURNAL_REF
     assert client.reconciled == [(2032, "attempt-old")]
     assert daemon.commands[0][0][0] == "journal-recover"
+
+
+def test_unregistered_recovered_publication_is_not_adopted_by_new_claim():
+    client = Client()
+    daemon = PublicationDaemon(client, recovered=publication())
+    assert daemon._settle_recovered_publication({
+        "id": 2032, "action_type": "scope-iterate", "claim_receipt": "new-live-receipt",
+    }) is False
+    assert not client.completed
+
+
+def test_daemon_restart_resumes_exact_interrupted_attempt_without_packet():
+    daemon = PublicationDaemon(Client(), recovered="incomplete")
+    assert daemon._resume_interrupted_publication(
+        2032, "scope-iterate", "attempt-old",
+    ) is True
+    assert [args[0] for args, _ in daemon.commands] == ["journal-list", "journal-resume"]
+    resume_args = daemon.commands[-1][0]
+    assert resume_args[-2:] == ("--attempt-id", "attempt-old")
 
 
 def test_no_recovered_publication_falls_through_to_normal_execution():

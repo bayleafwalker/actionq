@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from actionq_runner.publisher import (
     publish,
     query_settlement,
     recover_publication,
+    resume_publication,
 )
 
 
@@ -101,6 +103,51 @@ def test_fault_recovery_after_durable_stage(candidate, stage):
     assert recover_publication(root, 2032, allow_unsafe_test_root=True) == result
 
 
+@pytest.mark.parametrize("stage", ["bundle", "objects"])
+def test_fresh_process_resumes_from_sanitized_intent_without_packet(candidate, stage):
+    _, root, packet = candidate
+    with pytest.raises(RuntimeError, match="injected"):
+        publish(packet, fault_after=stage, allow_unsafe_test_root=True)
+    completed = subprocess.run(
+        [sys.executable, "-c", (
+            "import json,sys; from actionq_runner.publisher import resume_publication; "
+            "print(json.dumps(resume_publication(sys.argv[1],2032,'attempt-1',"
+            "allow_unsafe_test_root=True),sort_keys=True))"
+        ), str(root)],
+        capture_output=True, text=True, check=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["action_id"] == 2032
+    assert recover_publication(root, 2032, allow_unsafe_test_root=True) == result
+
+
+def test_intent_precedes_cas_objects_lists_incomplete_and_rejects_conflict(candidate, monkeypatch):
+    _, root, packet = candidate
+    original_put = FilesystemCAS.put
+
+    def checked_put(store, value):
+        assert (root / "journals/2032/attempt-1/intent.json").is_file()
+        return original_put(store, value)
+
+    monkeypatch.setattr(FilesystemCAS, "put", checked_put)
+    with pytest.raises(RuntimeError, match="injected"):
+        publish(packet, fault_after="bundle", allow_unsafe_test_root=True)
+    intent = json.loads((root / "journals/2032/attempt-1/intent.json").read_bytes())
+    assert intent["stage"] == "intent"
+    assert "artifact_root" not in intent and "claim_receipt" not in intent
+    incomplete = list_publications(root, 2032, allow_unsafe_test_root=True)
+    assert incomplete == [{
+        "action_id": 2032, "attempt_id": "attempt-1", "status": "incomplete",
+        "latest_stage": "bundle", "source_commit": packet["source_commit"],
+        "candidate_commit": packet["candidate_commit"],
+        "source_tree": intent["source_tree"], "candidate_tree": intent["candidate_tree"],
+        "bundle_ref": json.loads((root / "journals/2032/attempt-1/bundle.json").read_bytes())["bundle_ref"],
+    }]
+    conflicting = {**packet, "verification_evidence": {"tests": ["different"]}}
+    with pytest.raises(RuntimeError, match="conflict at intent"):
+        publish(conflicting, allow_unsafe_test_root=True)
+
+
 def test_cas_collision_and_corruption_fail_closed(tmp_path: Path):
     root = tmp_path / "cas"
     root.mkdir(mode=0o700)
@@ -167,14 +214,40 @@ def test_settlement_acknowledgement_is_bound_idempotent_and_queryable(candidate)
     ack_packet = {
         "artifact_root": str(root), "action_id": 2032, "attempt_id": "attempt-1",
         "journal_ref": result["journal_ref"], "terminal_status": "completed",
-        "result_ref": result["records"]["publication"],
+        "result_ref": result["journal_ref"],
+        "authoritative_decision": {
+            "action_id": 2032, "status": "completed", "result_ref": result["journal_ref"],
+            "completed_at": "2026-07-31T12:00:00Z",
+        },
     }
     expected = acknowledge_settlement(ack_packet, allow_unsafe_test_root=True)
     assert acknowledge_settlement(ack_packet, allow_unsafe_test_root=True) == expected
     assert query_settlement(root, 2032, "attempt-1", allow_unsafe_test_root=True) == expected
-    conflicting = {**ack_packet, "terminal_status": "failed"}
+    conflicting = {**ack_packet, "authoritative_decision": {
+        **ack_packet["authoritative_decision"], "completed_at": "2026-07-31T12:00:01Z",
+    }}
     with pytest.raises(RuntimeError, match="conflict"):
         acknowledge_settlement(conflicting, allow_unsafe_test_root=True)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("terminal_status", "failed"),
+    ("result_ref", "artifact:sha256:" + "0" * 64),
+])
+def test_settlement_rejects_ambiguous_or_nonmatching_terminal_decision(candidate, field, value):
+    _, root, packet = candidate
+    result = publish(packet, allow_unsafe_test_root=True)
+    ack = {
+        "artifact_root": str(root), "action_id": 2032, "attempt_id": "attempt-1",
+        "journal_ref": result["journal_ref"], "terminal_status": "completed",
+        "result_ref": result["journal_ref"], "authoritative_decision": {
+            "action_id": 2032, "status": "completed", "result_ref": result["journal_ref"],
+            "completed_at": "2026-07-31T12:00:00Z",
+        },
+    }
+    ack[field] = value
+    with pytest.raises(ValueError):
+        acknowledge_settlement(ack, allow_unsafe_test_root=True)
 
 
 def test_missing_settlement_query_does_not_create_journal(candidate):

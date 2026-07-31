@@ -89,6 +89,91 @@ def consume_runner_request(
     return True
 
 
+_ARTIFACT_REF_RE = re.compile(r"^artifact:sha256:[0-9a-f]{64}$")
+_GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+_ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def register_publication(
+    conn,
+    schema: str,
+    *,
+    action_id: int,
+    runner_id: str,
+    runner_request_id: str,
+    claim_receipt: str,
+    attempt_id: str,
+    journal_ref: str,
+    source_commit: str,
+    candidate_commit: str,
+) -> dict:
+    """Register an immutable publication receipt for the live claim only.
+
+    The runner request id is the idempotency authority.  A replay is accepted
+    only when every public registration field is byte-for-byte identical to
+    the already durable event; a different receipt under the same proof is a
+    conflict, never a second publication.
+    """
+    if not _ATTEMPT_ID_RE.fullmatch(attempt_id):
+        raise ActionQError("publication attempt id is invalid")
+    if not _ARTIFACT_REF_RE.fullmatch(journal_ref):
+        raise ActionQError("publication journal ref must be an artifact sha256 ref")
+    if not _GIT_OBJECT_RE.fullmatch(source_commit) or not _GIT_OBJECT_RE.fullmatch(candidate_commit):
+        raise ActionQError("publication commits must be lowercase Git object ids")
+
+    resource = f"action:{action_id}:publication:{attempt_id}"
+    safe_payload = {
+        "journal_ref": journal_ref,
+        "attempt_id": attempt_id,
+        "source_commit": source_commit,
+        "candidate_commit": candidate_commit,
+        "claim_receipt_digest": receipt_digest(claim_receipt),
+        "runner_request_id": runner_request_id,
+    }
+    with conn.transaction():
+        consumed = consume_runner_request(
+            conn,
+            schema,
+            runner_id=runner_id,
+            request_id=runner_request_id,
+            operation="execution.action.register-publication",
+            resource=resource,
+            action_id=action_id,
+            allow_replay=True,
+        )
+        action = conn.execute(
+            f"SELECT * FROM {qname(schema, 'actions')} WHERE id = %s FOR UPDATE",
+            (action_id,),
+        ).fetchone()
+        if not consumed:
+            prior = conn.execute(
+                f"""SELECT payload FROM {qname(schema, 'events')}
+                    WHERE action_id = %s AND event_type = 'publication.registered'
+                      AND payload->>'runner_request_id' = %s
+                    ORDER BY id ASC LIMIT 1""",
+                (action_id, runner_request_id),
+            ).fetchone()
+            if prior is not None and _event_payload(dict(prior)) == safe_payload:
+                return {"id": action_id, **safe_payload}
+            raise ActionQError("publication registration request conflicts with prior registration")
+        if action is None:
+            raise ActionQError(f"Action #{action_id} publication registration rejected: action-not-found")
+        reason = _renewal_rejection_reason(dict(action), runner_id, claim_receipt)
+        if reason is not None:
+            raise ActionQError(
+                f"Action #{action_id} publication registration rejected: {reason}"
+            )
+        insert_event(
+            conn,
+            schema,
+            action_id=action_id,
+            event_type="publication.registered",
+            actor=runner_id,
+            payload=safe_payload,
+        )
+    return {"id": action_id, **safe_payload}
+
+
 def _import_psycopg():
     try:
         import psycopg
