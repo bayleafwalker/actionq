@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from pathlib import Path
 
 import pytest
 
 from actionq import db
 from actionq.application import ActionQApplication
 from actionq.cli import cli
+from actionq.daemon import ActionConfig, Daemon, DaemonConfig
 
 
 def _schema() -> str:
@@ -243,3 +245,87 @@ def test_publication_registration_and_cancellation_serialize_on_action_row(
     assert current["status"] == "cancelling"
     registrations = [event for event in events if event["event_type"] == "publication.registered"]
     assert len(registrations) == (1 if history == "register-then-cancel" else 0)
+
+
+def test_reclaimed_claim_resumes_registers_and_settles_real_postgres(signed_runner_proof):
+    """Durable journal + ActionQ history suffice; no prior daemon state or packet."""
+    schema = _schema()
+    action, old_claim = _publication_fixture(schema)
+    attempt_id = "attempt-crashed"
+    source_commit, candidate_commit = "b" * 40, "c" * 40
+    journal_ref = "artifact:sha256:" + "a" * 64
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        db.insert_event(conn, schema, action_id=action["id"],
+                        event_type="runner.contract.frozen", actor="runner:old", payload={
+                            "contract": {"attempt_id": attempt_id,
+                                         "source_commit": source_commit},
+                        })
+        conn.execute(
+            f"UPDATE {db.qname(schema, 'actions')} SET claim_deadline=now() - interval '1 second' WHERE id=%s",
+            (action["id"],),
+        )
+        db.sweep(conn, schema)
+        replacement = db.claim(conn, schema, worker="worker:test", timeout_minutes=30)
+
+    app = ActionQApplication(
+        schema=schema,
+        connection_factory=lambda: db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]),
+    )
+
+    class LiveClient:
+        def show(self, action_id):
+            return app.show_action(action_id)
+
+        def register_publication(self, action_id, *, publication, actor, claim_receipt):
+            proof = signed_runner_proof(
+                actor, "execution.action.register-publication",
+                f"action:{action_id}:publication:{publication['attempt_id']}",
+            )
+            return app.register_publication(
+                action_id=action_id, claim_receipt=claim_receipt, runner_proof=proof,
+                **{key: publication[key] for key in (
+                    "attempt_id", "journal_ref", "source_commit", "candidate_commit"
+                )},
+            )
+
+        def complete(self, action_id, *, result_ref, actor, claim_receipt):
+            proof = signed_runner_proof(
+                actor, "execution.action.complete", f"action:{action_id}",
+            )
+            app.complete(action_id=action_id, result_ref=result_ref, actor=None,
+                         claim_receipt=claim_receipt, runner_proof=proof)
+
+        def emit(self, event_type, *, action_id, actor, payload):
+            app.emit_event(event_type=event_type, action_id=action_id,
+                           payload=payload, actor=actor)
+
+        def reconcile_runner_spool(self, action_id, *, attempt_id):
+            return None
+
+    publication = {"action_id": action["id"], "attempt_id": attempt_id,
+                   "journal_ref": journal_ref, "source_commit": source_commit,
+                   "candidate_commit": candidate_commit}
+
+    class RecoveryDaemon(Daemon):
+        def _runnerctl_json(self, *args, input_value=None):
+            if args[0] == "journal-list":
+                return [{**publication, "status": "incomplete", "latest_stage": "objects"}]
+            if args[0] == "journal-resume":
+                return publication
+            if args[0] == "settlement-ack":
+                return {"ok": True}
+            raise AssertionError(args)
+
+    daemon = RecoveryDaemon(
+        DaemonConfig(artifact_root=Path("/durable/actionq"), runner_id="worker:test"),
+        {"scope-iterate": ActionConfig(runner="scope-iterate", publish_candidate=True)},
+        LiveClient(),
+    )
+    claimed_action = {**replacement, "action_type": "scope-iterate"}
+    assert daemon._resume_and_settle_interrupted_publication(claimed_action) is True
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        current = db.get_action(conn, schema, action["id"])
+        events = db.action_events(conn, schema, action["id"])
+    assert current["status"] == "completed" and current["result_ref"] == journal_ref
+    assert [event["event_type"] for event in events].count("publication.registered") == 1
+    assert old_claim["claim_receipt"] != replacement["claim_receipt"]

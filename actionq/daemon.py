@@ -824,6 +824,8 @@ class Daemon:
         action = self.client.claim(self.config.runner_id, self.config.default_timeout_minutes)
         if action is None:
             return False
+        if self._resume_and_settle_interrupted_publication(action):
+            return True
         if self._settle_recovered_publication(action):
             return True
         self._run_action(action)
@@ -864,6 +866,51 @@ class Daemon:
             "journal-resume", "--artifact-root", str(self.config.artifact_root),
             "--action-id", str(action_id), "--attempt-id", attempt_id,
         )
+        return True
+
+    def _resume_and_settle_interrupted_publication(self, action: dict[str, Any]) -> bool:
+        """Adopt only a previously frozen interrupted attempt under this live claim."""
+        if self._publication_policy(action) is None:
+            return False
+        if self.config.artifact_root is None:
+            raise RuntimeError("publish_candidate requires a provisioned artifact_root")
+        history = self.client.show(int(action["id"]))
+        frozen = {
+            (event.get("payload", {}).get("contract", {}).get("attempt_id"),
+             event.get("payload", {}).get("contract", {}).get("source_commit"))
+            for event in history.get("events", [])
+            if event.get("event_type") == "runner.contract.frozen"
+        }
+        attempts = self._runnerctl_json(
+            "journal-list", "--artifact-root", str(self.config.artifact_root),
+            "--action-id", str(action["id"]),
+        )
+        interrupted = next(
+            (value for value in attempts
+             if value.get("status") == "incomplete"
+             and (value.get("attempt_id"), value.get("source_commit")) in frozen),
+            None,
+        )
+        if interrupted is None:
+            return False
+        publication = self._runnerctl_json(
+            "journal-resume", "--artifact-root", str(self.config.artifact_root),
+            "--action-id", str(action["id"]), "--attempt-id", str(interrupted["attempt_id"]),
+        )
+        receipt = str(action.get("claim_receipt") or "")
+        if not receipt:
+            raise RuntimeError("publication recovery requires a live claim receipt")
+        self.client.register_publication(
+            int(action["id"]), publication=publication, actor=self.config.runner_id,
+            claim_receipt=receipt,
+        )
+        self._complete_published(
+            int(action["id"]), claim_receipt=receipt, publication=publication,
+        )
+        if hasattr(self.client, "reconcile_runner_spool"):
+            self.client.reconcile_runner_spool(
+                int(action["id"]), attempt_id=str(publication["attempt_id"]),
+            )
         return True
 
     def _ack_publication_settlement(

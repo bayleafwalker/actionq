@@ -22,6 +22,7 @@ class Client:
         self.status = "completed"
         self.reconciled = []
         self.registered = []
+        self.frozen = []
 
     def complete(self, action_id, *, result_ref, actor, claim_receipt):
         self.completed.append((action_id, result_ref, actor, claim_receipt))
@@ -33,6 +34,7 @@ class Client:
         events = []
         if self.result_ref is not None:
             events.append({"event_type": "action_completed", "payload": {"result_ref": self.result_ref}})
+        events.extend(self.frozen)
         events.extend(self.registered)
         return {"action": {"id": action_id, "status": self.status, "result_ref": self.result_ref,
                            "completed_at": "2026-07-31T12:00:00Z"},
@@ -72,7 +74,8 @@ class PublicationDaemon(Daemon):
             return None
         if args[0] == "journal-list":
             return ([{"action_id": 2032, "attempt_id": "attempt-old",
-                      "status": "incomplete", "latest_stage": "bundle"}]
+                      "status": "incomplete", "latest_stage": "bundle",
+                      "source_commit": "b" * 40, "candidate_commit": "c" * 40}]
                     if self.recovered == "incomplete" else [])
         if args[0] == "journal-resume":
             return publication()
@@ -134,6 +137,21 @@ def test_daemon_restart_resumes_exact_interrupted_attempt_without_packet():
     assert [args[0] for args, _ in daemon.commands] == ["journal-list", "journal-resume"]
     resume_args = daemon.commands[-1][0]
     assert resume_args[-2:] == ("--attempt-id", "attempt-old")
+
+
+def test_fresh_daemon_claim_resumes_registers_and_settles_without_harness():
+    client = Client()
+    client.frozen.append({"event_type": "runner.contract.frozen", "payload": {"contract": {
+        "attempt_id": "attempt-old", "source_commit": "b" * 40,
+    }}})
+    daemon = PublicationDaemon(client, recovered="incomplete")
+    action = {"id": 2032, "action_type": "scope-iterate",
+              "claim_receipt": "new-live-receipt"}
+    assert daemon._resume_and_settle_interrupted_publication(action) is True
+    assert [args[0] for args, _ in daemon.commands][:2] == ["journal-list", "journal-resume"]
+    assert len(client.registered) == 1
+    assert client.completed == [(2032, JOURNAL_REF, "runner:devbox", "new-live-receipt")]
+    assert client.reconciled == [(2032, "attempt-old")]
 
 
 def test_no_recovered_publication_falls_through_to_normal_execution():
