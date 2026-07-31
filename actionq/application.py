@@ -700,6 +700,37 @@ class ActionQApplication:
             mutation=ack_mutation,
         )
 
+    def register_publication(
+        self,
+        *,
+        action_id: int,
+        attempt_id: str,
+        journal_ref: str,
+        source_commit: str,
+        candidate_commit: str,
+        claim_receipt: str,
+        runner_proof: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Record an immutable publication receipt under the current claim."""
+        identity = verify_runner_proof(
+            runner_proof,
+            operation="execution.action.register-publication",
+            resource=f"action:{action_id}:publication:{attempt_id}",
+        )
+        with self.connection() as conn:
+            return db.register_publication(
+                conn,
+                self.schema,
+                action_id=action_id,
+                runner_id=identity.runner_id,
+                runner_request_id=identity.request_id,
+                claim_receipt=claim_receipt,
+                attempt_id=attempt_id,
+                journal_ref=journal_ref,
+                source_commit=source_commit,
+                candidate_commit=candidate_commit,
+            )
+
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:
         return self._read(lambda conn: db.list_events(conn, self.schema, **filters))
 

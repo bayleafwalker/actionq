@@ -252,6 +252,51 @@ def cancel_ack(ctx, action_id: int, cancel_request_id: str, proof_stdin: bool) -
     ))
 
 
+@cli.command("register-publication")
+@click.argument("action_id", type=int)
+@click.option("--attempt-id")
+@click.option("--journal-ref")
+@click.option("--source-commit")
+@click.option("--candidate-commit")
+@click.option("--proof-stdin", is_flag=True, required=True, help="Read signed runner proof and live claim receipt from stdin")
+@click.pass_context
+def register_publication(
+    ctx,
+    action_id: int,
+    attempt_id: str,
+    journal_ref: str,
+    source_commit: str,
+    candidate_commit: str,
+    proof_stdin: bool,
+) -> None:
+    proof = json.load(sys.stdin)
+    private_fields = {"claim_receipt", "runner_proof"}
+    public_fields = {"attempt_id", "journal_ref", "source_commit", "candidate_commit"}
+    if not private_fields <= set(proof) or set(proof) - private_fields - public_fields:
+        raise click.ClickException("publication proof contains unsupported fields")
+    stdin_public = {field: proof.get(field) for field in public_fields if field in proof}
+    option_public = {
+        "attempt_id": attempt_id,
+        "journal_ref": journal_ref,
+        "source_commit": source_commit,
+        "candidate_commit": candidate_commit,
+    }
+    if stdin_public and any(value is not None for value in option_public.values()):
+        raise click.ClickException("publication fields must be supplied either by options or stdin, not both")
+    values = stdin_public or option_public
+    if set(values) != public_fields or not all(isinstance(value, str) for value in values.values()):
+        raise click.ClickException("publication fields are required and must be strings")
+    _echo_json(_app(ctx).register_publication(
+        action_id=action_id,
+        attempt_id=values["attempt_id"],
+        journal_ref=values["journal_ref"],
+        source_commit=values["source_commit"],
+        candidate_commit=values["candidate_commit"],
+        claim_receipt=str(proof["claim_receipt"]),
+        runner_proof=dict(proof["runner_proof"]),
+    ))
+
+
 @cli.command()
 @click.pass_context
 def sweep(ctx) -> None:
