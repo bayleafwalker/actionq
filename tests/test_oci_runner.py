@@ -82,8 +82,8 @@ class Engine:
                                if item == "--security-opt"]
             self.inspect = [{
                 "ImageDigest": "sha256:" + "a" * 64,
-                "EffectiveCaps": ["CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE"],
-                "BoundingCaps": ["CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE"],
+                "EffectiveCaps": ["CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL"],
+                "BoundingCaps": ["CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL"],
                 "Config": {"User": option("--user"), "Cmd": argv[argv.index(IMAGE) + 1:]},
                 "Mounts": [{"Source": source, "Destination": "/input/source.bundle", "RW": False,
                             "Propagation": "rprivate", "Options": ["nosuid", "nodev", "noexec", "rbind"]}],
@@ -242,6 +242,7 @@ def test_exact_create_argv_contains_every_frozen_control_and_no_secret(packet):
         "--user", "0:0",
         "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "SETUID",
         "--cap-add", "SETGID", "--cap-add", "DAC_OVERRIDE",
+        "--cap-add", "KILL",
         "--security-opt", "no-new-privileges",
         "--security-opt", create[create.index("--security-opt", create.index("--security-opt") + 1) + 1],
         "--pids-limit", "64", "--cpus", "1", "--memory", str(256 * 1024**2),
@@ -292,6 +293,7 @@ def test_sigterm_during_create_is_fenced_and_container_is_removed(packet):
     engine = SignalEngine()
     result = oci_execute(packet, run=engine, popen=factory())
     assert result["cancelled"] is True
+    assert not any(call[1] == "start" for call in engine.calls)
     assert engine.calls[-1][1:3] == ["rm", "--force"]
 
 
@@ -369,17 +371,17 @@ def test_disk_bound_is_configurable_and_capped(packet):
         oci_execute(packet, run=Engine(), popen=factory())
 
 
-def test_cancel_sends_term_then_kill_and_waits(packet):
+def test_cancel_before_start_never_executes_untrusted_container(packet):
     cancel = threading.Event()
     cancel.set()
     engine = Engine()
     processes = factory(timeout_count=1)
     result = oci_execute(packet, run=engine, popen=processes, cancel_event=cancel)
     operations = [call[1:4] for call in engine.calls]
-    assert ["kill", "--signal", "TERM"] in operations
-    assert ["kill", "--signal", "KILL"] in operations
+    assert ["kill", "--signal", "TERM"] not in operations
+    assert ["kill", "--signal", "KILL"] not in operations
     assert engine.calls[-1][1:3] == ["rm", "--force"]
-    assert processes.made[0].communications == 2
+    assert processes.made == []
     assert result["cancelled"] is True and result["exit_code"] == 130
 
 

@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import subprocess
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -179,9 +180,10 @@ os.system("git config core.fsmonitor docs/evil; git config core.hooksPath docs; 
 if os.fork() == 0:
     os.setsid()
     if os.fork() == 0:
-        time.sleep(1); pathlib.Path("/control/descendant-survived").touch(); os._exit(0)
+        time.sleep(30); pathlib.Path("/control/descendant-survived").touch(); os._exit(0)
     os._exit(0)
 '''
+    started = time.monotonic()
     result = oci_execute({
         "engine": ENGINE, "image": IMAGE, "envelope": envelope.as_dict(),
         "seccomp_sha256": SECCOMP_SHA256,
@@ -193,5 +195,6 @@ if os.fork() == 0:
                    "timeout_seconds": 60, "disk_bytes": 64 * 1024**2},
     })
     assert result["exit_code"] == 0
+    assert time.monotonic() - started < 10
     assert result["workspace_filesystem"]["descendants_reaped"] is True
     assert set(result["changed_paths"]) == {".gitattributes", "docs/evil", "docs/proof.txt"}

@@ -282,6 +282,7 @@ def _create_argv(config: Mapping[str, Any], name: str, source_bundle: Path, secc
         "--user", "0:0",
         "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "SETUID",
         "--cap-add", "SETGID", "--cap-add", "DAC_OVERRIDE",
+        "--cap-add", "KILL",
         "--security-opt", "no-new-privileges",
         "--security-opt", f"seccomp={seccomp_profile}",
         "--pids-limit", str(config["pids"]), "--cpus", _cpu_arg(float(config["cpus"])),
@@ -342,9 +343,9 @@ def _verify_created_container(config: Mapping[str, Any], name: str, source_bundl
         "ipc": host.get("IpcMode") == "private",
         "cap_add": host.get("CapAdd") in ([], None)
         and set(value.get("EffectiveCaps") or [])
-        == {"CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE"}
+        == {"CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL"}
         and set(value.get("BoundingCaps") or [])
-        == {"CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE"},
+        == {"CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE", "CAP_KILL"},
         "cap_drop": isinstance(host.get("CapDrop"), list) and bool(host.get("CapDrop")),
         "no_new_privileges": "no-new-privileges" in (host.get("SecurityOpt") or []),
         "seccomp": f"seccomp={seccomp_profile}" in (host.get("SecurityOpt") or [])
@@ -542,12 +543,15 @@ def oci_execute(
             raise RuntimeError(f"OCI container create failed: {create.stderr!s}")
         created = True
         _verify_created_container(config, name, source_bundle, seccomp_profile, run)
-        process = popen(
-            [config["engine"], "start", "--attach", name], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-        )
+        if signal_cancel.is_set() or (cancel_event is not None and cancel_event.is_set()):
+            cancelled = True
+        else:
+            process = popen(
+                [config["engine"], "start", "--attach", name], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+            )
         deadline = time.monotonic() + float(config["timeout"])
-        while True:
+        while process is not None:
             if signal_cancel.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 cancelled = True
                 break
@@ -565,7 +569,7 @@ def oci_execute(
                     "OCI wrapper exited before sealing its result: " + _redact_log(output or b"")
                 )
             time.sleep(min(0.1, remaining))
-        if timed_out or cancelled:
+        if (timed_out or cancelled) and process is not None:
             term = _engine_call(run, [config["engine"], "kill", "--signal", "TERM", name])
             try:
                 if term.returncode:

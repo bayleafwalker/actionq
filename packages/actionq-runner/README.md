@@ -34,7 +34,7 @@ nonroot worker with zero effective capabilities, no-new-privileges, private PID/
 namespaces, a read-only root, bounded `/tmp`, `/run`, and configurable
 `/workspace` tmpfs mounts, and exactly one read-only exact-source bundle bind.
 An immutable trusted wrapper runs as root only inside the rootless user
-namespace with the exact `CHOWN`, `SETUID`, `SETGID`, and `DAC_OVERRIDE`
+namespace with the exact `CHOWN`, `SETUID`, `SETGID`, `DAC_OVERRIDE`, and `KILL`
 capabilities needed for the ownership boundary. It drops the registered command
 to the exact nonroot worker UID, seals
 a candidate bundle, and holds the container alive while the supervisor copies
