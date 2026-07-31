@@ -254,6 +254,11 @@ class ActionctlClient:
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None:
         return self._run("claim", "--worker", worker, "--timeout", str(timeout_minutes), allow_empty=True)
 
+    def show(self, action_id: int) -> dict[str, Any]:
+        result = self._run("show", str(action_id))
+        assert result is not None
+        return result
+
     def renew(self, action_id: int, *, worker: str, timeout_minutes: int, claim_receipt: str) -> None:
         self._run("renew", str(action_id), "--worker", worker, "--timeout", str(timeout_minutes), "--claim-receipt", claim_receipt)
 
@@ -268,6 +273,9 @@ class ActionctlClient:
 
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
         self._run("fail", str(action_id), "--reason", reason, "--actor", actor, "--claim-receipt", claim_receipt)
+
+    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str, runner: str) -> None:
+        self._run("cancel-ack", str(action_id), "--cancel-request-id", cancel_request_id, "--runner", runner)
 
 
 class SprintctlTakeupClient:
@@ -1434,6 +1442,17 @@ class Daemon:
                 return "shutdown", self._child.wait()
             if time.monotonic() >= next_heartbeat:
                 try:
+                    current = self.client.show(action_id)
+                    action = current.get("action", current)
+                    if action.get("status") == "cancelling":
+                        os.killpg(self._child.pid, signal.SIGTERM)
+                        try:
+                            self._child.wait(timeout=self.config.graceful_shutdown_seconds)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(self._child.pid, signal.SIGKILL)
+                            self._child.wait()
+                        self.client.acknowledge_cancellation(action_id, cancel_request_id=str(action["cancel_request_id"]), runner=self.actor)
+                        return "cancelled", int(self._child.returncode or 0)
                     self.client.renew(action_id, worker=self.actor,
                                       timeout_minutes=self.config.default_timeout_minutes,
                                       claim_receipt=claim_receipt)

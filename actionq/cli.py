@@ -238,6 +238,15 @@ def cancel(ctx, action_id: int, reason: str, actor: str) -> None:
     _echo_json(action)
 
 
+@cli.command("cancel-ack")
+@click.argument("action_id", type=int)
+@click.option("--cancel-request-id", required=True)
+@click.option("--runner", required=True)
+@click.pass_context
+def cancel_ack(ctx, action_id: int, cancel_request_id: str, runner: str) -> None:
+    _echo_json(_app(ctx).acknowledge_cancellation(action_id=action_id, cancel_request_id=cancel_request_id, runner=runner))
+
+
 @cli.command()
 @click.pass_context
 def sweep(ctx) -> None:

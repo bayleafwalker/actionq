@@ -610,6 +610,16 @@ class ActionQApplication:
             ),
         )
 
+    def acknowledge_cancellation(self, *, action_id: int, cancel_request_id: str, runner: str) -> Any:
+        return self._mutate(
+            operation="execution.action.cancel-ack",
+            arguments={"action_id": action_id, "cancel_request_id": cancel_request_id, "runner": runner},
+            provenance=None,
+            mutation=lambda conn, _provenance: db.acknowledge_cancellation(
+                conn, self.schema, action_id, cancel_request_id=cancel_request_id, runner=runner
+            ),
+        )
+
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:
         return self._read(lambda conn: db.list_events(conn, self.schema, **filters))
 
