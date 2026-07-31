@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import re
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ MAX_CHAIN_DEPTH = int(os.environ.get("ACTIONQ_MAX_CHAIN_DEPTH", "3"))
 DEFAULT_RATE_LIMIT_PER_HOUR = int(os.environ.get("ACTIONQ_RATE_LIMIT_PER_HOUR", "20"))
 SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SESSION_EVENT_TYPES = (
+    "runner.contract.frozen",
     "session.dispatch",
     "session.started",
     "session.heartbeat",
@@ -348,6 +350,9 @@ def redact_action(action: dict[str, Any]) -> dict[str, Any]:
     result = dict(action)
     result.pop("claim_receipt", None)
     result.pop("cancel_former_receipt_digest", None)
+    result.pop("runner_auth_digest", None)
+    result.pop("cancel_runner_auth_digest", None)
+    result.pop("runner_auth_token", None)
     return result
 
 
@@ -622,6 +627,7 @@ def claim(
     timeout_minutes: int,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
+    runner_auth_token = secrets.token_urlsafe(32)
     with conn.transaction():
         row = conn.execute(
             f"""
@@ -630,7 +636,8 @@ def claim(
                 claimed_at = now(),
                 claimed_by = %s,
                 claim_deadline = now() + (%s * interval '1 minute'),
-                claim_receipt = %s
+                claim_receipt = %s,
+                runner_auth_digest = %s
             WHERE id = (
                 SELECT id FROM {qname(schema, "actions")}
                 WHERE status = 'pending'
@@ -640,7 +647,7 @@ def claim(
             )
             RETURNING *
             """,
-            (worker, timeout_minutes, str(uuid.uuid4())),
+            (worker, timeout_minutes, str(uuid.uuid4()), receipt_digest(runner_auth_token)),
         ).fetchone()
         if row is None:
             raise NoActionAvailable("no pending actions")
@@ -659,7 +666,9 @@ def claim(
                 provenance,
             ),
         )
-    return dict(row)
+    result = dict(row)
+    result["runner_auth_token"] = runner_auth_token
+    return result
 
 
 def _renewal_rejection_reason(current: dict[str, Any] | None, worker: str, claim_receipt: str) -> str | None:
@@ -812,7 +821,8 @@ def _transition_terminal(
                 result_ref = COALESCE(%s, result_ref),
                 failure_reason = COALESCE(%s, failure_reason),
                 claimed_at = NULL, claimed_by = NULL, claim_deadline = NULL,
-                claim_receipt = NULL
+                claim_receipt = NULL,
+                runner_auth_digest = NULL
             WHERE id = %s
               AND status IN ({allowed_sql})
               AND claimed_by = %s
@@ -945,7 +955,8 @@ def cancel(
                 f"""UPDATE {qname(schema, 'actions')} SET status='cancelling', cancel_request_id=%s,
                     cancel_stop_deadline=now() + interval '30 seconds', stop_acknowledged=false,
                     cancel_former_claimed_by=%s, cancel_former_receipt_digest=%s,
-                    claim_receipt=NULL, claim_deadline=NULL
+                    cancel_runner_auth_digest=runner_auth_digest,
+                    claim_receipt=NULL, claim_deadline=NULL, runner_auth_digest=NULL
                     WHERE id=%s RETURNING *""",
                 (request_id, row["claimed_by"], receipt_digest(row["claim_receipt"] or ""), action_id),
             ).fetchone()
@@ -960,33 +971,36 @@ def cancel(
 
 
 def acknowledge_cancellation(
-    conn, schema: str, action_id: int, *, cancel_request_id: str, runner: str,
-    former_claim_receipt: str,
+    conn, schema: str, action_id: int, *, cancel_request_id: str,
+    former_claim_receipt: str, runner_auth_token: str,
 ) -> dict:
     """Idempotently finalize a fenced cancellation after supervisor stop confirmation."""
     with conn.transaction():
         proof = receipt_digest(former_claim_receipt)
+        auth_proof = receipt_digest(runner_auth_token)
         row = conn.execute(
             f"""SELECT * FROM {qname(schema, 'actions')} WHERE id=%s FOR UPDATE""", (action_id,)
         ).fetchone()
         if (row is not None and row["status"] == "cancelled"
                 and str(row["cancel_request_id"]) == cancel_request_id
-                and row["cancel_former_claimed_by"] == runner
-                and row["cancel_former_receipt_digest"] == proof):
+                and row["cancel_former_receipt_digest"] == proof
+                and row["cancel_runner_auth_digest"] == auth_proof):
             return dict(row)
         if (row is None or row["status"] != "cancelling"
                 or str(row["cancel_request_id"]) != cancel_request_id
-                or row["cancel_former_claimed_by"] != runner
-                or row["cancel_former_receipt_digest"] != proof):
+                or row["cancel_former_receipt_digest"] != proof
+                or row["cancel_runner_auth_digest"] != auth_proof):
             raise ActionQError(f"Action #{action_id} cancellation acknowledgement rejected")
         row = conn.execute(
             f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
                 stop_acknowledged=true, claimed_at=NULL, claimed_by=NULL,
+                cancel_terminal_kind='stop-acknowledged',
                 claim_deadline=NULL, claim_receipt=NULL
                 WHERE id=%s RETURNING *""", (action_id,)
         ).fetchone()
         insert_event(conn, schema, action_id=action_id, event_type="action_cancelled",
-                     actor=runner, payload={"cancel_request_id": cancel_request_id, "stop_acknowledged": True})
+                     actor=row["cancel_former_claimed_by"],
+                     payload={"cancel_request_id": cancel_request_id, "stop_acknowledged": True})
     return dict(row)
 
 
@@ -995,13 +1009,16 @@ def reap_cancellations(conn, schema: str, *, actor: str = "actionctl:cancel-reap
         rows = conn.execute(
             f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
                 stop_acknowledged=false, claimed_at=NULL, claimed_by=NULL,
+                cancel_terminal_kind='stop-unacknowledged-timeout',
                 claim_deadline=NULL, claim_receipt=NULL
                 WHERE status='cancelling' AND cancel_stop_deadline < now()
                 RETURNING *"""
         ).fetchall()
         for row in rows:
-            insert_event(conn, schema, action_id=row["id"], event_type="action_cancelled", actor=actor,
-                         payload={"cancel_request_id": str(row["cancel_request_id"]), "stop_acknowledged": False})
+            insert_event(conn, schema, action_id=row["id"], event_type="action_cancel_reaped", actor=actor,
+                         payload={"cancel_request_id": str(row["cancel_request_id"]),
+                                  "stop_acknowledged": False, "process_state": "unknown",
+                                  "observation": "deadline-expired-without-ack"})
     return [dict(row) for row in rows]
 
 
@@ -1031,6 +1048,7 @@ def sweep(
                     claimed_by = NULL,
                     claim_deadline = NULL
                     , claim_receipt = NULL
+                    , runner_auth_digest = NULL
                 WHERE id = %s
                 RETURNING *
                 """,

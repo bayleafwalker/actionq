@@ -85,9 +85,10 @@ expired-but-unswept claimant cannot settle. Controller cancellation locks the
 row, records a cancellation request, clears the live receipt/lease, and moves
 the action to `cancelling`. This commit fences renewal, settlement, and sweep.
 The supervisor acknowledges process death or a bounded reaper finalizes without
-claiming that a process stopped before that evidence exists.
-
-`renew` is a narrower exception: it does check `claimed_by` against the requesting worker (see "Claim/lease authority commands" above), because that specific comparison is implemented and tested. This does not extend to the terminal transitions -- they remain as described in this section until a separate, explicitly authorized change adds claimant proof there too.
+claiming that a process stopped before that evidence exists. A reaped action is
+recorded as `stop-unacknowledged-timeout` with process state `unknown`; its
+private recovery spool remains unreconciled and therefore ineligible for garbage
+collection until the supervisor or an operator records an independent decision.
 
 ## Safety properties
 

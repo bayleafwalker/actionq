@@ -23,6 +23,8 @@ import tomllib
 import uuid
 from typing import Any, Callable, Protocol, Sequence
 
+from actionq_contracts import EXECUTION_ENVELOPE_V1, ExecutionEnvelope, require_compatible, sha256_digest
+
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
 from .harnesses import HarnessInvocation, get_adapter
 from .harness_profiles import validate_harness_profile
@@ -185,8 +187,8 @@ class CoordinatorClient(Protocol):
     def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None: ...
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None: ...
     def show(self, action_id: int) -> dict[str, Any]: ...
-    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str, runner: str,
-                                 former_claim_receipt: str) -> None: ...
+    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
+                                 former_claim_receipt: str, runner_auth_token: str) -> None: ...
 
 
 class TakeupClient(Protocol):
@@ -244,9 +246,9 @@ class ActionctlClient:
     def __init__(self, executable: str):
         self.executable = executable
 
-    def _run(self, *args: str, allow_empty: bool = False) -> dict[str, Any] | None:
+    def _run(self, *args: str, allow_empty: bool = False, input_text: str | None = None) -> dict[str, Any] | None:
         completed = subprocess.run(
-            [self.executable, *args], text=True, capture_output=True, check=False
+            [self.executable, *args], text=True, input=input_text, capture_output=True, check=False
         )
         if allow_empty and completed.returncode == 2:
             return None
@@ -278,10 +280,13 @@ class ActionctlClient:
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
         self._run("fail", str(action_id), "--reason", reason, "--actor", actor, "--claim-receipt", claim_receipt)
 
-    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str, runner: str,
-                                 former_claim_receipt: str) -> None:
-        self._run("cancel-ack", str(action_id), "--cancel-request-id", cancel_request_id,
-                  "--runner", runner, "--former-claim-receipt", former_claim_receipt)
+    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
+                                 former_claim_receipt: str, runner_auth_token: str) -> None:
+        self._run(
+            "cancel-ack", str(action_id), "--cancel-request-id", cancel_request_id, "--proof-stdin",
+            input_text=json.dumps({"former_claim_receipt": former_claim_receipt,
+                                   "runner_auth_token": runner_auth_token}),
+        )
 
 
 class SprintctlTakeupClient:
@@ -721,8 +726,11 @@ class Daemon:
     def _run_action(self, action: dict[str, Any]) -> None:
         action_id = int(action["id"])
         claim_receipt = str(action.get("claim_receipt") or "")
+        runner_auth_token = str(action.get("runner_auth_token") or "")
         if not claim_receipt:
             raise RuntimeError(f"action #{action_id} claim did not include a claim receipt")
+        if not runner_auth_token:
+            raise RuntimeError(f"action #{action_id} claim did not include runner authentication")
         action_type = str(action["action_type"])
         action_config = self.actions.get(action_type)
         if action_config is None:
@@ -891,6 +899,19 @@ class Daemon:
             if action_config.runner in {"command", "harness", "scope-iterate"}
             else None
         )
+        envelope = ExecutionEnvelope(
+            contract_id=EXECUTION_ENVELOPE_V1,
+            action_id=action_id,
+            attempt_id=session_id,
+            source_commit=base_commit or "unavailable",
+            command_id=f"{action_type}:{action_config.runner}",
+            allowed_paths=(),
+        )
+        require_compatible(envelope.as_dict())
+        self.client.emit(
+            "runner.contract.frozen", action_id=action_id, actor=self.actor,
+            payload={"session_id": session_id, "contract": envelope.as_dict(), "digest": sha256_digest(envelope)},
+        )
         try:
             self._child = self._start_child(
                 action_config,
@@ -928,7 +949,7 @@ class Daemon:
                                      "sprint_takeup": takeup, "audit_start": audit_start})
             sprint_claim_lease = self._sprint_claim_leases.get(session_id)
             outcome, exit_code = self._wait_for_child(
-                action_id, payload, record, claim_receipt, sprint_claim_lease,
+                action_id, payload, record, claim_receipt, runner_auth_token, sprint_claim_lease,
                 project, audit_actor, audit_refs,
             )
             usage_limit_reason: str | None = None
@@ -986,6 +1007,9 @@ class Daemon:
                     "settlement.actionq_skipped_claim_lost", action_id=action_id, actor=self.actor,
                     payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease)},
                 )
+            elif outcome == "cancelled":
+                # The acknowledgement already performed the terminal mutation.
+                pass
             elif settlement_error is not None:
                 self.client.fail(action_id, reason=settlement_error, actor=self.actor, claim_receipt=claim_receipt)
             elif outcome == "completed":
@@ -1425,6 +1449,7 @@ class Daemon:
         payload: dict[str, Any],
         record: SessionRecord,
         claim_receipt: str,
+        runner_auth_token: str,
         sprint_claim_lease: SprintClaimLease | None,
         project: ProjectConfig | None = None,
         audit_actor: str | None = None,
@@ -1461,7 +1486,8 @@ class Daemon:
                             self._child.wait()
                         self.client.acknowledge_cancellation(
                             action_id, cancel_request_id=str(action["cancel_request_id"]),
-                            runner=self.actor, former_claim_receipt=claim_receipt,
+                            former_claim_receipt=claim_receipt,
+                            runner_auth_token=runner_auth_token,
                         )
                         return "cancelled", int(self._child.returncode or 0)
                 except Exception as exc:

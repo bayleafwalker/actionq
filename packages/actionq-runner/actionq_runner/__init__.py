@@ -1,5 +1,5 @@
 """Unprivileged runner package; it never imports ActionQ server authority."""
 
-from .staging import collect, quarantine, seal, staging_dir
+from .staging import AttemptSpool, collect, mark_reconciled, quarantine, receive, seal, staging_dir
 
-__all__ = ["collect", "quarantine", "seal", "staging_dir"]
+__all__ = ["AttemptSpool", "collect", "mark_reconciled", "quarantine", "receive", "seal", "staging_dir"]

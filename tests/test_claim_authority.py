@@ -64,18 +64,23 @@ def test_controller_cancel_fences_claim_before_acknowledgement(schema):
     with pytest.raises(db.ActionQError):
         db.acknowledge_cancellation(
             conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
-            runner="worker:one", former_claim_receipt="wrong",
+            former_claim_receipt="wrong", runner_auth_token=claimed["runner_auth_token"],
+        )
+    with pytest.raises(db.ActionQError):
+        db.acknowledge_cancellation(
+            conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+            former_claim_receipt=claimed["claim_receipt"], runner_auth_token="forged",
         )
     acked = db.acknowledge_cancellation(
         conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
-        runner="worker:one", former_claim_receipt=claimed["claim_receipt"],
+        former_claim_receipt=claimed["claim_receipt"], runner_auth_token=claimed["runner_auth_token"],
     )
     assert acked["status"] == "cancelled"
     assert acked["stop_acknowledged"] is True
     assert acked["claimed_by"] is None
     duplicate = db.acknowledge_cancellation(
         conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
-        runner="worker:one", former_claim_receipt=claimed["claim_receipt"],
+        former_claim_receipt=claimed["claim_receipt"], runner_auth_token=claimed["runner_auth_token"],
     )
     assert duplicate["status"] == "cancelled"
 
@@ -86,6 +91,7 @@ def test_general_reads_do_not_disclose_claim_receipt(schema):
     assert claimed["claim_receipt"]
     assert "claim_receipt" not in db.redact_action(db.get_action(conn, schema, claimed["id"]))
     assert "claim_receipt" not in db.redact_action(db.list_actions(conn, schema)[0])
+    assert "runner_auth_token" not in db.redact_action(claimed)
 
 
 def test_cancellation_deadline_reaper_finalizes_without_ack(schema):
@@ -105,7 +111,7 @@ def test_cancellation_deadline_reaper_finalizes_without_ack(schema):
     with pytest.raises(db.ActionQError):
         db.acknowledge_cancellation(
             conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
-            runner="worker:one", former_claim_receipt="wrong",
+            former_claim_receipt="wrong", runner_auth_token=claimed["runner_auth_token"],
         )
 
 

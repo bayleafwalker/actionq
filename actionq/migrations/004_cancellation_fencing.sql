@@ -8,7 +8,11 @@ ALTER TABLE {{schema}}.actions
     ADD COLUMN IF NOT EXISTS cancel_request_id UUID,
     ADD COLUMN IF NOT EXISTS cancel_stop_deadline TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS stop_acknowledged BOOLEAN,
+    ADD COLUMN IF NOT EXISTS runner_auth_digest TEXT,
     ADD COLUMN IF NOT EXISTS cancel_former_claimed_by TEXT,
-    ADD COLUMN IF NOT EXISTS cancel_former_receipt_digest TEXT;
+    ADD COLUMN IF NOT EXISTS cancel_former_receipt_digest TEXT,
+    ADD COLUMN IF NOT EXISTS cancel_runner_auth_digest TEXT;
+ALTER TABLE {{schema}}.actions
+    ADD COLUMN IF NOT EXISTS cancel_terminal_kind TEXT;
 CREATE INDEX IF NOT EXISTS idx_actions_cancelling_deadline
     ON {{schema}}.actions(cancel_stop_deadline) WHERE status = 'cancelling';

@@ -60,8 +60,9 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
         dispatches = db.list_dispatches(conn, schema)
     assert _text(settled["status"]) == "completed", repr(settled.get("failure_reason"))
     event_types = [_text(event["event_type"]) for event in events]
-    assert event_types[:4] == [
-        "action_enqueued", "action_claimed", "session.dispatch", "session.started"
+    assert event_types[:5] == [
+        "action_enqueued", "action_claimed", "session.dispatch",
+        "runner.contract.frozen", "session.started",
     ]
     assert "session.heartbeat" in event_types
     assert event_types[-2:] == ["session.exited", "action_completed"]

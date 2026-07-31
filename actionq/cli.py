@@ -241,14 +241,16 @@ def cancel(ctx, action_id: int, reason: str, actor: str) -> None:
 @cli.command("cancel-ack")
 @click.argument("action_id", type=int)
 @click.option("--cancel-request-id", required=True)
-@click.option("--runner", required=True)
-@click.option("--former-claim-receipt", required=True)
+@click.option("--proof-stdin", is_flag=True, required=True, help="Read private acknowledgement proofs as JSON from stdin")
 @click.pass_context
-def cancel_ack(ctx, action_id: int, cancel_request_id: str, runner: str,
-               former_claim_receipt: str) -> None:
+def cancel_ack(ctx, action_id: int, cancel_request_id: str, proof_stdin: bool) -> None:
+    proof = json.load(sys.stdin)
+    if set(proof) != {"former_claim_receipt", "runner_auth_token"}:
+        raise click.ClickException("cancellation proof must contain exactly the required private fields")
     _echo_json(_app(ctx).acknowledge_cancellation(
-        action_id=action_id, cancel_request_id=cancel_request_id, runner=runner,
-        former_claim_receipt=former_claim_receipt,
+        action_id=action_id, cancel_request_id=cancel_request_id,
+        former_claim_receipt=str(proof["former_claim_receipt"]),
+        runner_auth_token=str(proof["runner_auth_token"]),
     ))
 
 

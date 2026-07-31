@@ -345,6 +345,11 @@ class ActionQApplication:
                         conn, operation=operation, provenance=provenance
                     )
                 )
+                durable_result = (
+                    db.redact_action(result)
+                    if operation == "execution.action.claim" and isinstance(result, dict)
+                    else result
+                )
                 decision = db.insert_event(
                     conn,
                     self.schema,
@@ -357,13 +362,18 @@ class ActionQApplication:
                         "code": code,
                         "message": message,
                         "event_refs": event_refs,
-                        "result": result,
+                        "result": durable_result,
                         "request_fingerprint": fingerprint,
                         "idempotency_owner": True,
                         "provenance": event_provenance,
                     },
                 )
-                return self._decision_result(event=decision, replayed=False)
+                response = self._decision_result(event=decision, replayed=False)
+                if operation == "execution.action.claim" and isinstance(result, dict):
+                    # Claim capabilities are disclosed only on the original
+                    # authenticated response, never in history or replay.
+                    response["result"] = result
+                return response
 
     def enqueue(
         self,
@@ -608,16 +618,17 @@ class ActionQApplication:
             },
         )
 
-    def acknowledge_cancellation(self, *, action_id: int, cancel_request_id: str, runner: str,
-                                 former_claim_receipt: str) -> Any:
+    def acknowledge_cancellation(self, *, action_id: int, cancel_request_id: str,
+                                 former_claim_receipt: str, runner_auth_token: str) -> Any:
         return self._mutate(
             operation="execution.action.cancel-ack",
-            arguments={"action_id": action_id, "cancel_request_id": cancel_request_id, "runner": runner,
-                       "former_claim_receipt_digest": db.receipt_digest(former_claim_receipt)},
+            arguments={"action_id": action_id, "cancel_request_id": cancel_request_id,
+                       "former_claim_receipt_digest": db.receipt_digest(former_claim_receipt),
+                       "runner_auth_digest": db.receipt_digest(runner_auth_token)},
             provenance=None,
             mutation=lambda conn, _provenance: db.acknowledge_cancellation(
-                conn, self.schema, action_id, cancel_request_id=cancel_request_id, runner=runner,
-                former_claim_receipt=former_claim_receipt,
+                conn, self.schema, action_id, cancel_request_id=cancel_request_id,
+                former_claim_receipt=former_claim_receipt, runner_auth_token=runner_auth_token,
             ),
         )
 

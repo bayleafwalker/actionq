@@ -1,16 +1,29 @@
-"""Private, noncanonical supervisor staging for pre-#2032 runner records."""
+"""Private supervisor-owned recovery spool for pre-#2032 runner records."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import stat
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_FORBIDDEN = re.compile(
+    rb"(?i)(postgres(?:ql)?://|authorization:\s*bearer|private[_ -]?key|"
+    rb"claim[_ -]?receipt|ssh_auth_sock|kubeconfig|git_askpass|provider[_ -]?token)"
+)
 ACTIVE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 SEALED_RETENTION_SECONDS = 72 * 60 * 60
+
+
+@dataclass(frozen=True)
+class AttemptSpool:
+    root: Path
+    action_id: int
+    claim_incarnation: str
 
 
 def _component(value: str) -> str:
@@ -24,26 +37,39 @@ def _mkdir_secure(path: Path) -> None:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise ValueError("runner staging path must be a real directory")
+    if info.st_uid != os.geteuid():
+        raise PermissionError("runner staging path is not supervisor-owned")
     os.chmod(path, 0o700)
 
 
-def staging_dir(action_id: int, claim_incarnation: str) -> Path:
+def staging_dir(action_id: int, claim_incarnation: str) -> AttemptSpool:
     if action_id <= 0:
         raise ValueError("action_id must be positive")
-    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-    path = root / "actionq" / "runner-staging" / "v1" / str(action_id) / _component(claim_incarnation)
-    current = root
-    for component in ("actionq", "runner-staging", "v1", str(action_id), claim_incarnation):
+    incarnation = _component(claim_incarnation)
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    current = state_home
+    _mkdir_secure(current)
+    for component in ("actionq", "runner-staging", "v1", str(action_id), incarnation):
         current = current / component
         _mkdir_secure(current)
     for phase in ("incoming", "quarantine", "sealed"):
-        _mkdir_secure(path / phase)
-    return path
+        _mkdir_secure(current / phase)
+    return AttemptSpool(current, action_id, incarnation)
 
 
-def _atomic_write(directory: Path, name: str, data: bytes) -> Path:
+def _phase_fd(spool: AttemptSpool, phase: str) -> int:
+    _component(phase)
+    expected = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / (
+        f"actionq/runner-staging/v1/{spool.action_id}/{spool.claim_incarnation}/{phase}"
+    )
+    if spool.root / phase != expected:
+        raise ValueError("spool is outside the canonical runner staging root")
+    return os.open(expected, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _atomic_write(spool: AttemptSpool, phase: str, name: str, data: bytes) -> Path:
     _component(name)
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory_fd = _phase_fd(spool, phase)
     temporary = f".{name}.{os.getpid()}.tmp"
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -66,26 +92,67 @@ def _atomic_write(directory: Path, name: str, data: bytes) -> Path:
         except FileNotFoundError:
             pass
         os.close(directory_fd)
-    return directory / name
+    return spool.root / phase / name
 
 
-def quarantine(path: Path, name: str, data: bytes) -> Path:
-    """Accept worker bytes into quarantine; callers must redact before sealing."""
-    return _atomic_write(path / "quarantine", name, data)
+def receive(spool: AttemptSpool, name: str, worker_bytes: bytes) -> Path:
+    """Receive transient worker output; it is never canonical evidence."""
+    return _atomic_write(spool, "incoming", name, worker_bytes)
 
 
-def seal(path: Path, name: str, normalized_redacted_data: bytes) -> Path:
-    return _atomic_write(path / "sealed", name, normalized_redacted_data)
+def quarantine(spool: AttemptSpool, name: str) -> Path:
+    """Move a closed incoming file out of the worker-visible phase."""
+    _component(name)
+    source_fd = _phase_fd(spool, "incoming")
+    target_fd = _phase_fd(spool, "quarantine")
+    try:
+        os.rename(name, name, src_dir_fd=source_fd, dst_dir_fd=target_fd)
+        os.fsync(source_fd); os.fsync(target_fd)
+    finally:
+        os.close(source_fd); os.close(target_fd)
+    return spool.root / "quarantine" / name
 
 
-def collect(path: Path, *, reconciled: bool, terminal: bool, now: float | None = None) -> bool:
-    """Delete only reconciled attempts whose bounded retention has elapsed."""
-    if not reconciled:
+def seal(spool: AttemptSpool, name: str, normalized_redacted_data: bytes) -> Path:
+    """Seal only supervisor-normalized, credential-free bytes from quarantine."""
+    quarantined = spool.root / "quarantine" / _component(name)
+    if quarantined.is_symlink() or not quarantined.is_file():
+        raise ValueError("worker record must be quarantined before sealing")
+    if _FORBIDDEN.search(normalized_redacted_data):
+        raise ValueError("sealed runner record contains forbidden credential material")
+    target = _atomic_write(spool, "sealed", name, normalized_redacted_data)
+    quarantined.unlink()
+    directory_fd = _phase_fd(spool, "quarantine")
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return target
+
+
+def mark_reconciled(spool: AttemptSpool, *, terminal: bool) -> None:
+    _atomic_write(spool, "sealed", "recovery-state.json", json.dumps(
+        {"reconciled": True, "terminal": terminal}, sort_keys=True, separators=(",", ":")
+    ).encode())
+
+
+def collect(spool: AttemptSpool, *, now: float | None = None) -> bool:
+    """Collect only reconciled canonical attempt roots after their retention."""
+    state_path = spool.root / "sealed" / "recovery-state.json"
+    if state_path.is_symlink() or not state_path.is_file():
+        return False
+    state = json.loads(state_path.read_text())
+    if state != {"reconciled": True, "terminal": bool(state.get("terminal"))}:
         return False
     now = time.time() if now is None else now
-    age = now - path.stat().st_mtime
-    limit = SEALED_RETENTION_SECONDS if terminal else ACTIVE_RETENTION_SECONDS
-    if age < limit:
+    limit = SEALED_RETENTION_SECONDS if state["terminal"] else ACTIVE_RETENTION_SECONDS
+    if now - state_path.stat().st_mtime < limit:
         return False
-    shutil.rmtree(path)
+    parent = spool.root.parent
+    shutil.rmtree(spool.root)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
     return True
