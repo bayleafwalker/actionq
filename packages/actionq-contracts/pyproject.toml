@@ -7,6 +7,7 @@ name = "actionq-contracts"
 version = "0.1.0"
 requires-python = ">=3.11"
 description = "Portable, dependency-light ActionQ execution contracts"
+readme = "README.md"
 
 [tool.setuptools.packages.find]
 include = ["actionq_contracts*"]

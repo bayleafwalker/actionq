@@ -217,12 +217,17 @@ def test_scope_iterate_worker_runs_through_contained_identity(tmp_path: Path, mo
     )
     captured = {}
 
+    class Input:
+        def write(self, value):
+            captured["packet"] = value
+        def close(self):
+            pass
+
     class Child:
-        stdin = None
+        stdin = Input()
 
     def fake_popen(command, **kwargs):
         captured["command"] = command
-        captured["env"] = kwargs["env"]
         return Child()
 
     monkeypatch.setattr("actionq.daemon.subprocess.Popen", fake_popen)
@@ -239,9 +244,15 @@ def test_scope_iterate_worker_runs_through_contained_identity(tmp_path: Path, mo
 
     monkeypatch.setattr("actionq.daemon.get_adapter", lambda *_args, **_kwargs: Adapter())
 
-    daemon._start_child(action, project=project, routing=routing, prompt="work")
+    from actionq_contracts import EXECUTION_ENVELOPE_V1, ExecutionEnvelope
+    daemon._start_child(
+        action, project=project, routing=routing, prompt="work",
+        envelope=ExecutionEnvelope(EXECUTION_ENVELOPE_V1, 1, "attempt-1", "abcdef1", "test"),
+    )
 
-    assert captured["command"][:7] == [
+    assert captured["command"] == ["actionq-runner", "execute"]
+    packet = json.loads(captured["packet"])
+    assert packet["command"][:7] == [
         "/run/wrappers/bin/sudo", "-n", "-H", "--preserve-env=OPENCODE_CONFIG", "-u", "agentworker", "--",
     ]
-    assert captured["env"] == {"OPENCODE_CONFIG": "/etc/agentops/opencode.actionq-worker.json"}
+    assert packet["environment"] == {"OPENCODE_CONFIG": "/etc/agentops/opencode.actionq-worker.json"}

@@ -60,6 +60,30 @@ def receipt_digest(receipt: str) -> str:
     return "sha256:" + hashlib.sha256(receipt.encode("utf-8")).hexdigest()
 
 
+def consume_runner_request(
+    conn, schema: str, *, runner_id: str, request_id: str, operation: str,
+    resource: str, action_id: int | None = None, allow_replay: bool = False,
+) -> bool:
+    lock_key = f"runner-auth:{runner_id}:{request_id}"
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+    prior = conn.execute(
+        f"""SELECT 1 FROM {qname(schema, 'events')}
+            WHERE event_type='runner.authenticated'
+              AND payload->>'runner_id'=%s AND payload->>'request_id'=%s LIMIT 1""",
+        (runner_id, request_id),
+    ).fetchone()
+    if prior is not None:
+        if allow_replay:
+            return False
+        raise ActionQError("runner proof request id was already consumed")
+    insert_event(
+        conn, schema, action_id=action_id, event_type="runner.authenticated", actor=runner_id,
+        payload={"runner_id": runner_id, "request_id": request_id,
+                 "operation": operation, "resource": resource},
+    )
+    return True
+
+
 def _import_psycopg():
     try:
         import psycopg
@@ -972,7 +996,7 @@ def cancel(
 
 def acknowledge_cancellation(
     conn, schema: str, action_id: int, *, cancel_request_id: str,
-    former_claim_receipt: str, runner_auth_token: str,
+    former_claim_receipt: str, runner_auth_token: str, authenticated_runner: str,
 ) -> dict:
     """Idempotently finalize a fenced cancellation after supervisor stop confirmation."""
     with conn.transaction():
@@ -984,11 +1008,13 @@ def acknowledge_cancellation(
         if (row is not None and row["status"] == "cancelled"
                 and str(row["cancel_request_id"]) == cancel_request_id
                 and row["cancel_former_receipt_digest"] == proof
+                and row["cancel_former_claimed_by"] == authenticated_runner
                 and row["cancel_runner_auth_digest"] == auth_proof):
             return dict(row)
         if (row is None or row["status"] != "cancelling"
                 or str(row["cancel_request_id"]) != cancel_request_id
                 or row["cancel_former_receipt_digest"] != proof
+                or row["cancel_former_claimed_by"] != authenticated_runner
                 or row["cancel_runner_auth_digest"] != auth_proof):
             raise ActionQError(f"Action #{action_id} cancellation acknowledgement rejected")
         row = conn.execute(

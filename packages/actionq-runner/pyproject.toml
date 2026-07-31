@@ -6,8 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "actionq-runner"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["actionq-contracts==0.1.0"]
+dependencies = ["actionq-contracts==0.1.0", "cryptography>=45"]
 description = "Unprivileged ActionQ harness runner"
+readme = "README.md"
+
+[project.scripts]
+actionq-runner = "actionq_runner.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["actionq_runner*"]

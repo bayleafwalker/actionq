@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import tomllib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -24,13 +25,13 @@ from actionq_runner.staging import collect, mark_reconciled, quarantine, receive
 def test_contract_canonicalization_and_explicit_compatibility():
     envelope = ExecutionEnvelope(
         contract_id=EXECUTION_ENVELOPE_V1, action_id=2031, attempt_id="claim-1",
-        source_commit="abc123", command_id="pytest", allowed_paths=("actionq/",),
+        source_commit="abcdef1", command_id="pytest", allowed_paths=("actionq/",),
     )
     assert canonical_bytes(envelope.as_dict()) == canonical_bytes(json.loads(canonical_bytes(envelope.as_dict())))
     assert require_compatible(envelope.as_dict()) == EXECUTION_ENVELOPE_V1
     with pytest.raises(ValueError, match="unsupported"):
         require_compatible({"contract_id": "execution-envelope/v2"})
-    claim = Claim(2031, "claim-1", "runner:devbox", "sha256:abc", "2026-08-01T00:00:00Z")
+    claim = Claim(2031, "claim-1", "runner:devbox", "sha256:" + "a" * 64, "2026-08-01T00:00:00Z")
     assert require_compatible(claim.__dict__) == CLAIM_V1
     with pytest.raises(ValueError, match="floats"):
         canonical_bytes({"contract_id": CLAIM_V1, "ratio": 1.0})
@@ -45,7 +46,7 @@ def test_server_and_runner_distributions_have_no_cross_imports():
     root_metadata = tomllib.loads((ROOT / "pyproject.toml").read_text())
     runner_metadata = tomllib.loads((ROOT / "packages/actionq-runner/pyproject.toml").read_text())
     assert "actionq-runner" not in " ".join(root_metadata["project"]["dependencies"])
-    assert runner_metadata["project"]["dependencies"] == ["actionq-contracts==0.1.0"]
+    assert runner_metadata["project"]["dependencies"] == ["actionq-contracts==0.1.0", "cryptography>=45"]
 
 
 def test_staging_is_private_atomic_and_rejects_traversal(tmp_path: Path, monkeypatch):
@@ -83,3 +84,35 @@ def test_gc_skips_unreconciled_and_obeys_terminal_retention(tmp_path: Path, monk
     retained_until = (attempt.root / "sealed/recovery-state.json").stat().st_mtime + 8 * 24 * 60 * 60
     assert collect(attempt, now=retained_until) is True
     assert not attempt.root.exists()
+
+
+def test_installed_runner_executes_redacts_and_requires_reconciliation(tmp_path: Path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    envelope = ExecutionEnvelope(
+        EXECUTION_ENVELOPE_V1, 2031, "attempt-3", "abcdef1", "test-command",
+    ).as_dict()
+    packet = {
+        "envelope": envelope,
+        "command": [sys.executable, "-c", "print('DATABASE_URL=postgresql://secret'); print('safe')"],
+        "environment": {"PATH": os.environ["PATH"]},
+        "grace_seconds": 0.1,
+    }
+    binary = Path(sys.executable).with_name("actionq-runner")
+    result = subprocess.run(
+        [str(binary), "execute"], input=json.dumps(packet), text=True,
+        capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    attempt = staging_dir(2031, "attempt-3")
+    sealed = (attempt.root / "sealed/execution.log").read_bytes()
+    assert b"postgresql://secret" not in sealed
+    assert b"[REDACTED]" in sealed and b"safe" in sealed
+    assert collect(attempt, now=10**12) is False
+    reconciled = subprocess.run(
+        [str(binary), "reconcile", "--action-id", "2031", "--attempt-id", "attempt-3"],
+        text=True, capture_output=True, check=False,
+    )
+    assert reconciled.returncode == 0, reconciled.stderr
+    assert (attempt.root / "sealed/recovery-state.json").exists()

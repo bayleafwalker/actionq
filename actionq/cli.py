@@ -133,16 +133,13 @@ def show(ctx, action_id: int) -> None:
 
 
 @cli.command()
-@click.option("--worker", required=True, help="Worker identity")
+@click.option("--proof-stdin", is_flag=True, required=True, help="Read signed runner proof as JSON from stdin")
 @click.option("--timeout", "timeout_minutes", default=30, type=int, show_default=True)
 @click.pass_context
-def claim(ctx, worker: str, timeout_minutes: int) -> None:
+def claim(ctx, proof_stdin: bool, timeout_minutes: int) -> None:
     """Claim one pending action as JSON; exits non-zero if none are available."""
     try:
-        action = _app(ctx).claim(
-            worker=worker,
-            timeout_minutes=timeout_minutes,
-        )
+        action = _app(ctx).claim(runner_proof=json.load(sys.stdin), timeout_minutes=timeout_minutes)
     except db.NoActionAvailable as exc:
         click.echo(str(exc), err=True)
         raise click.exceptions.Exit(2) from exc
@@ -245,12 +242,13 @@ def cancel(ctx, action_id: int, reason: str, actor: str) -> None:
 @click.pass_context
 def cancel_ack(ctx, action_id: int, cancel_request_id: str, proof_stdin: bool) -> None:
     proof = json.load(sys.stdin)
-    if set(proof) != {"former_claim_receipt", "runner_auth_token"}:
+    if set(proof) != {"former_claim_receipt", "runner_auth_token", "runner_proof"}:
         raise click.ClickException("cancellation proof must contain exactly the required private fields")
     _echo_json(_app(ctx).acknowledge_cancellation(
         action_id=action_id, cancel_request_id=cancel_request_id,
         former_claim_receipt=str(proof["former_claim_receipt"]),
         runner_auth_token=str(proof["runner_auth_token"]),
+        runner_proof=dict(proof["runner_proof"]),
     ))
 
 

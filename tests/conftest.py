@@ -5,6 +5,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import json
+import base64
 from pathlib import Path
 
 import pytest
@@ -14,11 +16,57 @@ from click.testing import CliRunner
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "packages/actionq-runner"))
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from actionq_runner.identity import sign_runner_request
 
 
 MIGRATION_ROLE = "actionq_migration"
 RUNTIME_ROLE = "actionq_runtime"
 _POSTGRES_STATE = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def runner_identity(tmp_path_factory):
+    root = tmp_path_factory.mktemp("runner-identity")
+    private_path = root / "runner.pem"
+    registry_path = root / "registry.json"
+    key = Ed25519PrivateKey.generate()
+    private_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ))
+    private_path.chmod(0o600)
+    public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    registry_path.write_text(json.dumps({"worker:test": base64.b64encode(public).decode(),
+                                         "worker:one": base64.b64encode(public).decode(),
+                                         "actionq-daemon:test": base64.b64encode(public).decode(),
+                                         "runner:devbox": base64.b64encode(public).decode()}))
+    previous = os.environ.get("ACTIONQ_RUNNER_IDENTITY_REGISTRY")
+    previous_private = os.environ.get("ACTIONQ_RUNNER_PRIVATE_KEY")
+    os.environ["ACTIONQ_RUNNER_IDENTITY_REGISTRY"] = str(registry_path)
+    os.environ["ACTIONQ_RUNNER_PRIVATE_KEY"] = str(private_path)
+    yield {"private_key": private_path, "registry": registry_path}
+    if previous is None:
+        os.environ.pop("ACTIONQ_RUNNER_IDENTITY_REGISTRY", None)
+    else:
+        os.environ["ACTIONQ_RUNNER_IDENTITY_REGISTRY"] = previous
+    if previous_private is None:
+        os.environ.pop("ACTIONQ_RUNNER_PRIVATE_KEY", None)
+    else:
+        os.environ["ACTIONQ_RUNNER_PRIVATE_KEY"] = previous_private
+
+
+@pytest.fixture
+def signed_runner_proof(runner_identity):
+    def sign(runner_id: str, operation: str, resource: str):
+        return sign_runner_request(
+            runner_identity["private_key"], runner_id=runner_id, operation=operation,
+            resource=resource, request_id=str(__import__("uuid").uuid4()),
+        )
+    return sign
 
 
 def _needs_postgres(config) -> bool:
@@ -29,6 +77,7 @@ def _needs_postgres(config) -> bool:
         Path(argument).name == "tests"
         or "integration" in argument
         or "claim_authority" in argument
+        or "runner_auth" in argument
         or "cross_authority" in argument
         for argument in args
     )

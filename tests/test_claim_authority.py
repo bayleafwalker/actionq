@@ -65,15 +65,18 @@ def test_controller_cancel_fences_claim_before_acknowledgement(schema):
         db.acknowledge_cancellation(
             conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
             former_claim_receipt="wrong", runner_auth_token=claimed["runner_auth_token"],
+            authenticated_runner="worker:one",
         )
     with pytest.raises(db.ActionQError):
         db.acknowledge_cancellation(
             conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
             former_claim_receipt=claimed["claim_receipt"], runner_auth_token="forged",
+            authenticated_runner="worker:one",
         )
     acked = db.acknowledge_cancellation(
         conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
         former_claim_receipt=claimed["claim_receipt"], runner_auth_token=claimed["runner_auth_token"],
+        authenticated_runner="worker:one",
     )
     assert acked["status"] == "cancelled"
     assert acked["stop_acknowledged"] is True
@@ -81,6 +84,7 @@ def test_controller_cancel_fences_claim_before_acknowledgement(schema):
     duplicate = db.acknowledge_cancellation(
         conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
         former_claim_receipt=claimed["claim_receipt"], runner_auth_token=claimed["runner_auth_token"],
+        authenticated_runner="worker:one",
     )
     assert duplicate["status"] == "cancelled"
 
@@ -112,6 +116,7 @@ def test_cancellation_deadline_reaper_finalizes_without_ack(schema):
         db.acknowledge_cancellation(
             conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
             former_claim_receipt="wrong", runner_auth_token=claimed["runner_auth_token"],
+            authenticated_runner="worker:one",
         )
 
 
@@ -334,7 +339,7 @@ def test_stale_claim_receipt_cannot_settle_reclaimed_action(schema):
 
 
 def test_renew_cli_exits_nonzero_with_rejection_reason(
-    schema, monkeypatch, actionq_cli_runner
+    schema, monkeypatch, actionq_cli_runner, signed_runner_proof
 ):
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
     runner = actionq_cli_runner
@@ -345,7 +350,10 @@ def test_renew_cli_exits_nonzero_with_rejection_reason(
             cli, ["add", "--type", "scope-iterate", "--project", "demo", "--target", "42", "--created-by", "human:test"]
         ).output
     )
-    claimed = json.loads(runner.invoke(cli, ["claim", "--worker", "worker:one"]).output)
+    claimed = json.loads(runner.invoke(
+        cli, ["claim", "--proof-stdin"],
+        input=json.dumps(signed_runner_proof("worker:one", "execution.action.claim", "queue:next")),
+    ).output)
     assert claimed["id"] == action["id"]
 
     ok = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:one", "--timeout", "45", "--claim-receipt", claimed["claim_receipt"]])

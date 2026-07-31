@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
@@ -11,9 +12,10 @@ CANDIDATE_V1 = "candidate/v1"
 EXECUTION_V1 = "execution/v1"
 VERIFICATION_V1 = "verification/v1"
 PUBLICATION_V1 = "publication/v1"
+RUNNER_AUTH_V1 = "runner-auth/v1"
 SUPPORTED_CONTRACT_IDS = frozenset({
     EXECUTION_ENVELOPE_V1, CLAIM_V1, CANDIDATE_V1, EXECUTION_V1,
-    VERIFICATION_V1, PUBLICATION_V1,
+    VERIFICATION_V1, PUBLICATION_V1, RUNNER_AUTH_V1,
 })
 
 
@@ -96,12 +98,27 @@ class Publication:
     contract_id: str = PUBLICATION_V1
 
 
+@dataclass(frozen=True)
+class RunnerAuth:
+    runner_id: str
+    operation: str
+    resource: str
+    request_id: str
+    issued_at: str
+    expires_at: str
+    contract_id: str = RUNNER_AUTH_V1
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 _REQUIRED_FIELDS = {
     CLAIM_V1: frozenset(Claim.__dataclass_fields__),
     CANDIDATE_V1: frozenset(Candidate.__dataclass_fields__),
     EXECUTION_V1: frozenset(Execution.__dataclass_fields__),
     VERIFICATION_V1: frozenset(Verification.__dataclass_fields__),
     PUBLICATION_V1: frozenset(Publication.__dataclass_fields__),
+    RUNNER_AUTH_V1: frozenset(RunnerAuth.__dataclass_fields__),
     EXECUTION_ENVELOPE_V1: frozenset(ExecutionEnvelope.__dataclass_fields__),
 }
 
@@ -139,8 +156,25 @@ def require_compatible(value: dict[str, Any]) -> str:
     extra = set(value) - _REQUIRED_FIELDS[str(contract_id)]
     if missing or extra:
         raise ValueError(f"invalid {contract_id} fields: missing={sorted(missing)}, extra={sorted(extra)}")
-    if not isinstance(value.get("action_id"), int) or int(value["action_id"]) <= 0:
-        raise ValueError("action_id must be a positive integer")
-    if not isinstance(value.get("attempt_id"), str) or not value["attempt_id"]:
-        raise ValueError("attempt_id is required")
+    if contract_id != RUNNER_AUTH_V1:
+        if not isinstance(value.get("action_id"), int) or int(value["action_id"]) <= 0:
+            raise ValueError("action_id must be a positive integer")
+        if not isinstance(value.get("attempt_id"), str) or not value["attempt_id"]:
+            raise ValueError("attempt_id is required")
+    elif not all(isinstance(value.get(field), str) and value[field]
+                 for field in ("runner_id", "operation", "resource", "request_id", "issued_at", "expires_at")):
+        raise ValueError("runner authentication fields must be non-empty strings")
+    for field in ("receipt_digest", "evidence_digest", "candidate_digest", "verification_digest"):
+        if field in value and not re.fullmatch(r"sha256:[0-9a-f]{64}", str(value[field])):
+            raise ValueError(f"{field} must be a canonical sha256 digest")
+    if "source_commit" in value and value["source_commit"] != "unavailable" and not re.fullmatch(
+        r"[0-9a-f]{7,64}", str(value["source_commit"])
+    ):
+        raise ValueError("source_commit must be a lowercase Git object id")
+    if "allowed_paths" in value:
+        for path in value["allowed_paths"]:
+            if not isinstance(path, str) or path.startswith("/") or ".." in path.split("/"):
+                raise ValueError("allowed paths must be relative and traversal-free")
+    if contract_id == VERIFICATION_V1 and value["outcome"] not in {"passed", "failed", "skipped"}:
+        raise ValueError("verification outcome is invalid")
     return str(contract_id)

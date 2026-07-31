@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
     "actionq-contracts==0.1.0",
     "click>=8.1",
+    "cryptography>=45",
     "psycopg[binary]>=3.1",
 ]
 

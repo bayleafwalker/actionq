@@ -6,6 +6,9 @@ from pathlib import Path
 import sys
 import subprocess
 import threading
+import time
+
+import pytest
 
 from actionq.daemon import ActionConfig, ActionctlClient, Daemon, DaemonConfig, ProjectConfig, SessionRecord, TakeupConfig, load_config
 
@@ -121,6 +124,43 @@ def test_cancellation_control_poll_stops_process_and_acks_with_private_proofs(tm
     assert daemon.config.session_state_path.read_text() == "{}"
 
 
+def test_cancellation_escalates_to_sigkill_and_leaves_no_worker(tmp_path: Path):
+    pid_file = tmp_path / "worker.pid"
+    client = FakeClient({"id": 71, "action_type": "command", "project": "demo"})
+    code = (
+        "import os,signal,time,pathlib; "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+    )
+    daemon = Daemon(
+        DaemonConfig(
+            heartbeat_interval_seconds=60, cancellation_poll_interval_seconds=0.01,
+            graceful_shutdown_seconds=0.02, session_state_path=tmp_path / "state-kill.json",
+            pause_file=tmp_path / "PAUSED",
+        ),
+        {"command": ActionConfig(runner="command", command=(sys.executable, "-c", code))}, client,
+    )
+    timer = threading.Timer(0.1, lambda: setattr(client, "current_status", "cancelling"))
+    timer.start()
+    try:
+        assert daemon.run_once() is True
+    finally:
+        timer.cancel()
+    worker_pid = int(pid_file.read_text())
+    for _ in range(100):
+        try:
+            os.kill(worker_pid, 0)
+        except ProcessLookupError:
+            break
+        stat_path = Path(f"/proc/{worker_pid}/stat")
+        if stat_path.exists() and stat_path.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("worker process remained after cancellation acknowledgement")
+    assert client.cancel_acks
+
+
 def test_cancel_ack_keeps_private_proofs_out_of_process_arguments(monkeypatch):
     observed = {}
 
@@ -130,7 +170,10 @@ def test_cancel_ack_keeps_private_proofs_out_of_process_arguments(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, stdout='{"status":"cancelled"}', stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    ActionctlClient("actionctl").acknowledge_cancellation(
+    client = ActionctlClient("actionctl", runner_private_key_path=Path("unused"))
+    client.runner_id = "runner:test"
+    monkeypatch.setattr(client, "_proof", lambda **_: {"signed": "proof"})
+    client.acknowledge_cancellation(
         70, cancel_request_id="cancel:one", former_claim_receipt="receipt:secret",
         runner_auth_token="auth:secret",
     )
@@ -138,7 +181,8 @@ def test_cancel_ack_keeps_private_proofs_out_of_process_arguments(monkeypatch):
     assert "auth:secret" not in observed["argv"]
     assert "--runner" not in observed["argv"]
     assert json.loads(observed["input"]) == {
-        "former_claim_receipt": "receipt:secret", "runner_auth_token": "auth:secret"
+        "former_claim_receipt": "receipt:secret", "runner_auth_token": "auth:secret",
+        "runner_proof": {"signed": "proof"},
     }
 
 

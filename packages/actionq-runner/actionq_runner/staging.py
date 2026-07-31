@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FORBIDDEN = re.compile(
     rb"(?i)(postgres(?:ql)?://|authorization:\s*bearer|private[_ -]?key|"
     rb"claim[_ -]?receipt(?![_ -]?digest)|ssh_auth_sock|kubeconfig|git_askpass|provider[_ -]?token)"
@@ -56,6 +56,19 @@ def staging_dir(action_id: int, claim_incarnation: str) -> AttemptSpool:
     for phase in ("incoming", "quarantine", "sealed"):
         _mkdir_secure(current / phase)
     return AttemptSpool(current, action_id, incarnation)
+
+
+def open_staging(action_id: int, claim_incarnation: str) -> AttemptSpool:
+    if action_id <= 0:
+        raise ValueError("action_id must be positive")
+    incarnation = _component(claim_incarnation)
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    root = state_home / "actionq" / "runner-staging" / "v1" / str(action_id) / incarnation
+    spool = AttemptSpool(root, action_id, incarnation)
+    for phase in ("incoming", "quarantine", "sealed"):
+        fd = _phase_fd(spool, phase)
+        os.close(fd)
+    return spool
 
 
 def _phase_fd(spool: AttemptSpool, phase: str) -> int:
@@ -147,6 +160,12 @@ def mark_reconciled(spool: AttemptSpool, *, terminal: bool) -> None:
 
 def collect(spool: AttemptSpool, *, now: float | None = None) -> bool:
     """Collect only reconciled canonical attempt roots after their retention."""
+    for phase in ("incoming", "quarantine", "sealed"):
+        fd = _phase_fd(spool, phase)
+        os.close(fd)
+    root_info = spool.root.lstat()
+    if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid():
+        raise PermissionError("spool root is not a supervisor-owned directory")
     state_path = spool.root / "sealed" / "recovery-state.json"
     if state_path.is_symlink() or not state_path.is_file():
         return False

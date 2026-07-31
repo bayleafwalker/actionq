@@ -17,6 +17,7 @@ import time
 import uuid
 
 from . import db
+from .runner_auth import VerifiedRunner, verify_runner_proof
 
 
 _KIND_TO_ACTION_TYPE = {
@@ -432,21 +433,39 @@ class ActionQApplication:
     def claim(
         self,
         *,
-        worker: str,
+        runner_proof: dict[str, Any] | None = None,
+        worker: str | None = None,
         timeout_minutes: int,
         provenance: InvocationProvenance | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            identity = verify_runner_proof(
+                runner_proof, operation="execution.action.claim", resource="queue:next"
+            )
+            proof_authenticated = True
+        elif provenance is not None and worker == provenance.actor:
+            identity = VerifiedRunner(provenance.actor, provenance.request_id, "execution.action.claim")
+            proof_authenticated = False
+        else:
+            raise db.ActionQError("claim requires signed runner proof or authenticated served identity")
+        def claim_mutation(conn, event_provenance):
+            with conn.transaction():
+                if proof_authenticated:
+                    db.consume_runner_request(
+                        conn, self.schema, runner_id=identity.runner_id,
+                        request_id=identity.request_id, operation=identity.operation,
+                        resource="queue:next",
+                    )
+                return db.claim(
+                    conn, self.schema, worker=identity.runner_id,
+                    timeout_minutes=timeout_minutes, provenance=event_provenance,
+                )
         return self._mutate(
             operation="execution.action.claim",
-            arguments={"worker": worker, "timeout_minutes": timeout_minutes},
+            arguments={"worker": identity.runner_id, "runner_request_id": identity.request_id,
+                       "timeout_minutes": timeout_minutes},
             provenance=provenance,
-            mutation=lambda conn, event_provenance: db.claim(
-                conn,
-                self.schema,
-                worker=worker,
-                timeout_minutes=timeout_minutes,
-                provenance=event_provenance,
-            ),
+            mutation=claim_mutation,
         )
 
     def renew(
@@ -619,17 +638,33 @@ class ActionQApplication:
         )
 
     def acknowledge_cancellation(self, *, action_id: int, cancel_request_id: str,
-                                 former_claim_receipt: str, runner_auth_token: str) -> Any:
+                                 former_claim_receipt: str, runner_auth_token: str,
+                                 runner_proof: dict[str, Any]) -> Any:
+        identity = verify_runner_proof(
+            runner_proof, operation="execution.action.cancel-ack",
+            resource=f"action:{action_id}:cancel:{cancel_request_id}",
+        )
+        def ack_mutation(conn, _provenance):
+            with conn.transaction():
+                resource = f"action:{action_id}:cancel:{cancel_request_id}"
+                db.consume_runner_request(
+                    conn, self.schema, runner_id=identity.runner_id,
+                    request_id=identity.request_id, operation=identity.operation,
+                    resource=resource, action_id=action_id, allow_replay=True,
+                )
+                return db.acknowledge_cancellation(
+                    conn, self.schema, action_id, cancel_request_id=cancel_request_id,
+                    former_claim_receipt=former_claim_receipt, runner_auth_token=runner_auth_token,
+                    authenticated_runner=identity.runner_id,
+                )
         return self._mutate(
             operation="execution.action.cancel-ack",
             arguments={"action_id": action_id, "cancel_request_id": cancel_request_id,
                        "former_claim_receipt_digest": db.receipt_digest(former_claim_receipt),
-                       "runner_auth_digest": db.receipt_digest(runner_auth_token)},
+                       "runner_auth_digest": db.receipt_digest(runner_auth_token),
+                       "runner_id": identity.runner_id, "runner_request_id": identity.request_id},
             provenance=None,
-            mutation=lambda conn, _provenance: db.acknowledge_cancellation(
-                conn, self.schema, action_id, cancel_request_id=cancel_request_id,
-                former_claim_receipt=former_claim_receipt, runner_auth_token=runner_auth_token,
-            ),
+            mutation=ack_mutation,
         )
 
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:

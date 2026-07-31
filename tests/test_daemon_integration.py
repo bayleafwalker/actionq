@@ -21,7 +21,7 @@ def _text(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
 
 
-def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: Path):
+def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: Path, runner_identity):
     schema = "aqdaemon_" + uuid.uuid4().hex
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
     with db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"]) as conn:
@@ -49,7 +49,8 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
             actionctl_bin=str(actionctl),
         ),
         {"scope-iterate": ActionConfig(fake_duration_seconds=1)},
-        ActionctlClient(str(actionctl)),
+        ActionctlClient(str(actionctl), runnerctl=str(Path(sys.executable).with_name("actionq-runner")),
+                        runner_private_key_path=runner_identity["private_key"]),
     )
 
     assert daemon.run_once() is True
@@ -76,7 +77,8 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
             actionctl_bin=str(actionctl),
         ),
         {},
-        ActionctlClient(str(actionctl)),
+        ActionctlClient(str(actionctl), runnerctl=str(Path(sys.executable).with_name("actionq-runner")),
+                        runner_private_key_path=runner_identity["private_key"]),
     )
     recovery._write_state(
         SessionRecord(
