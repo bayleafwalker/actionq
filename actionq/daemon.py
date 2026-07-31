@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import pwd
 import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ import time
 import tomllib
 import uuid
 from typing import Any, Callable, Protocol, Sequence
+
+from actionq_contracts import EXECUTION_ENVELOPE_V1, ExecutionEnvelope, require_compatible, sha256_digest
 
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
 from .harnesses import HarnessInvocation, get_adapter
@@ -100,12 +103,17 @@ class ContextConfig:
 class DaemonConfig:
     poll_interval_seconds: float = 30.0
     heartbeat_interval_seconds: float = 60.0
+    cancellation_poll_interval_seconds: float = 2.0
     graceful_shutdown_seconds: float = 30.0
     default_timeout_minutes: int = 30
     session_state_path: Path = Path("~/.local/state/actionq/sessions.json")
     pause_file: Path = Path("~/.local/state/actionq/PAUSED")
     handoff_dir: Path = Path("~/.local/state/actionq/handoff")
     actionctl_bin: str = "actionctl"
+    runnerctl_bin: str = "actionq-runner"
+    runner_private_key_path: Path = Path("~/.local/state/actionq/runner-identity.pem")
+    runner_id: str = "runner:devbox"
+    enforce_worker_isolation: bool = True
     takeup: TakeupConfig = TakeupConfig()
     audit: AuditConfig = AuditConfig()
     context: ContextConfig = ContextConfig()
@@ -183,6 +191,10 @@ class CoordinatorClient(Protocol):
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None: ...
     def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None: ...
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None: ...
+    def show(self, action_id: int) -> dict[str, Any]: ...
+    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
+                                 former_claim_receipt: str, runner_auth_token: str) -> None: ...
+    def reconcile_runner_spool(self, action_id: int, *, attempt_id: str) -> None: ...
 
 
 class TakeupClient(Protocol):
@@ -237,12 +249,17 @@ class AuditClient(Protocol):
 
 
 class ActionctlClient:
-    def __init__(self, executable: str):
+    def __init__(self, executable: str, *, runnerctl: str = "actionq-runner",
+                 runner_private_key_path: Path | None = None):
         self.executable = executable
+        self.runnerctl = runnerctl
+        configured_key = os.environ.get("ACTIONQ_RUNNER_PRIVATE_KEY")
+        self.runner_private_key_path = runner_private_key_path or (Path(configured_key) if configured_key else None)
+        self.runner_id: str | None = None
 
-    def _run(self, *args: str, allow_empty: bool = False) -> dict[str, Any] | None:
+    def _run(self, *args: str, allow_empty: bool = False, input_text: str | None = None) -> dict[str, Any] | None:
         completed = subprocess.run(
-            [self.executable, *args], text=True, capture_output=True, check=False
+            [self.executable, *args], text=True, input=input_text, capture_output=True, check=False
         )
         if allow_empty and completed.returncode == 2:
             return None
@@ -251,11 +268,34 @@ class ActionctlClient:
             raise RuntimeError(detail)
         return json.loads(completed.stdout)
 
+    def _proof(self, *, runner_id: str, operation: str, resource: str) -> dict[str, Any]:
+        if self.runner_private_key_path is None:
+            raise RuntimeError("runner private key is not configured")
+        request_id = str(uuid.uuid4())
+        completed = subprocess.run(
+            [self.runnerctl, "sign", "--private-key", str(self.runner_private_key_path),
+             "--runner-id", runner_id, "--operation", operation, "--resource", resource,
+             "--request-id", request_id], text=True, capture_output=True, check=False,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr.strip() or "runner signing failed")
+        return json.loads(completed.stdout)
+
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None:
-        return self._run("claim", "--worker", worker, "--timeout", str(timeout_minutes), allow_empty=True)
+        self.runner_id = worker
+        proof = self._proof(runner_id=worker, operation="execution.action.claim", resource="queue:next")
+        return self._run("claim", "--proof-stdin", "--timeout", str(timeout_minutes),
+                         allow_empty=True, input_text=json.dumps(proof))
+
+    def show(self, action_id: int) -> dict[str, Any]:
+        result = self._run("show", str(action_id))
+        assert result is not None
+        return result
 
     def renew(self, action_id: int, *, worker: str, timeout_minutes: int, claim_receipt: str) -> None:
-        self._run("renew", str(action_id), "--worker", worker, "--timeout", str(timeout_minutes), "--claim-receipt", claim_receipt)
+        proof = self._proof(runner_id=worker, operation="execution.action.renew", resource=f"action:{action_id}")
+        self._run("renew", str(action_id), "--timeout", str(timeout_minutes), "--proof-stdin",
+                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
 
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None:
         args = ["emit", "--type", event_type, "--actor", actor, "--payload", json.dumps(payload, sort_keys=True)]
@@ -264,10 +304,43 @@ class ActionctlClient:
         self._run(*args)
 
     def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None:
-        self._run("complete", str(action_id), "--result", result_ref, "--actor", actor, "--claim-receipt", claim_receipt)
+        proof = self._proof(runner_id=actor, operation="execution.action.complete", resource=f"action:{action_id}")
+        self._run("complete", str(action_id), "--result", result_ref, "--proof-stdin",
+                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
 
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
-        self._run("fail", str(action_id), "--reason", reason, "--actor", actor, "--claim-receipt", claim_receipt)
+        proof = self._proof(runner_id=actor, operation="execution.action.fail", resource=f"action:{action_id}")
+        self._run("fail", str(action_id), "--reason", reason, "--proof-stdin",
+                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
+
+    def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
+                                 former_claim_receipt: str, runner_auth_token: str) -> None:
+        if self.runner_id is None:
+            raise RuntimeError("runner identity was not established by a claim")
+        proof = self._proof(
+            runner_id=self.runner_id, operation="execution.action.cancel-ack",
+            resource=f"action:{action_id}:cancel:{cancel_request_id}",
+        )
+        self._run(
+            "cancel-ack", str(action_id), "--cancel-request-id", cancel_request_id, "--proof-stdin",
+            input_text=json.dumps({"former_claim_receipt": former_claim_receipt,
+                                   "runner_auth_token": runner_auth_token,
+                                   "runner_proof": proof}),
+        )
+
+    def reconcile_runner_spool(self, action_id: int, *, attempt_id: str) -> None:
+        if self.runner_id is None:
+            raise RuntimeError("runner identity was not established by a claim")
+        proof = self._proof(
+            runner_id=self.runner_id, operation="runner.spool.reconcile",
+            resource=f"action:{action_id}:attempt:{attempt_id}",
+        )
+        completed = subprocess.run(
+            [self.runnerctl, "reconcile", "--proof-stdin"], input=json.dumps(proof),
+            text=True, capture_output=True, check=False,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr.strip() or "runner spool reconciliation failed")
 
 
 class SprintctlTakeupClient:
@@ -487,12 +560,19 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
     config = DaemonConfig(
         poll_interval_seconds=float(global_raw.get("poll_interval_seconds", 30)),
         heartbeat_interval_seconds=float(global_raw.get("heartbeat_interval_seconds", 60)),
+        cancellation_poll_interval_seconds=float(global_raw.get("cancellation_poll_interval_seconds", 2)),
         graceful_shutdown_seconds=float(global_raw.get("graceful_shutdown_seconds", 30)),
         default_timeout_minutes=int(global_raw.get("default_timeout_minutes", 30)),
         session_state_path=state_path,
         pause_file=pause_file,
         handoff_dir=handoff_dir,
         actionctl_bin=str(global_raw.get("actionctl_bin", "actionctl")),
+        runnerctl_bin=str(global_raw.get("runnerctl_bin", "actionq-runner")),
+        runner_private_key_path=Path(global_raw.get(
+            "runner_private_key_path", DaemonConfig.runner_private_key_path
+        )).expanduser(),
+        runner_id=str(global_raw.get("runner_id", "runner:devbox")),
+        enforce_worker_isolation=bool(global_raw.get("enforce_worker_isolation", True)),
         takeup=TakeupConfig(
             enabled=bool(takeup_raw.get("enabled", False)),
             remote_only=bool(takeup_raw.get("remote_only", True)),
@@ -697,7 +777,7 @@ class Daemon:
                 payload={"daemon_id": self.daemon_id, "pause_file": str(self.config.pause_file)},
             )
             return False
-        action = self.client.claim(self.actor, self.config.default_timeout_minutes)
+        action = self.client.claim(self.config.runner_id, self.config.default_timeout_minutes)
         if action is None:
             return False
         self._run_action(action)
@@ -706,12 +786,15 @@ class Daemon:
     def _run_action(self, action: dict[str, Any]) -> None:
         action_id = int(action["id"])
         claim_receipt = str(action.get("claim_receipt") or "")
+        runner_auth_token = str(action.get("runner_auth_token") or "")
         if not claim_receipt:
             raise RuntimeError(f"action #{action_id} claim did not include a claim receipt")
+        if not runner_auth_token:
+            raise RuntimeError(f"action #{action_id} claim did not include runner authentication")
         action_type = str(action["action_type"])
         action_config = self.actions.get(action_type)
         if action_config is None:
-            self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.actor, claim_receipt=claim_receipt)
+            self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.config.runner_id, claim_receipt=claim_receipt)
             return
         project = self.projects.get(str(action.get("project") or ""))
         routing: RoutingResult | None = None
@@ -731,6 +814,15 @@ class Daemon:
                 )
                 if project is None:
                     raise RoutingError(f"runner {action_config.runner!r} requires a configured project worktree")
+                if self.config.enforce_worker_isolation:
+                    if action_config.worker_user is None:
+                        raise RoutingError(f"runner {action_config.runner!r} requires a distinct worker_user")
+                    try:
+                        worker_uid = pwd.getpwnam(action_config.worker_user).pw_uid
+                    except KeyError as exc:
+                        raise RoutingError("configured worker_user does not exist") from exc
+                    if worker_uid == os.geteuid():
+                        raise RoutingError("worker_user must differ from the trusted supervisor identity")
                 if action_config.runner == "harness" and not (action.get("prompt") or action_config.prompt):
                     raise RoutingError("runner 'harness' requires an explicit or action-class prompt")
                 if action_config.runner == "scope-iterate":
@@ -753,7 +845,7 @@ class Daemon:
                             worker_user=action_config.worker_user,
                         )
             except RoutingError as exc:
-                self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.actor, claim_receipt=claim_receipt)
+                self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.config.runner_id, claim_receipt=claim_receipt)
                 return
         session_id = f"aqs:{uuid.uuid4()}"
         ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
@@ -807,7 +899,7 @@ class Daemon:
             except Exception as exc:
                 self.client.fail(
                     action_id, reason=f"scope-iterate preparation failed: {exc}",
-                    actor=self.actor, claim_receipt=claim_receipt,
+                    actor=self.config.runner_id, claim_receipt=claim_receipt,
                 )
                 return
         claim_result = self._context_claim_acquire(
@@ -822,7 +914,7 @@ class Daemon:
             self.client.fail(
                 action_id,
                 reason=f"context claim acquisition failed before session start: {claim_result['error']}",
-                actor=self.actor, claim_receipt=claim_receipt,
+                actor=self.config.runner_id, claim_receipt=claim_receipt,
             )
             return
         # Best-effort starting git state for this project (#1115 crash-
@@ -876,6 +968,23 @@ class Daemon:
             if action_config.runner in {"command", "harness", "scope-iterate"}
             else None
         )
+        envelope = ExecutionEnvelope(
+            contract_id=EXECUTION_ENVELOPE_V1,
+            action_id=action_id,
+            attempt_id=session_id,
+            source_commit=base_commit or "unavailable",
+            command_id=f"{action_type}:{action_config.runner}",
+            allowed_paths=(
+                tuple(action_config.scope_iterate.path_acl.allow)
+                if action_config.runner == "scope-iterate" and action_config.scope_iterate is not None
+                else ()
+            ),
+        )
+        require_compatible(envelope.as_dict())
+        self.client.emit(
+            "runner.contract.frozen", action_id=action_id, actor=self.actor,
+            payload={"session_id": session_id, "contract": envelope.as_dict(), "digest": sha256_digest(envelope)},
+        )
         try:
             self._child = self._start_child(
                 action_config,
@@ -886,6 +995,7 @@ class Daemon:
                     else (str(action["prompt"]) if action.get("prompt") else action_config.prompt)
                 ),
                 output_path=output_path,
+                envelope=envelope,
             )
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
             try:
@@ -900,7 +1010,7 @@ class Daemon:
                 os.killpg(self._child.pid, signal.SIGTERM)
                 self._child.wait()
                 self.client.fail(action_id, reason=f"sprintctl takeup failed before session start: {exc}",
-                                 actor=self.actor, claim_receipt=claim_receipt)
+                                 actor=self.config.runner_id, claim_receipt=claim_receipt)
                 return
             self._write_state(record)
             audit_start = self._publish_audit(
@@ -913,7 +1023,7 @@ class Daemon:
                                      "sprint_takeup": takeup, "audit_start": audit_start})
             sprint_claim_lease = self._sprint_claim_leases.get(session_id)
             outcome, exit_code = self._wait_for_child(
-                action_id, payload, record, claim_receipt, sprint_claim_lease,
+                action_id, payload, record, claim_receipt, runner_auth_token, sprint_claim_lease,
                 project, audit_actor, audit_refs,
             )
             usage_limit_reason: str | None = None
@@ -971,8 +1081,11 @@ class Daemon:
                     "settlement.actionq_skipped_claim_lost", action_id=action_id, actor=self.actor,
                     payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease)},
                 )
+            elif outcome == "cancelled":
+                # The acknowledgement already performed the terminal mutation.
+                pass
             elif settlement_error is not None:
-                self.client.fail(action_id, reason=settlement_error, actor=self.actor, claim_receipt=claim_receipt)
+                self.client.fail(action_id, reason=settlement_error, actor=self.config.runner_id, claim_receipt=claim_receipt)
             elif outcome == "completed":
                 self.client.complete(
                     action_id,
@@ -980,13 +1093,15 @@ class Daemon:
                         scope_result.result_ref if scope_result is not None
                         else f"session={session_id}"
                     ),
-                    actor=self.actor,
+                    actor=self.config.runner_id,
                     claim_receipt=claim_receipt,
                 )
             else:
-                self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.actor, claim_receipt=claim_receipt)
+                self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.config.runner_id, claim_receipt=claim_receipt)
+            if outcome not in {"claim-lost"} and settlement_error is None and hasattr(self.client, "reconcile_runner_spool"):
+                self.client.reconcile_runner_spool(action_id, attempt_id=session_id)
         except Exception as exc:
-            self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.actor, claim_receipt=claim_receipt)
+            self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.config.runner_id, claim_receipt=claim_receipt)
             raise
         finally:
             self._sprint_claim_leases.pop(session_id, None)
@@ -1195,10 +1310,36 @@ class Daemon:
         routing: RoutingResult | None = None,
         prompt: str | None = None,
         output_path: Path | None = None,
+        envelope: ExecutionEnvelope,
     ) -> subprocess.Popen[str]:
+        def portable(command: list[str], *, cwd: Path | None = None,
+                     environment: dict[str, str] | None = None,
+                     stdin_text: str | None = None) -> subprocess.Popen[str]:
+            blocked = ("ACTIONQ", "SPRINT", "KUBECONFIG", "SSH_", "GIT_", "AWS_", "TOKEN", "SECRET", "PASSWORD")
+            source = environment if environment is not None else os.environ
+            clean_env = {key: value for key, value in source.items()
+                         if not any(marker in key.upper() for marker in blocked)}
+            packet = {
+                "envelope": envelope.as_dict(), "command": command,
+                "cwd": str(cwd) if cwd else None, "environment": clean_env,
+                "registered_command_id": envelope.command_id,
+                "contained_worker": self.config.enforce_worker_isolation,
+                "stdin": stdin_text, "output_path": str(output_path) if output_path else None,
+                # Leave the outer coordinator enough time to observe the
+                # runner's waitpid after the runner escalates its child.
+                "grace_seconds": max(0.0, self.config.graceful_shutdown_seconds - 0.5),
+            }
+            child = subprocess.Popen(
+                [self.config.runnerctl_bin, "execute"], stdin=subprocess.PIPE,
+                text=True, start_new_session=True,
+            )
+            assert child.stdin is not None
+            child.stdin.write(json.dumps(packet, sort_keys=True))
+            child.stdin.close()
+            return child
         if action.runner in {"fake", "fake-commit"}:
             code = f"import time; time.sleep({action.fake_duration_seconds!r})"
-            return subprocess.Popen([sys.executable, "-c", code], text=True, start_new_session=True)
+            return portable([sys.executable, "-c", code])
         if action.runner == "command":
             # Deterministic, config-driven runner for usage-limit
             # command-wrapper simulations (#976) -- not a real harness
@@ -1207,23 +1348,7 @@ class Daemon:
             # after the child exits.
             if not action.command:
                 raise RuntimeError("runner 'command' requires ActionConfig.command")
-            handle = None
-            stdout_target: Any = subprocess.DEVNULL
-            if output_path is not None:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                handle = open(output_path, "w", encoding="utf-8")
-                stdout_target = handle
-            try:
-                return subprocess.Popen(
-                    list(action.command),
-                    text=True,
-                    start_new_session=True,
-                    stdout=stdout_target,
-                    stderr=subprocess.STDOUT,
-                )
-            finally:
-                if handle is not None:
-                    handle.close()
+            return portable(list(action.command))
         if action.runner in {"harness", "scope-iterate"}:
             if project is None or routing is None or prompt is None:
                 raise RuntimeError(f"runner {action.runner!r} requires project, routing, and prompt")
@@ -1239,15 +1364,9 @@ class Daemon:
                 timeout_seconds=(action.timeout_minutes or self.config.default_timeout_minutes) * 60,
                 extra_env=project.env or {},
             )
-            handle = None
-            stdout_target: Any = subprocess.DEVNULL
-            if output_path is not None:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                handle = open(output_path, "w", encoding="utf-8")
-                stdout_target = handle
+            command = adapter.build_command(invocation)
+            env = adapter.build_env(invocation)
             try:
-                command = adapter.build_command(invocation)
-                env = adapter.build_env(invocation)
                 if action.worker_user is not None:
                     # `sudo -H` supplies the worker's HOME, so provider
                     # credentials remain with that identity.  Preserve only
@@ -1263,28 +1382,10 @@ class Daemon:
                         *command,
                     ]
                     env = {"OPENCODE_CONFIG": env.get("OPENCODE_CONFIG", "")}
-                child = subprocess.Popen(
-                    command,
-                    cwd=invocation.worktree,
-                    env=env,
-                    stdin=subprocess.PIPE if adapter.stdin_text(invocation) is not None else subprocess.DEVNULL,
-                    stdout=stdout_target,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    start_new_session=True,
-                )
                 stdin_text = adapter.stdin_text(invocation)
-                if stdin_text is not None and child.stdin is not None:
-                    try:
-                        child.stdin.write(stdin_text)
-                    except BrokenPipeError:
-                        pass
-                    finally:
-                        child.stdin.close()
-                return child
+                return portable(command, cwd=invocation.worktree, environment=env, stdin_text=stdin_text)
             finally:
-                if handle is not None:
-                    handle.close()
+                pass
         raise RuntimeError(f"runner {action.runner!r} is not supported by daemon minimum")
 
     def _output_path(self, session_id: str) -> Path:
@@ -1410,6 +1511,7 @@ class Daemon:
         payload: dict[str, Any],
         record: SessionRecord,
         claim_receipt: str,
+        runner_auth_token: str,
         sprint_claim_lease: SprintClaimLease | None,
         project: ProjectConfig | None = None,
         audit_actor: str | None = None,
@@ -1417,6 +1519,7 @@ class Daemon:
     ) -> tuple[str, int]:
         assert self._child is not None
         next_heartbeat = time.monotonic() + self.config.heartbeat_interval_seconds
+        next_cancel_poll = time.monotonic()
         while self._child.poll() is None:
             if self._shutdown:
                 audit_pause = self._publish_audit(
@@ -1432,9 +1535,33 @@ class Daemon:
                 except subprocess.TimeoutExpired:
                     os.killpg(self._child.pid, signal.SIGTERM)
                 return "shutdown", self._child.wait()
+            if time.monotonic() >= next_cancel_poll:
+                try:
+                    current = self.client.show(action_id) if hasattr(self.client, "show") else None
+                    action = current.get("action", current) if isinstance(current, dict) else None
+                    if isinstance(action, dict) and action.get("status") == "cancelling":
+                        os.killpg(self._child.pid, signal.SIGTERM)
+                        try:
+                            self._child.wait(timeout=self.config.graceful_shutdown_seconds)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(self._child.pid, signal.SIGKILL)
+                            self._child.wait()
+                        self.client.acknowledge_cancellation(
+                            action_id, cancel_request_id=str(action["cancel_request_id"]),
+                            former_claim_receipt=claim_receipt,
+                            runner_auth_token=runner_auth_token,
+                        )
+                        return "cancelled", int(self._child.returncode or 0)
+                except Exception as exc:
+                    os.killpg(self._child.pid, signal.SIGTERM)
+                    self._child.wait()
+                    self.client.emit("session.paused", action_id=action_id, actor=self.actor,
+                        payload={**payload, "pid": record.pid, "reason": "cancellation-control-lost", "detail": str(exc)})
+                    return "claim-lost", int(self._child.returncode or 1)
+                next_cancel_poll = time.monotonic() + self.config.cancellation_poll_interval_seconds
             if time.monotonic() >= next_heartbeat:
                 try:
-                    self.client.renew(action_id, worker=self.actor,
+                    self.client.renew(action_id, worker=self.config.runner_id,
                                       timeout_minutes=self.config.default_timeout_minutes,
                                       claim_receipt=claim_receipt)
                     if sprint_claim_lease is not None:
@@ -1482,7 +1609,10 @@ def main(argv: list[str] | None = None) -> int:
     if not config_path.exists() and args.config is None:
         config_path = Path("~/.config/actionq-dispatcher/config.toml").expanduser()
     config, actions, projects = load_config(config_path)
-    daemon = Daemon(config, actions, ActionctlClient(config.actionctl_bin), projects,
+    daemon = Daemon(config, actions, ActionctlClient(
+        config.actionctl_bin, runnerctl=config.runnerctl_bin,
+        runner_private_key_path=config.runner_private_key_path,
+    ), projects,
                     reload_config=lambda: load_config(config_path))
     signal.signal(signal.SIGTERM, daemon.request_shutdown)
     signal.signal(signal.SIGINT, daemon.request_shutdown)

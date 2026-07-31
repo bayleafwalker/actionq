@@ -228,6 +228,7 @@ class _CapturingActionctlClient(ActionctlClient):
         action = super().claim(worker, timeout_minutes)
         if action is not None:
             self.claim_receipt = action["claim_receipt"]
+            action.setdefault("runner_auth_token", "test-runner-auth")
         return action
 
     def emit(self, event_type, *, action_id, actor, payload):

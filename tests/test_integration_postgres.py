@@ -25,8 +25,8 @@ def runner_env(monkeypatch, actionq_cli_runner):
     return actionq_cli_runner, schema
 
 
-def _invoke_json(runner, args):
-    result = runner.invoke(cli, args)
+def _invoke_json(runner, args, *, input=None):
+    result = runner.invoke(cli, args, input=input)
     assert result.exit_code == 0, result.output
     return json.loads(result.output)
 
@@ -42,7 +42,7 @@ def _install_legacy_v1(conn, schema: str) -> None:
     conn.commit()
 
 
-def test_lifecycle_claim_complete_show(runner_env):
+def test_lifecycle_claim_complete_show(runner_env, signed_runner_proof):
     runner, _schema = runner_env
     result = runner.invoke(cli, ["migrate"])
     assert result.exit_code == 0, result.output
@@ -65,13 +65,17 @@ def test_lifecycle_claim_complete_show(runner_env):
     )
     assert action["status"] == "pending"
 
-    claimed = _invoke_json(runner, ["claim", "--worker", "worker:test"])
+    claimed = _invoke_json(runner, ["claim", "--proof-stdin"],
+                           input=json.dumps(signed_runner_proof("worker:test", "execution.action.claim", "queue:next")))
     assert claimed["id"] == action["id"]
     assert claimed["status"] == "claimed"
 
     completed = _invoke_json(
         runner,
-        ["complete", str(action["id"]), "--result", "branch=agent/scope-iterate/1", "--actor", "worker:test", "--claim-receipt", claimed["claim_receipt"]],
+        ["complete", str(action["id"]), "--result", "branch=agent/scope-iterate/1", "--proof-stdin"],
+        input=json.dumps({"claim_receipt": claimed["claim_receipt"], "runner_proof": signed_runner_proof(
+            "worker:test", "execution.action.complete", f"action:{action['id']}"
+        )}),
     )
     assert completed["status"] == "completed"
 
@@ -84,17 +88,18 @@ def test_lifecycle_claim_complete_show(runner_env):
     ]
 
 
-def test_claim_exits_nonzero_when_empty(runner_env):
+def test_claim_exits_nonzero_when_empty(runner_env, signed_runner_proof):
     runner, _schema = runner_env
     result = runner.invoke(cli, ["migrate"])
     assert result.exit_code == 0, result.output
 
-    result = runner.invoke(cli, ["claim", "--worker", "worker:test"])
+    result = runner.invoke(cli, ["claim", "--proof-stdin"],
+                           input=json.dumps(signed_runner_proof("worker:test", "execution.action.claim", "queue:next")))
     assert result.exit_code == 2
     assert "no pending actions" in result.output
 
 
-def test_manual_usage_limit_pause_then_resume_drill(runner_env):
+def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_proof):
     """One manual resume/re-dispatch drill for work item #976: pause an
     action with a confirmed usage-limit reason and handoff reference, fail
     it (checkpoint-and-fail), enqueue a fresh re-dispatch action, and emit
@@ -109,7 +114,9 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env):
         runner,
         ["add", "--type", "scope-iterate", "--project", "sprintctl", "--target", "42", "--created-by", "human:test"],
     )
-    claimed = _invoke_json(runner, ["claim", "--worker", "actionq-daemon:test"])
+    claimed = _invoke_json(runner, ["claim", "--proof-stdin"], input=json.dumps(
+        signed_runner_proof("actionq-daemon:test", "execution.action.claim", "queue:next")
+    ))
     assert claimed["id"] == action["id"]
 
     paused = _invoke_json(
@@ -126,7 +133,10 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env):
 
     failed = _invoke_json(
         runner,
-        ["fail", str(action["id"]), "--reason", "usage-limit-paused: confirmed usage-limit signal matched", "--actor", "actionq-daemon:test", "--claim-receipt", claimed["claim_receipt"]],
+        ["fail", str(action["id"]), "--reason", "usage-limit-paused: confirmed usage-limit signal matched", "--proof-stdin"],
+        input=json.dumps({"claim_receipt": claimed["claim_receipt"], "runner_proof": signed_runner_proof(
+            "actionq-daemon:test", "execution.action.fail", f"action:{action['id']}"
+        )}),
     )
     assert failed["status"] == "failed"
 
@@ -245,6 +255,8 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
                 "idx_dispatch_requests_created",
             }
         )
+    if schema_contract.MAX_SCHEMA_VERSION >= 4:
+        expected_indexes.add("idx_actions_cancelling_deadline")
     assert before <= expected_indexes
     assert after == expected_indexes
 

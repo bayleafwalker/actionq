@@ -53,6 +53,109 @@ def _enqueue_and_claim(conn, schema_name: str, worker: str = "worker:one", timeo
     return claimed
 
 
+def test_controller_cancel_fences_claim_before_acknowledgement(schema):
+    conn = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(conn, schema)
+    cancelling = db.cancel(conn, schema, claimed["id"], "operator stop", actor="controller")
+    assert cancelling["status"] == "cancelling"
+    assert cancelling["claim_receipt"] is None
+    with pytest.raises(db.ActionQError):
+        db.complete(conn, schema, claimed["id"], "result:late", worker="worker:one", claim_receipt=claimed["claim_receipt"])
+    with pytest.raises(db.ActionQError):
+        db.acknowledge_cancellation(
+            conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+            former_claim_receipt="wrong", runner_auth_token=claimed["runner_auth_token"],
+            authenticated_runner="worker:one",
+        )
+    with pytest.raises(db.ActionQError):
+        db.acknowledge_cancellation(
+            conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+            former_claim_receipt=claimed["claim_receipt"], runner_auth_token="forged",
+            authenticated_runner="worker:one",
+        )
+    acked = db.acknowledge_cancellation(
+        conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+        former_claim_receipt=claimed["claim_receipt"], runner_auth_token=claimed["runner_auth_token"],
+        authenticated_runner="worker:one",
+    )
+    assert acked["status"] == "cancelled"
+    assert acked["stop_acknowledged"] is True
+    assert acked["claimed_by"] is None
+    duplicate = db.acknowledge_cancellation(
+        conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+        former_claim_receipt=claimed["claim_receipt"], runner_auth_token=claimed["runner_auth_token"],
+        authenticated_runner="worker:one",
+    )
+    assert duplicate["status"] == "cancelled"
+
+
+def test_general_reads_do_not_disclose_claim_receipt(schema):
+    conn = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(conn, schema)
+    assert claimed["claim_receipt"]
+    assert "claim_receipt" not in db.redact_action(db.get_action(conn, schema, claimed["id"]))
+    assert "claim_receipt" not in db.redact_action(db.list_actions(conn, schema)[0])
+    assert "runner_auth_token" not in db.redact_action(claimed)
+
+
+def test_cancellation_deadline_reaper_finalizes_without_ack(schema):
+    conn = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(conn, schema)
+    cancelling = db.cancel(conn, schema, claimed["id"], "runner unavailable", actor="controller")
+    conn.execute(
+        f"UPDATE {db.qname(schema, 'actions')} SET cancel_stop_deadline=now() - interval '1 second' WHERE id=%s",
+        (claimed["id"],),
+    )
+    conn.commit()
+    reaped = db.reap_cancellations(conn, schema)
+    assert [row["id"] for row in reaped] == [claimed["id"]]
+    assert reaped[0]["status"] == "cancelled"
+    assert reaped[0]["stop_acknowledged"] is False
+    assert reaped[0]["claimed_by"] is None
+    with pytest.raises(db.ActionQError):
+        db.acknowledge_cancellation(
+            conn, schema, claimed["id"], cancel_request_id=str(cancelling["cancel_request_id"]),
+            former_claim_receipt="wrong", runner_auth_token=claimed["runner_auth_token"],
+            authenticated_runner="worker:one",
+        )
+
+
+def test_cancel_and_complete_serialize_on_action_row(schema):
+    setup = _connect_migrated(schema)
+    claimed = _enqueue_and_claim(setup, schema)
+    setup.close()
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def complete():
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        barrier.wait()
+        try:
+            db.complete(conn, schema, claimed["id"], "result:ok", worker="worker:one",
+                        claim_receipt=claimed["claim_receipt"])
+            conn.commit(); outcomes.append("completed")
+        except db.ActionQError:
+            conn.rollback(); outcomes.append("complete-rejected")
+        finally:
+            conn.close()
+
+    def cancel():
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        barrier.wait()
+        try:
+            db.cancel(conn, schema, claimed["id"], "operator stop", actor="controller")
+            conn.commit(); outcomes.append("cancelling")
+        except db.ActionQError:
+            conn.rollback(); outcomes.append("cancel-rejected")
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=complete), threading.Thread(target=cancel)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=5)
+    assert sorted(outcomes) in (["cancel-rejected", "completed"], ["cancelling", "complete-rejected"])
+
+
 # -- db.renew: grant path -------------------------------------------------
 
 
@@ -236,7 +339,7 @@ def test_stale_claim_receipt_cannot_settle_reclaimed_action(schema):
 
 
 def test_renew_cli_exits_nonzero_with_rejection_reason(
-    schema, monkeypatch, actionq_cli_runner
+    schema, monkeypatch, actionq_cli_runner, signed_runner_proof
 ):
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
     runner = actionq_cli_runner
@@ -247,14 +350,23 @@ def test_renew_cli_exits_nonzero_with_rejection_reason(
             cli, ["add", "--type", "scope-iterate", "--project", "demo", "--target", "42", "--created-by", "human:test"]
         ).output
     )
-    claimed = json.loads(runner.invoke(cli, ["claim", "--worker", "worker:one"]).output)
+    claimed = json.loads(runner.invoke(
+        cli, ["claim", "--proof-stdin"],
+        input=json.dumps(signed_runner_proof("worker:one", "execution.action.claim", "queue:next")),
+    ).output)
     assert claimed["id"] == action["id"]
 
-    ok = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:one", "--timeout", "45", "--claim-receipt", claimed["claim_receipt"]])
+    ok = runner.invoke(cli, ["renew", str(action["id"]), "--timeout", "45", "--proof-stdin"], input=json.dumps({
+        "claim_receipt": claimed["claim_receipt"],
+        "runner_proof": signed_runner_proof("worker:one", "execution.action.renew", f"action:{action['id']}"),
+    }))
     assert ok.exit_code == 0, ok.output
     assert json.loads(ok.output)["id"] == action["id"]
 
-    rejected = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:impostor", "--claim-receipt", claimed["claim_receipt"]])
+    rejected = runner.invoke(cli, ["renew", str(action["id"]), "--proof-stdin"], input=json.dumps({
+        "claim_receipt": claimed["claim_receipt"],
+        "runner_proof": signed_runner_proof("worker:test", "execution.action.renew", f"action:{action['id']}"),
+    }))
     assert rejected.exit_code == 2
     assert "claimed-by-different-worker" in rejected.output
 

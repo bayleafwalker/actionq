@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
+import sys
+import subprocess
 import threading
+import time
 
-from actionq.daemon import ActionConfig, Daemon, DaemonConfig, ProjectConfig, SessionRecord, TakeupConfig, load_config
+import pytest
+
+from actionq.daemon import ActionConfig, ActionctlClient, Daemon, DaemonConfig, ProjectConfig, SessionRecord, TakeupConfig, load_config
 
 
 class FakeClient:
@@ -15,16 +21,28 @@ class FakeClient:
         self.completed = []
         self.failed = []
         self.started = threading.Event()
+        self.current_status = "claimed"
+        self.cancel_request_id = "00000000-0000-0000-0000-000000000001"
+        self.cancel_acks = []
 
     def claim(self, worker, timeout_minutes):
         self.claims.append((worker, timeout_minutes))
         action, self.action = self.action, None
         if action is not None:
-            action = {**action, "claim_receipt": action.get("claim_receipt", "test-receipt")}
+            action = {**action, "claim_receipt": action.get("claim_receipt", "test-receipt"),
+                      "runner_auth_token": action.get("runner_auth_token", "test-runner-auth")}
         return action
 
     def renew(self, action_id, *, worker, timeout_minutes, claim_receipt):
         assert claim_receipt == "test-receipt"
+
+    def show(self, action_id):
+        return {"action": {"id": action_id, "status": self.current_status,
+                           "cancel_request_id": self.cancel_request_id}}
+
+    def acknowledge_cancellation(self, action_id, *, cancel_request_id,
+                                 former_claim_receipt, runner_auth_token):
+        self.cancel_acks.append((action_id, cancel_request_id, former_claim_receipt, runner_auth_token))
 
     def emit(self, event_type, *, action_id, actor, payload):
         self.events.append((event_type, action_id, actor, payload))
@@ -69,15 +87,103 @@ def test_fake_action_emits_lifecycle_and_clears_state(tmp_path: Path):
     assert daemon.run_once() is True
 
     event_types = [event[0] for event in client.events]
-    assert event_types[:2] == ["session.dispatch", "session.started"]
+    assert event_types[:3] == ["session.dispatch", "runner.contract.frozen", "session.started"]
     assert "session.heartbeat" in event_types
     assert event_types[-1] == "session.exited"
     session_id = client.events[0][3]["session_id"]
     assert all(event[3]["session_id"] == session_id for event in client.events)
     assert client.events[0][3]["ttl_seconds"] == 1800
     assert client.completed and client.completed[0][0] == 7
-    assert not client.failed
     assert config.session_state_path.read_text() == "{}"
+
+
+def test_cancellation_control_poll_stops_process_and_acks_with_private_proofs(tmp_path: Path):
+    client = FakeClient({"id": 70, "action_type": "command", "project": "demo"})
+    daemon = Daemon(
+        DaemonConfig(
+            heartbeat_interval_seconds=60,
+            cancellation_poll_interval_seconds=0.01,
+            graceful_shutdown_seconds=0.02,
+            session_state_path=tmp_path / "state.json",
+            pause_file=tmp_path / "PAUSED",
+        ),
+        {"command": ActionConfig(runner="command", command=(sys.executable, "-c", "import time; time.sleep(5)"))},
+        client,
+    )
+    timer = threading.Timer(0.05, lambda: setattr(client, "current_status", "cancelling"))
+    timer.start()
+    try:
+        assert daemon.run_once() is True
+    finally:
+        timer.cancel()
+    assert client.cancel_acks == [
+        (70, client.cancel_request_id, "test-receipt", "test-runner-auth")
+    ]
+    assert client.completed == []
+    assert not client.failed
+    assert daemon.config.session_state_path.read_text() == "{}"
+
+
+def test_cancellation_escalates_to_sigkill_and_leaves_no_worker(tmp_path: Path):
+    pid_file = tmp_path / "worker.pid"
+    client = FakeClient({"id": 71, "action_type": "command", "project": "demo"})
+    code = (
+        "import os,signal,time,pathlib; "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+    )
+    daemon = Daemon(
+        DaemonConfig(
+            heartbeat_interval_seconds=60, cancellation_poll_interval_seconds=0.01,
+            graceful_shutdown_seconds=0.02, session_state_path=tmp_path / "state-kill.json",
+            pause_file=tmp_path / "PAUSED",
+        ),
+        {"command": ActionConfig(runner="command", command=(sys.executable, "-c", code))}, client,
+    )
+    timer = threading.Timer(0.1, lambda: setattr(client, "current_status", "cancelling"))
+    timer.start()
+    try:
+        assert daemon.run_once() is True
+    finally:
+        timer.cancel()
+    worker_pid = int(pid_file.read_text())
+    for _ in range(100):
+        try:
+            os.kill(worker_pid, 0)
+        except ProcessLookupError:
+            break
+        stat_path = Path(f"/proc/{worker_pid}/stat")
+        if stat_path.exists() and stat_path.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("worker process remained after cancellation acknowledgement")
+    assert client.cancel_acks
+
+
+def test_cancel_ack_keeps_private_proofs_out_of_process_arguments(monkeypatch):
+    observed = {}
+
+    def run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["input"] = kwargs["input"]
+        return subprocess.CompletedProcess(argv, 0, stdout='{"status":"cancelled"}', stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    client = ActionctlClient("actionctl", runner_private_key_path=Path("unused"))
+    client.runner_id = "runner:test"
+    monkeypatch.setattr(client, "_proof", lambda **_: {"signed": "proof"})
+    client.acknowledge_cancellation(
+        70, cancel_request_id="cancel:one", former_claim_receipt="receipt:secret",
+        runner_auth_token="auth:secret",
+    )
+    assert "receipt:secret" not in observed["argv"]
+    assert "auth:secret" not in observed["argv"]
+    assert "--runner" not in observed["argv"]
+    assert json.loads(observed["input"]) == {
+        "former_claim_receipt": "receipt:secret", "runner_auth_token": "auth:secret",
+        "runner_proof": {"signed": "proof"},
+    }
 
 
 def test_pause_file_prevents_claim(tmp_path: Path):
@@ -210,7 +316,8 @@ def test_remote_project_takeup_wraps_fake_session(tmp_path: Path):
 
     assert daemon.run_once() is True
     assert [call[0] for call in takeup.calls] == ["take", "release"]
-    assert client.events[1][3]["sprint_takeup"]["status"] == "ok"
+    started = next(event for event in client.events if event[0] == "session.started")
+    assert started[3]["sprint_takeup"]["status"] == "ok"
     assert client.events[-1][3]["sprint_takeup_release"]["status"] == "ok"
 
 

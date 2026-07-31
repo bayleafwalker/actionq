@@ -19,6 +19,6 @@ jobs:
           enable-cache: true
       - name: Put PostgreSQL tools on PATH
         run: echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
-      - run: uv sync --all-extras
+      - run: uv sync --all-packages --all-extras
       - name: Run full suite with disposable PostgreSQL gate
-        run: uv run pytest -q
+        run: uv run --all-packages --extra dev pytest -q

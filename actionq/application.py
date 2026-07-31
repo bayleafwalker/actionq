@@ -17,6 +17,7 @@ import time
 import uuid
 
 from . import db
+from .runner_auth import VerifiedRunner, verify_runner_proof
 
 
 _KIND_TO_ACTION_TYPE = {
@@ -345,6 +346,11 @@ class ActionQApplication:
                         conn, operation=operation, provenance=provenance
                     )
                 )
+                durable_result = (
+                    db.redact_action(result)
+                    if operation == "execution.action.claim" and isinstance(result, dict)
+                    else result
+                )
                 decision = db.insert_event(
                     conn,
                     self.schema,
@@ -357,13 +363,18 @@ class ActionQApplication:
                         "code": code,
                         "message": message,
                         "event_refs": event_refs,
-                        "result": result,
+                        "result": durable_result,
                         "request_fingerprint": fingerprint,
                         "idempotency_owner": True,
                         "provenance": event_provenance,
                     },
                 )
-                return self._decision_result(event=decision, replayed=False)
+                response = self._decision_result(event=decision, replayed=False)
+                if operation == "execution.action.claim" and isinstance(result, dict):
+                    # Claim capabilities are disclosed only on the original
+                    # authenticated response, never in history or replay.
+                    response["result"] = result
+                return response
 
     def enqueue(
         self,
@@ -405,7 +416,7 @@ class ActionQApplication:
         )
 
     def list_actions(self, **filters: Any) -> list[dict[str, Any]]:
-        return self._read(lambda conn: db.list_actions(conn, self.schema, **filters))
+        return self._read(lambda conn: [db.redact_action(row) for row in db.list_actions(conn, self.schema, **filters)])
 
     def show_action(self, action_id: int) -> dict[str, Any] | None:
         def read(conn):
@@ -413,7 +424,7 @@ class ActionQApplication:
             if action is None:
                 return None
             return {
-                "action": action,
+                "action": db.redact_action(action),
                 "events": db.action_events(conn, self.schema, action_id),
             }
 
@@ -422,39 +433,66 @@ class ActionQApplication:
     def claim(
         self,
         *,
-        worker: str,
+        runner_proof: dict[str, Any] | None = None,
+        worker: str | None = None,
         timeout_minutes: int,
         provenance: InvocationProvenance | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            identity = verify_runner_proof(
+                runner_proof, operation="execution.action.claim", resource="queue:next"
+            )
+            proof_authenticated = True
+        elif provenance is not None and worker == provenance.actor:
+            identity = VerifiedRunner(provenance.actor, provenance.request_id, "execution.action.claim")
+            proof_authenticated = False
+        else:
+            raise db.ActionQError("claim requires signed runner proof or authenticated served identity")
+        def claim_mutation(conn, event_provenance):
+            with conn.transaction():
+                if proof_authenticated:
+                    db.consume_runner_request(
+                        conn, self.schema, runner_id=identity.runner_id,
+                        request_id=identity.request_id, operation=identity.operation,
+                        resource="queue:next",
+                    )
+                return db.claim(
+                    conn, self.schema, worker=identity.runner_id,
+                    timeout_minutes=timeout_minutes, provenance=event_provenance,
+                )
         return self._mutate(
             operation="execution.action.claim",
-            arguments={"worker": worker, "timeout_minutes": timeout_minutes},
+            arguments={"worker": identity.runner_id, "runner_request_id": identity.request_id,
+                       "timeout_minutes": timeout_minutes},
             provenance=provenance,
-            mutation=lambda conn, event_provenance: db.claim(
-                conn,
-                self.schema,
-                worker=worker,
-                timeout_minutes=timeout_minutes,
-                provenance=event_provenance,
-            ),
+            mutation=claim_mutation,
         )
 
     def renew(
         self,
         *,
         action_id: int,
-        worker: str,
+        worker: str | None,
         timeout_minutes: int,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            identity = verify_runner_proof(
+                runner_proof, operation="execution.action.renew", resource=f"action:{action_id}"
+            )
+            worker = identity.runner_id
+        elif provenance is None or worker != provenance.actor:
+            raise db.ActionQError("renew requires signed runner proof or authenticated served identity")
+        assert worker is not None
         return self._mutate(
             operation="execution.action.renew",
             arguments={
                 "action_id": action_id,
                 "worker": worker,
                 "timeout_minutes": timeout_minutes,
-                "claim_receipt": claim_receipt,
+                "claim_receipt_digest": db.receipt_digest(claim_receipt),
             },
             provenance=provenance,
             mutation=lambda conn, event_provenance: db.renew(
@@ -473,7 +511,7 @@ class ActionQApplication:
         *,
         operation: str,
         action_id: int,
-        actor: str,
+        actor: str | None,
         arguments: dict[str, Any],
         provenance: InvocationProvenance | None,
         transition: Callable[[Any, dict[str, Any] | None], dict[str, Any]],
@@ -490,15 +528,23 @@ class ActionQApplication:
         *,
         action_id: int,
         result_ref: str,
-        actor: str,
+        actor: str | None,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            actor = verify_runner_proof(
+                runner_proof, operation="execution.action.complete", resource=f"action:{action_id}"
+            ).runner_id
+        elif provenance is None or actor != provenance.actor:
+            raise db.ActionQError("complete requires signed runner proof or authenticated served identity")
+        assert actor is not None
         return self._terminal(
             operation="execution.action.complete",
             action_id=action_id,
             actor=actor,
-            arguments={"result_ref": result_ref, "claim_receipt": claim_receipt},
+            arguments={"result_ref": result_ref, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.complete(
                 conn,
@@ -517,15 +563,23 @@ class ActionQApplication:
         *,
         action_id: int,
         reason: str,
-        actor: str,
+        actor: str | None,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            actor = verify_runner_proof(
+                runner_proof, operation="execution.action.fail", resource=f"action:{action_id}"
+            ).runner_id
+        elif provenance is None or actor != provenance.actor:
+            raise db.ActionQError("fail requires signed runner proof or authenticated served identity")
+        assert actor is not None
         return self._terminal(
             operation="execution.action.fail",
             action_id=action_id,
             actor=actor,
-            arguments={"reason": reason, "claim_receipt": claim_receipt},
+            arguments={"reason": reason, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.fail(
                 conn,
@@ -548,12 +602,20 @@ class ActionQApplication:
         actor: str,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            actor = verify_runner_proof(
+                runner_proof, operation="execution.action.reject", resource=f"action:{action_id}"
+            ).runner_id
+        elif provenance is None or actor != provenance.actor:
+            raise db.ActionQError("reject requires signed runner proof or authenticated served identity")
+        assert actor is not None
         return self._terminal(
             operation="execution.action.reject",
             action_id=action_id,
             actor=actor,
-            arguments={"reason": reason, "validator": validator, "claim_receipt": claim_receipt},
+            arguments={"reason": reason, "validator": validator, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
             transition=lambda conn, event_provenance: db.reject(
                 conn,
@@ -602,12 +664,40 @@ class ActionQApplication:
             operation="execution.action.sweep",
             arguments={"actor": actor},
             provenance=provenance,
-            mutation=lambda conn, event_provenance: db.sweep(
-                conn,
-                self.schema,
-                actor=actor,
-                provenance=event_provenance,
-            ),
+            mutation=lambda conn, event_provenance: {
+                "reclaimed": db.sweep(conn, self.schema, actor=actor, provenance=event_provenance),
+                "cancelled": db.reap_cancellations(conn, self.schema, actor=actor),
+            },
+        )
+
+    def acknowledge_cancellation(self, *, action_id: int, cancel_request_id: str,
+                                 former_claim_receipt: str, runner_auth_token: str,
+                                 runner_proof: dict[str, Any]) -> Any:
+        identity = verify_runner_proof(
+            runner_proof, operation="execution.action.cancel-ack",
+            resource=f"action:{action_id}:cancel:{cancel_request_id}",
+        )
+        def ack_mutation(conn, _provenance):
+            with conn.transaction():
+                resource = f"action:{action_id}:cancel:{cancel_request_id}"
+                db.consume_runner_request(
+                    conn, self.schema, runner_id=identity.runner_id,
+                    request_id=identity.request_id, operation=identity.operation,
+                    resource=resource, action_id=action_id, allow_replay=True,
+                )
+                return db.acknowledge_cancellation(
+                    conn, self.schema, action_id, cancel_request_id=cancel_request_id,
+                    former_claim_receipt=former_claim_receipt, runner_auth_token=runner_auth_token,
+                    authenticated_runner=identity.runner_id,
+                )
+        return self._mutate(
+            operation="execution.action.cancel-ack",
+            arguments={"action_id": action_id, "cancel_request_id": cancel_request_id,
+                       "former_claim_receipt_digest": db.receipt_digest(former_claim_receipt),
+                       "runner_auth_digest": db.receipt_digest(runner_auth_token),
+                       "runner_id": identity.runner_id, "runner_request_id": identity.request_id},
+            provenance=None,
+            mutation=ack_mutation,
         )
 
     def list_events(self, **filters: Any) -> list[dict[str, Any]]:

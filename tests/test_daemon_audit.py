@@ -109,7 +109,8 @@ class FakeClient:
 
     def claim(self, worker, timeout_minutes):
         action, self.action = self.action, None
-        return {**action, "claim_receipt": action.get("claim_receipt", "test-receipt")} if action else None
+        return {**action, "claim_receipt": action.get("claim_receipt", "test-receipt"),
+                "runner_auth_token": action.get("runner_auth_token", "test-runner-auth")} if action else None
 
     def renew(self, action_id, *, worker, timeout_minutes, claim_receipt):
         assert claim_receipt == "test-receipt"
