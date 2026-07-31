@@ -30,6 +30,7 @@ SESSION_EVENT_TYPES = (
     "publication.available",
     "publication.settled",
     "workspace.destroyed",
+    "workspace.destruction_failed",
 )
 
 

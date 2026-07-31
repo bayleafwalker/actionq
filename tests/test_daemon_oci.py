@@ -65,6 +65,7 @@ def test_daemon_oci_child_packet_has_no_authority_and_exact_frozen_limits(
         timeout_minutes=30, oci_engine="/usr/bin/podman", oci_image=IMAGE,
         oci_uid=os.geteuid(), oci_cpus=2, oci_memory_bytes=2 * 1024**3, oci_pids=128,
         oci_disk_bytes=10 * 1024**3,
+        oci_seccomp_sha256="c" * 64,
     )
     child = daemon._start_child(
         config, project=ProjectConfig(workspace), output_path=output, envelope=envelope,
@@ -74,6 +75,7 @@ def test_daemon_oci_child_packet_has_no_authority_and_exact_frozen_limits(
     packet = json.loads(child.stdin.packet)
     assert packet == {
         "engine": "/usr/bin/podman", "image": IMAGE,
+        "seccomp_sha256": "c" * 64,
         "envelope": json.loads(json.dumps(envelope.as_dict())),
         "registered_command_id": envelope.command_id, "deterministic": True,
         "command": ["python", "-c", "print('ok')"], "workspace": str(workspace),
@@ -125,3 +127,20 @@ def test_daemon_destroys_only_exact_supervisor_worktree_after_settlement(tmp_pat
     assert not workspace.exists()
     assert client.events[-1][0] == "workspace.destroyed"
     assert client.events[-1][3] == {"attempt_id": "attempt-oci", "workspace_destroyed": True}
+
+
+def test_daemon_idempotently_reconciles_deterministic_oci_container(monkeypatch):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    daemon = Daemon(DaemonConfig(), {}, Client())
+    config = ActionConfig(runner="oci-scope-iterate", oci_engine="/usr/bin/podman")
+    daemon._cleanup_oci_container(config, action_id=2033, attempt_id="attempt-oci")
+    assert calls == [([
+        "/usr/bin/podman", "rm", "--force", "--ignore",
+        daemon._oci_container_name(2033, "attempt-oci"),
+    ], {"text": True, "capture_output": True, "check": False})]

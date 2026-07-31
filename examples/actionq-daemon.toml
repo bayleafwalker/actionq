@@ -42,6 +42,7 @@ publish_candidate = false
 # publish_candidate = true
 # oci_engine = "/absolute/path/to/podman"
 # oci_image = "registry.example/actionq-runner@sha256:<64 lowercase hex>"
+# oci_seccomp_sha256 = "<64 lowercase hex for the explicit engine profile>"
 # oci_uid = 1000
 # oci_cpus = 2
 # oci_memory_bytes = 2147483648

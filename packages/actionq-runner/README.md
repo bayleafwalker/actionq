@@ -44,6 +44,9 @@ credential, publication credential, or additional mount. The supervisor
 terminates and reaps timed-out or cancelled containers. The supervisor verifies
 bundle integrity, strict fsck, ancestry, changed paths, and modes before it
 imports the verified commit into the clean, remoteless publication worktree.
+The engine seccomp profile is selected explicitly and must match the digest
+frozen in the execution packet. Deterministic container naming lets the daemon
+remove an attempt container after runner death and reconcile it again on restart.
 
 This pilot deliberately supports deterministic offline commands only. The
 ActionQ daemon composes it with the unchanged #2032 publication and settlement

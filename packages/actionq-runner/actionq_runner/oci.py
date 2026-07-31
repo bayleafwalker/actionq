@@ -33,6 +33,14 @@ _SECRET_VALUE = re.compile(
 _MAX_LOG = 1024 * 1024
 _DEFAULT_DISK = 10 * 1024**3
 _MAX_DISK = 10 * 1024**3
+_GIT_CONFIG = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+
+
+def _git_env() -> dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+    }
 
 
 class Completed(Protocol):
@@ -135,8 +143,8 @@ def oci_preflight(engine: str | os.PathLike[str], *, run: Run = subprocess.run) 
 
 def _git(workspace: Path, *args: str) -> bytes:
     completed = subprocess.run(
-        ["git", "-C", os.fspath(workspace), *args], stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, check=False, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
+        ["git", *_GIT_CONFIG, "-C", os.fspath(workspace), *args], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, check=False, env=_git_env(),
     )
     if completed.returncode:
         raise OciPolicyError(f"Git workspace check failed: {' '.join(args)}")
@@ -188,7 +196,7 @@ def _positive_number(value: Any, field: str, maximum: float) -> float:
 def _validate_packet(packet: Mapping[str, Any]) -> dict[str, Any]:
     required = {
         "engine", "image", "envelope", "registered_command_id", "deterministic", "command",
-        "workspace", "network", "uid", "environment", "limits",
+        "workspace", "network", "uid", "environment", "limits", "seccomp_sha256",
     }
     if set(packet) != required:
         raise OciPolicyError(
@@ -198,6 +206,9 @@ def _validate_packet(packet: Mapping[str, Any]) -> dict[str, Any]:
     image = str(packet["image"])
     if not _IMAGE.fullmatch(image):
         raise OciPolicyError("OCI image must be an immutable name@sha256 digest")
+    seccomp_sha256 = str(packet["seccomp_sha256"])
+    if not re.fullmatch(r"[0-9a-f]{64}", seccomp_sha256):
+        raise OciPolicyError("seccomp_sha256 must freeze one lowercase SHA-256 digest")
     envelope = dict(packet["envelope"])
     if require_compatible(envelope) != EXECUTION_ENVELOPE_V1:
         raise OciPolicyError("OCI runner requires execution-envelope/v1")
@@ -255,6 +266,7 @@ def _validate_packet(packet: Mapping[str, Any]) -> dict[str, Any]:
         "engine": engine, "image": image, "envelope": envelope, "command": list(command),
         "workspace": workspace, "uid": uid, "environment": dict(environment),
         "cpus": cpus, "memory": memory, "pids": pids, "timeout": timeout, "disk": disk,
+        "seccomp_sha256": seccomp_sha256,
     }
 
 
@@ -262,7 +274,7 @@ def _cpu_arg(value: float) -> str:
     return str(int(value)) if value.is_integer() else format(value, ".12g")
 
 
-def _create_argv(config: Mapping[str, Any], name: str, source_bundle: Path) -> list[str]:
+def _create_argv(config: Mapping[str, Any], name: str, source_bundle: Path, seccomp_profile: Path) -> list[str]:
     argv = [
         str(config["engine"]), "create", "--name", name,
         "--pull", "never",
@@ -271,6 +283,7 @@ def _create_argv(config: Mapping[str, Any], name: str, source_bundle: Path) -> l
         "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "SETUID",
         "--cap-add", "SETGID", "--cap-add", "DAC_OVERRIDE",
         "--security-opt", "no-new-privileges",
+        "--security-opt", f"seccomp={seccomp_profile}",
         "--pids-limit", str(config["pids"]), "--cpus", _cpu_arg(float(config["cpus"])),
         "--memory", str(config["memory"]), "--memory-swap", str(config["memory"]),
         "--pid", "private", "--ipc", "private",
@@ -294,7 +307,8 @@ def _engine_call(run: Run, argv: Sequence[str]) -> Completed:
     return run(list(argv), capture_output=True, check=False, stdin=subprocess.DEVNULL)
 
 
-def _verify_created_container(config: Mapping[str, Any], name: str, source_bundle: Path, run: Run) -> None:
+def _verify_created_container(config: Mapping[str, Any], name: str, source_bundle: Path,
+                              seccomp_profile: Path, run: Run) -> None:
     """Read back the engine decision before executing untrusted bytes."""
     completed = _engine_call(run, [config["engine"], "inspect", name])
     if completed.returncode:
@@ -333,6 +347,8 @@ def _verify_created_container(config: Mapping[str, Any], name: str, source_bundl
         == {"CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE"},
         "cap_drop": isinstance(host.get("CapDrop"), list) and bool(host.get("CapDrop")),
         "no_new_privileges": "no-new-privileges" in (host.get("SecurityOpt") or []),
+        "seccomp": f"seccomp={seccomp_profile}" in (host.get("SecurityOpt") or [])
+        and "seccomp=unconfined" not in (host.get("SecurityOpt") or []),
         "memory": host.get("Memory") == config["memory"],
         "memory_swap": host.get("MemorySwap") == config["memory"],
         "cpus": host.get("NanoCpus") == int(float(config["cpus"]) * 1_000_000_000),
@@ -384,9 +400,9 @@ def _stage_root(override: Path | None) -> Path:
 
 def _create_source_bundle(workspace: Path, source: str, destination: Path) -> None:
     completed = subprocess.run(
-        ["git", "-C", os.fspath(workspace), "bundle", "create", os.fspath(destination), "HEAD"],
+        ["git", *_GIT_CONFIG, "-C", os.fspath(workspace), "bundle", "create", os.fspath(destination), "HEAD"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
+        env=_git_env(),
     )
     if completed.returncode:
         raise OciPolicyError("could not create the exact source Git bundle")
@@ -395,25 +411,44 @@ def _create_source_bundle(workspace: Path, source: str, destination: Path) -> No
         raise OciPolicyError("source changed while its bundle was created")
 
 
+def _stage_seccomp_profile(engine: str, stage: Path, expected_sha256: str) -> Path:
+    source = Path(engine).parent.parent / "share/containers/seccomp.json"
+    try:
+        metadata = source.lstat()
+    except OSError as exc:
+        raise OciPolicyError(f"OCI engine seccomp profile is unavailable: {source}") from exc
+    if source.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise OciPolicyError("OCI engine seccomp profile must be a real regular file")
+    destination = stage / "seccomp.json"
+    shutil.copyfile(source, destination, follow_symlinks=False)
+    if hashlib.sha256(destination.read_bytes()).hexdigest() != expected_sha256:
+        raise OciPolicyError("OCI seccomp profile does not match its frozen digest")
+    os.chmod(destination, 0o400)
+    return destination
+
+
 def _validate_candidate_bundle(stage: Path, source: str, envelope: Mapping[str, Any]) -> tuple[str, tuple[str, ...], dict[str, Any], str]:
     bundle = stage / "candidate.bundle"
     metadata = bundle.lstat()
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
         raise OciPolicyError("candidate bundle must be a mode-0600 regular file")
-    verify = subprocess.run(["git", "bundle", "verify", os.fspath(bundle)], capture_output=True, check=False)
+    verify = subprocess.run(["git", *_GIT_CONFIG, "bundle", "verify", os.fspath(bundle)],
+                            capture_output=True, check=False, env=_git_env())
     if verify.returncode:
         raise OciPolicyError("candidate Git bundle failed verification")
     checkout = stage / "validate"
-    cloned = subprocess.run(["git", "clone", "--quiet", os.fspath(bundle), os.fspath(checkout)], capture_output=True, check=False)
+    cloned = subprocess.run(["git", *_GIT_CONFIG, "clone", "--quiet", "--no-checkout",
+                             os.fspath(bundle), os.fspath(checkout)],
+                            capture_output=True, check=False, env=_git_env())
     if cloned.returncode:
         raise OciPolicyError("candidate Git bundle could not be cloned")
     _git(checkout, "remote", "remove", "origin")
-    if subprocess.run(["git", "-C", os.fspath(checkout), "fsck", "--full", "--strict"],
-                      capture_output=True, check=False).returncode:
+    if subprocess.run(["git", *_GIT_CONFIG, "-C", os.fspath(checkout), "fsck", "--full", "--strict"],
+                      capture_output=True, check=False, env=_git_env()).returncode:
         raise OciPolicyError("candidate repository failed strict fsck")
     candidate = _git(checkout, "rev-parse", "HEAD").decode().strip()
-    if subprocess.run(["git", "-C", os.fspath(checkout), "merge-base", "--is-ancestor", source, candidate],
-                      capture_output=True, check=False).returncode:
+    if subprocess.run(["git", *_GIT_CONFIG, "-C", os.fspath(checkout), "merge-base", "--is-ancestor", source, candidate],
+                      capture_output=True, check=False, env=_git_env()).returncode:
         raise OciPolicyError("OCI candidate does not descend from the exact source")
     changed = _changed_paths(checkout, source, candidate)
     disallowed = sorted(path for path in changed if not any(
@@ -437,16 +472,16 @@ def _validate_candidate_bundle(stage: Path, source: str, envelope: Mapping[str, 
 def _promote_verified_candidate(workspace: Path, bundle: Path, candidate: str) -> None:
     """Import only the already verified object graph into the publisher worktree."""
     fetched = subprocess.run(
-        ["git", "-C", os.fspath(workspace), "fetch", "--no-tags", os.fspath(bundle), "HEAD"],
-        capture_output=True, check=False,
+        ["git", *_GIT_CONFIG, "-C", os.fspath(workspace), "fetch", "--no-tags", os.fspath(bundle), "HEAD"],
+        capture_output=True, check=False, env=_git_env(),
     )
     if fetched.returncode:
         raise OciPolicyError("verified candidate could not be imported into the host worktree")
     if _git(workspace, "rev-parse", "FETCH_HEAD").decode().strip() != candidate:
         raise OciPolicyError("candidate import selected an unexpected commit")
     checked = subprocess.run(
-        ["git", "-C", os.fspath(workspace), "checkout", "--detach", "--force", candidate],
-        capture_output=True, check=False,
+        ["git", *_GIT_CONFIG, "-C", os.fspath(workspace), "checkout", "--detach", "--force", candidate],
+        capture_output=True, check=False, env=_git_env(),
     )
     if checked.returncode:
         raise OciPolicyError("verified candidate could not be checked out for publication")
@@ -475,6 +510,9 @@ def oci_execute(
     os.chmod(stage, 0o700)
     source_bundle = stage / "source.bundle"
     _create_source_bundle(workspace, source, source_bundle)
+    seccomp_profile = _stage_seccomp_profile(
+        config["engine"], stage, config["seccomp_sha256"],
+    )
     created = False
     process: subprocess.Popen[bytes] | None = None
     timed_out = False
@@ -493,13 +531,17 @@ def oci_execute(
     workspace_filesystem: dict[str, Any] | None = None
     sealed = False
     try:
-        create = _engine_call(run, _create_argv(config, name, source_bundle))
+        if threading.current_thread() is threading.main_thread():
+            previous_handler = signal.signal(signal.SIGTERM, request_cancel)
+        # A deterministic identity makes an uncatchable supervisor SIGKILL
+        # recoverable: the next execution removes any prior container before
+        # it can create or start another one with the same attempt identity.
+        _engine_call(run, [config["engine"], "rm", "--force", name])
+        create = _engine_call(run, _create_argv(config, name, source_bundle, seccomp_profile))
         if create.returncode:
             raise RuntimeError(f"OCI container create failed: {create.stderr!s}")
         created = True
-        _verify_created_container(config, name, source_bundle, run)
-        if threading.current_thread() is threading.main_thread():
-            previous_handler = signal.signal(signal.SIGTERM, request_cancel)
+        _verify_created_container(config, name, source_bundle, seccomp_profile, run)
         process = popen(
             [config["engine"], "start", "--attach", name], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
@@ -556,6 +598,8 @@ def oci_execute(
             command_exit = workspace_filesystem.get("command_exit")
             if not isinstance(command_exit, int):
                 raise OciPolicyError("OCI wrapper omitted the command exit status")
+            if workspace_filesystem.get("descendants_reaped") is not True:
+                raise OciPolicyError("OCI wrapper did not prove descendant cleanup")
             exit_code = command_exit
             if exit_code == 0:
                 copied = _engine_call(run, [config["engine"], "cp", f"{name}:/workspace/candidate.bundle",
@@ -593,6 +637,7 @@ def oci_execute(
         "log": _redact_log(output or b""), "candidate_manifest": manifest,
         "candidate_bundle_sha256": bundle_digest, "workspace_disk_bytes": config["disk"],
         "workspace_filesystem": workspace_filesystem,
+        "seccomp_sha256": config["seccomp_sha256"],
     }
 
 

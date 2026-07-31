@@ -91,7 +91,13 @@ CPU, memory, disk, PID, and 1,800-second wall-clock ceilings are mandatory.
 Before untrusted bytes run, the supervisor reads back engine inspection state
 and fails closed if the engine weakened the image digest, UID mapping,
 network, mounts, namespaces, capabilities, tmpfs, or resource limits. A trusted
-image wrapper exports only a candidate Git bundle, which the supervisor copies
+engine seccomp profile is selected explicitly and accepted only when its bytes
+match the digest frozen by the coordinator. All Git operations over
+worker-controlled state run under the zero-capability worker identity; the PID-1
+wrapper kills and reaps every remaining namespace descendant before sealing.
+A deterministic container identity is removed after runner death and retried
+during daemon restart recovery. The immutable image wrapper exports only a
+candidate Git bundle, which the supervisor copies
 to private staging and validates in a fresh repository for object integrity,
 source ancestry, candidate cleanliness, modes, and the frozen path allowlist.
 Publication, registration, settlement, and recovery

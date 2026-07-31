@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -38,8 +40,15 @@ def packet(tmp_path: Path, monkeypatch):
     git(workspace, "add", ".")
     git(workspace, "commit", "-qm", "source")
     source = git(workspace, "rev-parse", "HEAD")
+    engine = tmp_path / "engine/bin/rootless-engine"
+    profile = tmp_path / "engine/share/containers/seccomp.json"
+    engine.parent.mkdir(parents=True)
+    engine.write_text("fake\n")
+    profile.parent.mkdir(parents=True)
+    profile.write_text("{}\n")
     return {
-        "engine": "/usr/bin/rootless-engine", "image": IMAGE,
+        "engine": str(engine), "image": IMAGE,
+        "seccomp_sha256": hashlib.sha256(b"{}\n").hexdigest(),
         "envelope": {
             "contract_id": EXECUTION_ENVELOPE_V1, "action_id": 2033,
             "attempt_id": "attempt-one", "source_commit": source,
@@ -69,6 +78,8 @@ class Engine:
             volume = option("--volume")
             source = volume.split(":", 1)[0]
             tmpfs_values = [argv[index + 1] for index, item in enumerate(argv) if item == "--tmpfs"]
+            security_values = [argv[index + 1] for index, item in enumerate(argv)
+                               if item == "--security-opt"]
             self.inspect = [{
                 "ImageDigest": "sha256:" + "a" * 64,
                 "EffectiveCaps": ["CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_DAC_OVERRIDE"],
@@ -80,7 +91,8 @@ class Engine:
                     "NetworkMode": "none", "ReadonlyRootfs": True, "Privileged": False,
                     "PidMode": "private", "IpcMode": "private",
                     "CapAdd": [], "CapDrop": ["ALL"],
-                    "SecurityOpt": ["no-new-privileges"], "Memory": int(option("--memory")),
+                    "SecurityOpt": security_values,
+                    "Memory": int(option("--memory")),
                     "MemorySwap": int(option("--memory-swap")),
                     "NanoCpus": int(float(option("--cpus")) * 1_000_000_000),
                     "PidsLimit": int(option("--pids-limit")), "Devices": [],
@@ -96,7 +108,8 @@ class Engine:
         if argv[1] == "cp":
             if argv[2].endswith("runner-metadata.json"):
                 Path(argv[3]).write_text(json.dumps({"capacity_bytes": 32 * 1024**2,
-                                                      "workspace_mode": "0o700", "command_exit": 0}))
+                                                      "workspace_mode": "0o700", "command_exit": 0,
+                                                      "descendants_reaped": True}))
             else:
                 source = Path(self.inspect[0]["Mounts"][0]["Source"])
                 Path(argv[3]).write_bytes(source.read_bytes())
@@ -223,13 +236,14 @@ def test_exact_create_argv_contains_every_frozen_control_and_no_secret(packet):
     result = oci_execute(packet, run=engine, popen=processes)
     create = next(call for call in engine.calls if call[1] == "create")
     assert create == [
-        "/usr/bin/rootless-engine", "create", "--name", create[3],
+        packet["engine"], "create", "--name", create[3],
         "--pull", "never",
         "--network", "none", "--read-only", "--userns", "keep-id:uid=0,gid=0",
         "--user", "0:0",
         "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "SETUID",
         "--cap-add", "SETGID", "--cap-add", "DAC_OVERRIDE",
         "--security-opt", "no-new-privileges",
+        "--security-opt", create[create.index("--security-opt", create.index("--security-opt") + 1) + 1],
         "--pids-limit", "64", "--cpus", "1", "--memory", str(256 * 1024**2),
         "--memory-swap", str(256 * 1024**2), "--pid", "private", "--ipc", "private",
         "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
@@ -244,14 +258,14 @@ def test_exact_create_argv_contains_every_frozen_control_and_no_secret(packet):
         "--", "python", "-c", "print('ok')",
     ]
     assert processes.made[0].argv == [
-        "/usr/bin/rootless-engine", "start", "--attach", create[3],
+        packet["engine"], "start", "--attach", create[3],
     ]
-    assert engine.calls[-1] == ["/usr/bin/rootless-engine", "rm", "--force", create[3]]
+    assert engine.calls[-1] == [packet["engine"], "rm", "--force", create[3]]
     candidate_cp = next(index for index, call in enumerate(engine.calls)
                         if call[1] == "cp" and call[2].endswith("candidate.bundle"))
     orderly_stop = next(index for index, call in enumerate(engine.calls)
                         if call[1:4] == ["kill", "--signal", "TERM"])
-    removal = next(index for index, call in enumerate(engine.calls) if call[1] == "rm")
+    removal = max(index for index, call in enumerate(engine.calls) if call[1] == "rm")
     assert candidate_cp < orderly_stop < removal
     flattened = "\0".join(item for call in engine.calls for item in call)
     assert not any(secret in flattened.upper() for secret in ("ACTIONQ_URL", "TOKEN", "PASSWORD", "DOCKER.SOCK"))
@@ -259,8 +273,30 @@ def test_exact_create_argv_contains_every_frozen_control_and_no_secret(packet):
     assert result["changed_paths"] == [] and result["exit_code"] == 0
 
 
+def test_stale_container_is_removed_before_create(packet):
+    engine = Engine()
+    oci_execute(packet, run=engine, popen=factory())
+    stale_rm = next(index for index, call in enumerate(engine.calls) if call[1] == "rm")
+    create = next(index for index, call in enumerate(engine.calls) if call[1] == "create")
+    assert stale_rm < create
+
+
+def test_sigterm_during_create_is_fenced_and_container_is_removed(packet):
+    class SignalEngine(Engine):
+        def __call__(self, argv, **kwargs):
+            result = super().__call__(argv, **kwargs)
+            if argv[1] == "create":
+                os.kill(os.getpid(), signal.SIGTERM)
+            return result
+
+    engine = SignalEngine()
+    result = oci_execute(packet, run=engine, popen=factory())
+    assert result["cancelled"] is True
+    assert engine.calls[-1][1:3] == ["rm", "--force"]
+
+
 @pytest.mark.parametrize("weakening", [
-    "network", "rootfs", "privileged", "memory", "pids", "image", "mount", "tmpfs", "userns", "wrapper",
+    "network", "rootfs", "privileged", "memory", "pids", "image", "mount", "tmpfs", "userns", "wrapper", "seccomp",
 ])
 def test_engine_inspect_weakening_fails_before_worker_start(packet, weakening):
     class WeakEngine(Engine):
@@ -279,6 +315,7 @@ def test_engine_inspect_weakening_fails_before_worker_start(packet, weakening):
                 elif weakening == "tmpfs": host["Tmpfs"].pop("/run")
                 elif weakening == "userns": host["Annotations"].clear()
                 elif weakening == "wrapper": value["Config"]["Cmd"] = ["sh"]
+                elif weakening == "seccomp": host["SecurityOpt"][-1] = "seccomp=unconfined"
                 return SimpleNamespace(returncode=0, stdout=json.dumps(self.inspect), stderr="")
             return result
 

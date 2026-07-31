@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 from dataclasses import asdict
@@ -17,6 +18,10 @@ from actionq_runner.publisher import FilesystemCAS, publish, recover_publication
 
 ENGINE = os.environ.get("ACTIONQ_OCI_ENGINE")
 IMAGE = os.environ.get("ACTIONQ_OCI_IMAGE")
+SECCOMP_SHA256 = (
+    hashlib.sha256((Path(ENGINE).parent.parent / "share/containers/seccomp.json").read_bytes()).hexdigest()
+    if ENGINE else None
+)
 pytestmark = pytest.mark.skipif(
     not ENGINE or not IMAGE, reason="rootless OCI engine/image proof is not configured",
 )
@@ -71,6 +76,7 @@ s = socket.socket(); s.settimeout(0.2); probe["network_reachable"] = s.connect_e
     ]
     result = oci_execute({
         "engine": ENGINE, "image": IMAGE, "envelope": envelope.as_dict(),
+        "seccomp_sha256": SECCOMP_SHA256,
         "registered_command_id": envelope.command_id, "deterministic": True,
         "command": command, "workspace": str(workspace), "network": "none",
         "uid": os.geteuid(), "environment": {
@@ -134,6 +140,7 @@ def test_real_rootless_runner_disk_enospc_yields_no_candidate(tmp_path: Path):
                                  "fixture:oci-enospc", ("docs/**",))
     result = oci_execute({
         "engine": ENGINE, "image": IMAGE, "envelope": envelope.as_dict(),
+        "seccomp_sha256": SECCOMP_SHA256,
         "registered_command_id": envelope.command_id, "deterministic": True,
         "command": ["dd", "if=/dev/zero", "of=payload", "bs=1M", "count=64", "conv=fsync"],
         "workspace": str(workspace), "network": "none", "uid": os.geteuid(),
@@ -145,3 +152,46 @@ def test_real_rootless_runner_disk_enospc_yields_no_candidate(tmp_path: Path):
     assert result["candidate_bundle_sha256"] is None
     assert result["candidate_commit"] == source
     assert git(workspace, "rev-parse", "HEAD") == source
+
+
+def test_real_wrapper_never_runs_worker_git_as_root_and_reaps_setsid_descendants(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    git(workspace, "init", "-q")
+    git(workspace, "config", "user.email", "runner@example.invalid")
+    git(workspace, "config", "user.name", "Runner")
+    (workspace / "README.md").write_text("source\n")
+    git(workspace, "add", ".")
+    git(workspace, "commit", "-qm", "source")
+    source = git(workspace, "rev-parse", "HEAD")
+    envelope = ExecutionEnvelope(EXECUTION_ENVELOPE_V1, 2033, "oci-hostile-config", source,
+                                 "fixture:oci-hostile-config", ("docs/**", ".gitattributes"))
+    script = r'''
+import os, pathlib, time
+root = pathlib.Path("docs"); root.mkdir()
+evil = root / "evil"
+evil.write_text("#!/bin/sh\ntouch /control/privileged-marker\n")
+evil.chmod(0o755)
+pathlib.Path(".gitattributes").write_text("docs/proof.txt filter=evil\n")
+(root / "proof.txt").write_text("proof\n")
+os.system("git add . && git -c user.name=Runner -c user.email=runner@example.invalid commit -qm hostile")
+os.system("git config core.fsmonitor docs/evil; git config core.hooksPath docs; git config filter.evil.clean docs/evil")
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        time.sleep(1); pathlib.Path("/control/descendant-survived").touch(); os._exit(0)
+    os._exit(0)
+'''
+    result = oci_execute({
+        "engine": ENGINE, "image": IMAGE, "envelope": envelope.as_dict(),
+        "seccomp_sha256": SECCOMP_SHA256,
+        "registered_command_id": envelope.command_id, "deterministic": True,
+        "command": ["python", "-c", script], "workspace": str(workspace),
+        "network": "none", "uid": os.geteuid(),
+        "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"},
+        "limits": {"cpus": 1, "memory_bytes": 256 * 1024**2, "pids": 32,
+                   "timeout_seconds": 60, "disk_bytes": 64 * 1024**2},
+    })
+    assert result["exit_code"] == 0
+    assert result["workspace_filesystem"]["descendants_reaped"] is True
+    assert set(result["changed_paths"]) == {".gitattributes", "docs/evil", "docs/proof.txt"}
