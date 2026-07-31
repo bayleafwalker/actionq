@@ -34,7 +34,7 @@ def _component(value: str) -> str:
 
 
 def _mkdir_secure(path: Path) -> None:
-    path.mkdir(mode=0o700, exist_ok=True)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise ValueError("runner staging path must be a real directory")

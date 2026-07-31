@@ -51,7 +51,7 @@ def test_server_and_runner_distributions_have_no_cross_imports():
 
 
 def test_staging_is_private_atomic_and_rejects_traversal(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "missing" / "state"))
     attempt = staging_dir(2031, "claim-1")
     assert stat.S_IMODE(attempt.root.stat().st_mode) == 0o700
     incoming = receive(attempt, "result.json", b"worker secret bytes", redact=lambda _: b"worker bytes")
