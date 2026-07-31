@@ -925,64 +925,97 @@ def claim(
             f"""
             SELECT a.id
             FROM {qname(schema, 'actions')} a
+            LEFT JOIN {qname(schema, 'execution_group_members')} m ON m.action_id = a.id
+            LEFT JOIN {qname(schema, 'execution_groups')} g ON g.id = m.group_id
             WHERE a.status = 'pending'
+              AND (
+                  m.group_id IS NULL
+                  OR (
+                      g.claim_state = 'active'
+                      AND (
+                          SELECT count(*)
+                          FROM {qname(schema, 'execution_group_members')} capacity_member
+                          JOIN {qname(schema, 'actions')} capacity_action
+                            ON capacity_action.id = capacity_member.action_id
+                          WHERE capacity_member.group_id = m.group_id
+                            AND capacity_action.status IN ('claimed', 'cancelling')
+                      ) < g.max_parallel
+                  )
+              )
             ORDER BY a.priority ASC, a.created_at ASC
             """,
         ).fetchall()
         row = None
         selected = None
+        selected_envelope = None
+
+        class SkipClaimCandidate(Exception):
+            pass
+
         for candidate_id in candidate_ids:
-            candidate = conn.execute(
-                f"""SELECT a.id, m.group_id, m.envelope_digest, m.envelope_snapshot
-                    FROM {qname(schema, 'actions')} a
-                    LEFT JOIN {qname(schema, 'execution_group_members')} m ON m.action_id = a.id
-                    WHERE a.id=%s AND a.status='pending'
-                    FOR UPDATE OF a SKIP LOCKED""",
-                (candidate_id["id"],),
-            ).fetchone()
-            if candidate is None:
+            try:
+                # A savepoint releases locks for an ineligible candidate. This
+                # prevents crossed group locks when one claim scans multiple
+                # full/stopped groups while preserving blocking serialization
+                # for two claimers admitted to the same group.
+                with conn.transaction():
+                    candidate = conn.execute(
+                        f"""SELECT a.id, m.group_id, m.envelope_digest, m.envelope_snapshot
+                            FROM {qname(schema, 'actions')} a
+                            LEFT JOIN {qname(schema, 'execution_group_members')} m ON m.action_id = a.id
+                            WHERE a.id=%s AND a.status='pending'
+                            FOR UPDATE OF a SKIP LOCKED""",
+                        (candidate_id["id"],),
+                    ).fetchone()
+                    if candidate is None:
+                        raise SkipClaimCandidate
+                    envelope = None
+                    if candidate["group_id"] is not None:
+                        group = conn.execute(
+                            f"SELECT * FROM {qname(schema, 'execution_groups')} WHERE id=%s FOR UPDATE",
+                            (candidate["group_id"],),
+                        ).fetchone()
+                        if group is None or group["claim_state"] != "active":
+                            raise SkipClaimCandidate
+                        claimed = conn.execute(
+                            f"""SELECT count(*) AS count
+                                FROM {qname(schema, 'execution_group_members')} m
+                                JOIN {qname(schema, 'actions')} a ON a.id=m.action_id
+                                WHERE m.group_id=%s AND a.status IN ('claimed', 'cancelling')""",
+                            (candidate["group_id"],),
+                        ).fetchone()["count"]
+                        if int(claimed) >= int(group["max_parallel"]):
+                            raise SkipClaimCandidate
+                        snapshot = candidate["envelope_snapshot"]
+                        if isinstance(snapshot, memoryview):
+                            snapshot = snapshot.tobytes()
+                        try:
+                            envelope = json.loads(bytes(snapshot).decode("utf-8"))
+                            contract_id = require_contract_compatible(envelope)
+                        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            raise ActionQError("stored execution group envelope is invalid") from exc
+                        if (
+                            contract_id != EXECUTION_ENVELOPE_V1
+                            or envelope.get("action_id") != int(candidate["id"])
+                            or contract_digest(envelope) != candidate["envelope_digest"]
+                            or contract_canonical_bytes(envelope) != bytes(snapshot)
+                        ):
+                            raise ActionQError("stored execution group envelope failed integrity validation")
+                    row = conn.execute(
+                        f"""UPDATE {qname(schema, 'actions')}
+                            SET status='claimed', claimed_at=now(), claimed_by=%s,
+                                claim_deadline=now() + (%s * interval '1 minute'),
+                                claim_receipt=%s, runner_auth_digest=%s
+                            WHERE id=%s AND status='pending' RETURNING *""",
+                        (worker, timeout_minutes, str(uuid.uuid4()), receipt_digest(runner_auth_token), candidate["id"]),
+                    ).fetchone()
+                    if row is None:
+                        raise SkipClaimCandidate
+            except SkipClaimCandidate:
                 continue
-            if candidate["group_id"] is not None:
-                group = conn.execute(
-                    f"SELECT * FROM {qname(schema, 'execution_groups')} WHERE id=%s FOR UPDATE",
-                    (candidate["group_id"],),
-                ).fetchone()
-                if group is None or group["claim_state"] != "active":
-                    continue
-                claimed = conn.execute(
-                    f"""SELECT count(*) AS count
-                        FROM {qname(schema, 'execution_group_members')} m
-                        JOIN {qname(schema, 'actions')} a ON a.id=m.action_id
-                        WHERE m.group_id=%s AND a.status IN ('claimed', 'cancelling')""",
-                    (candidate["group_id"],),
-                ).fetchone()["count"]
-                if int(claimed) >= int(group["max_parallel"]):
-                    continue
-                snapshot = candidate["envelope_snapshot"]
-                if isinstance(snapshot, memoryview):
-                    snapshot = snapshot.tobytes()
-                try:
-                    envelope = json.loads(bytes(snapshot).decode("utf-8"))
-                    contract_id = require_contract_compatible(envelope)
-                except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise ActionQError("stored execution group envelope is invalid") from exc
-                if (
-                    contract_id != EXECUTION_ENVELOPE_V1
-                    or envelope.get("action_id") != int(candidate["id"])
-                    or contract_digest(envelope) != candidate["envelope_digest"]
-                    or contract_canonical_bytes(envelope) != bytes(snapshot)
-                ):
-                    raise ActionQError("stored execution group envelope failed integrity validation")
-            row = conn.execute(
-                f"""UPDATE {qname(schema, 'actions')}
-                    SET status='claimed', claimed_at=now(), claimed_by=%s,
-                        claim_deadline=now() + (%s * interval '1 minute'),
-                        claim_receipt=%s, runner_auth_digest=%s
-                    WHERE id=%s AND status='pending' RETURNING *""",
-                (worker, timeout_minutes, str(uuid.uuid4()), receipt_digest(runner_auth_token), candidate["id"]),
-            ).fetchone()
             if row is not None:
                 selected = candidate
+                selected_envelope = envelope
                 break
         if row is None:
             raise NoActionAvailable("no pending actions")
@@ -1006,7 +1039,7 @@ def claim(
     if selected is not None and selected["group_id"] is not None:
         result["execution_group_id"] = str(selected["group_id"])
         result["execution_envelope_digest"] = selected["envelope_digest"]
-        result["execution_envelope"] = envelope
+        result["execution_envelope"] = selected_envelope
     return result
 
 

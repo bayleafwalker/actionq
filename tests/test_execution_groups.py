@@ -238,11 +238,202 @@ def test_concurrent_claims_cannot_exceed_group_parallelism(group_db):
         thread.join(timeout=10)
     assert not any(thread.is_alive() for thread in threads)
     assert errors == []
-    # SKIP LOCKED permits a contender to report empty while another claimant
-    # holds the group row.  This history proves the safety property (never
-    # exceed two); the capacity-release test separately proves availability.
-    assert 1 <= len(claimed) == len(set(claimed)) <= 2
+    assert len(claimed) == len(set(claimed)) == 2
     assert len(claimed) + len(empty) == 3
+
+
+def test_full_interleaved_groups_cannot_deadlock_ordinary_claimers(group_db):
+    setup, schema = group_db
+    a1 = _enqueue(setup, schema, "a-1")
+    b1 = _enqueue(setup, schema, "b-1")
+    a2 = _enqueue(setup, schema, "a-2")
+    b2 = _enqueue(setup, schema, "b-2")
+    _realize(setup, schema, _spec([a1, a2], max_parallel=1))
+    second_spec = _spec([b1, b2], max_parallel=1)
+    second_spec["plan_ref"] = "artifact:sha256:" + "c" * 64
+    _realize(setup, schema, second_spec)
+    db.claim(setup, schema, worker="worker:a", timeout_minutes=30)
+    setup.commit()
+    db.claim(setup, schema, worker="worker:b", timeout_minutes=30)
+    setup.commit()
+    ordinary = [_enqueue(setup, schema, f"ordinary-{index}") for index in range(2)]
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    claimed: list[int] = []
+    errors: list[BaseException] = []
+
+    def claim_ordinary(worker: str) -> None:
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        try:
+            conn.execute("SET statement_timeout = '2s'")
+            barrier.wait(timeout=5)
+            row = db.claim(conn, schema, worker=worker, timeout_minutes=30)
+            conn.commit()
+            with lock:
+                claimed.append(row["id"])
+        except BaseException as exc:
+            conn.rollback()
+            with lock:
+                errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=claim_ordinary, args=(f"worker:ordinary-{index}",))
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert set(claimed) == {row["id"] for row in ordinary}
+
+
+def test_claim_versus_realize_serializes_on_the_action_row(group_db):
+    setup, schema = group_db
+    action = _enqueue(setup, schema, "claim-versus-realize")
+    spec = _spec([action])
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    outcomes: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def claim() -> None:
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        try:
+            barrier.wait(timeout=5)
+            try:
+                row = db.claim(conn, schema, worker="worker:race", timeout_minutes=30)
+                conn.commit()
+                with lock:
+                    outcomes["claim"] = row
+            except db.NoActionAvailable:
+                conn.rollback()
+                with lock:
+                    outcomes["claim_empty"] = True
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+        finally:
+            conn.close()
+
+    def realize() -> None:
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        try:
+            barrier.wait(timeout=5)
+            try:
+                row = db.realize_execution_group(conn, schema, **spec)
+                conn.commit()
+                with lock:
+                    outcomes["realize"] = row
+            except db.ActionQError as exc:
+                conn.rollback()
+                with lock:
+                    outcomes["realize_rejected"] = str(exc)
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=claim), threading.Thread(target=realize)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+
+    if "realize" in outcomes:
+        group = outcomes["realize"]
+        if "claim" not in outcomes:
+            # Claim may observe a transient empty queue because realization
+            # holds the action row and claim uses SKIP LOCKED.  A retry after
+            # the serializing commit must receive the frozen group envelope.
+            assert outcomes["claim_empty"] is True
+            outcomes["claim"] = db.claim(
+                setup, schema, worker="worker:retry", timeout_minutes=30,
+            )
+            setup.commit()
+        claimed = outcomes["claim"]
+        assert claimed["execution_group_id"] == str(group["id"])
+        assert claimed["execution_envelope_digest"] == sha256_digest(_envelope(action["id"]))
+    else:
+        claimed = outcomes["claim"]
+        assert "must all be pending" in outcomes["realize_rejected"]
+        assert "execution_group_id" not in claimed
+        count = setup.execute(
+            f"SELECT count(*) AS n FROM {db.qname(schema, 'execution_groups')}"
+        ).fetchone()["n"]
+        assert count == 0
+    current = db.get_action(setup, schema, action["id"])
+    assert current["status"] == "claimed"
+
+
+def test_claim_versus_stop_has_only_serialized_outcomes(group_db):
+    setup, schema = group_db
+    action = _enqueue(setup, schema, "claim-versus-stop")
+    group = _realize(setup, schema, _spec([action]))
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    outcomes: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def claim() -> None:
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        try:
+            barrier.wait(timeout=5)
+            try:
+                row = db.claim(conn, schema, worker="worker:race", timeout_minutes=30)
+                conn.commit()
+                with lock:
+                    outcomes["claim"] = row
+            except db.NoActionAvailable:
+                conn.rollback()
+                with lock:
+                    outcomes["claim_empty"] = True
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+        finally:
+            conn.close()
+
+    def stop() -> None:
+        conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+        try:
+            barrier.wait(timeout=5)
+            row = db.stop_execution_group(
+                conn, schema, group_id=group["id"], actor="operator:race", reason="race",
+            )
+            conn.commit()
+            with lock:
+                outcomes["stop"] = row
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=claim), threading.Thread(target=stop)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert outcomes["stop"]["claim_state"] == "stopped"
+
+    projection = db.get_execution_group(setup, schema, group["id"])
+    if "claim" in outcomes:
+        assert outcomes["claim"]["execution_group_id"] == str(group["id"])
+        assert projection["counts"]["claimed"] == 1
+        assert projection["counts"]["pending_stopped"] == 0
+    else:
+        assert outcomes["claim_empty"] is True
+        assert projection["counts"]["claimed"] == 0
+        assert projection["counts"]["pending_stopped"] == 1
 
 
 def test_stop_fences_new_claims_but_not_existing_claim_or_ungrouped_action(group_db):
@@ -275,6 +466,35 @@ def test_stop_fences_new_claims_but_not_existing_claim_or_ungrouped_action(group
     assert ordinary_claim["id"] == ungrouped["id"]
     projection = db.get_execution_group(conn, schema, group["id"])
     assert projection["counts"]["pending_stopped"] == 1
+
+
+def test_sweep_requeues_claim_but_stop_keeps_it_unclaimable(group_db):
+    conn, schema = group_db
+    action = _enqueue(conn, schema, "sweep-after-stop")
+    group = _realize(conn, schema, _spec([action]))
+    claimed = db.claim(conn, schema, worker="worker:expired", timeout_minutes=30)
+    conn.commit()
+    db.stop_execution_group(
+        conn, schema, group_id=group["id"], actor="operator:test", reason="permanent stop",
+    )
+    conn.execute(
+        f"UPDATE {db.qname(schema, 'actions')} "
+        "SET claim_deadline=now() - interval '1 second' WHERE id=%s",
+        (claimed["id"],),
+    )
+    conn.commit()
+
+    swept = db.sweep(conn, schema, actor="sweeper:test")
+    conn.commit()
+    assert [row["id"] for row in swept] == [action["id"]]
+    assert swept[0]["status"] == "pending"
+    assert swept[0]["claimed_by"] is None
+    with pytest.raises(db.NoActionAvailable):
+        db.claim(conn, schema, worker="worker:late", timeout_minutes=30)
+    conn.rollback()
+    projection = db.get_execution_group(conn, schema, group["id"])
+    assert projection["counts"]["pending_stopped"] == 1
+    assert projection["counts"]["claimed"] == 0
 
 
 def test_stopped_group_prefix_cannot_starve_later_ordinary_action(group_db):
@@ -382,6 +602,67 @@ def test_served_realization_authorization_and_idempotency(group_db):
             **(spec | {"plan_ref": "artifact:sha256:" + "c" * 64}),
             provenance=replace(provenance, idempotency_key="denied"),
         )
+
+
+def test_served_stop_authorization_idempotency_and_denial(group_db):
+    setup, schema = group_db
+    allowed_action = _enqueue(setup, schema, "served-stop")
+    denied_action = _enqueue(setup, schema, "served-stop-denied")
+    allowed_group = _realize(setup, schema, _spec([allowed_action]))
+    denied_spec = _spec([denied_action]) | {
+        "plan_ref": "artifact:sha256:" + "d" * 64,
+    }
+    denied_group = _realize(setup, schema, denied_spec)
+    runtime_url = os.environ.get("ACTIONQ_TEST_RUNTIME_URL") or os.environ[
+        "ACTIONQ_TEST_URL"
+    ].replace("//actionq:", "//actionq_runtime:")
+    authorization_calls: list[tuple[str, str]] = []
+
+    def authorize(_provenance, resource, verb):
+        authorization_calls.append((resource, verb))
+        return resource == "execution.group.manage" and verb == "update"
+
+    app = ActionQApplication(
+        schema=schema,
+        connection_factory=lambda: db.connect(runtime_url),
+        authorizer=authorize,
+    )
+    provenance = InvocationProvenance(
+        actor="coordinator:test", environment="served:test",
+        request_id="stop-request-one", catalog_revision="catalog:test",
+        idempotency_key="stop-group-one",
+    )
+    arguments = {
+        "group_id": str(allowed_group["id"]),
+        "actor": "coordinator:test",
+        "reason": "served bounded stop",
+    }
+    first = app.stop_execution_group(**arguments, provenance=provenance)
+    replay = app.stop_execution_group(
+        **arguments, provenance=replace(provenance, request_id="stop-request-two"),
+    )
+    assert first["result"]["claim_state"] == "stopped"
+    assert replay["result"] == first["result"]
+    assert replay["decision"]["replayed"] is True
+    assert authorization_calls == [
+        ("execution.group.manage", "update"),
+        ("execution.group.manage", "update"),
+    ]
+
+    denied = ActionQApplication(
+        schema=schema,
+        connection_factory=lambda: db.connect(runtime_url),
+        authorizer=lambda *_args: False,
+    )
+    with pytest.raises(db.ActionQError, match="authorization denied"):
+        denied.stop_execution_group(
+            group_id=str(denied_group["id"]), actor="coordinator:test", reason="denied",
+            provenance=replace(
+                provenance, request_id="stop-denied", idempotency_key="stop-denied",
+            ),
+        )
+    still_active = db.get_execution_group(setup, schema, denied_group["id"])
+    assert still_active["claim_state"] == "active"
 
 
 @dataclass(frozen=True)
