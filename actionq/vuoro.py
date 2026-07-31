@@ -124,6 +124,27 @@ _DISPATCH_V2_INPUT_SCHEMA = _object(
     },
     required=("contract_version", "action_type", "output_expectation", "repo_id", "sprint_id", "work_item_id", "title", "prompt", "harness", "model", "priority", "refs", "dispatch_group_id"),
 )
+_EXECUTION_ENVELOPE_SCHEMA = {
+    "type": "object",
+    "properties": {"contract_id": {"const": "execution-envelope/v1"}},
+    "required": ["contract_id"],
+    "additionalProperties": True,
+}
+_EXECUTION_GROUP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "format": "uuid"},
+        "plan_ref": {"type": "string", "pattern": "^artifact:sha256:[0-9a-f]{64}$"},
+        "spec_sha256": {"type": "string", "pattern": "^artifact:sha256:[0-9a-f]{64}$"},
+        "max_parallel": {"type": "integer", "minimum": 1, "maximum": 32},
+        "failure_policy": {"const": "continue-independent"},
+        "claim_state": {"enum": ["active", "stopped"]},
+        "members": {"type": "array", "items": {"type": "object"}},
+        "counts": {"type": "object"},
+    },
+    "required": ["id", "plan_ref", "spec_sha256", "max_parallel", "failure_policy", "claim_state", "members", "counts"],
+    "additionalProperties": True,
+}
 
 
 @dataclass(frozen=True)
@@ -286,6 +307,93 @@ def build_operations(
             lambda a, _context: _transport(
                 app.show_action(a["action_id"]) or {"action": None, "events": []}
             ),
+        )
+    )
+
+    name = "execution.group.realize"
+    operations.append(
+        AdapterOperation(
+            _definition(
+                name,
+                input_schema=_object(
+                    {
+                        "contract_id": {"const": "execution-group/v1"},
+                        "plan_ref": {"type": "string", "pattern": "^artifact:sha256:[0-9a-f]{64}$"},
+                        "max_parallel": {"type": "integer", "minimum": 1, "maximum": 32},
+                        "failure_policy": {"const": "continue-independent"},
+                        "members": {
+                            "type": "array", "minItems": 1,
+                            "items": _object(
+                                {"action_id": action_id, "envelope": _EXECUTION_ENVELOPE_SCHEMA},
+                                required=("action_id", "envelope"),
+                            ),
+                        },
+                    },
+                    required=("contract_id", "plan_ref", "max_parallel", "failure_policy", "members"),
+                ),
+                result_schema=_DECISION_RESULT_SCHEMA,
+                authority="execution.group.manage",
+                semantics="write",
+                idempotency="required",
+            ),
+            served(
+                name,
+                lambda a, p, actor: app.realize_execution_group(
+                    plan_ref=a["plan_ref"], max_parallel=a["max_parallel"],
+                    failure_policy=a["failure_policy"], members=a["members"],
+                    created_by=actor, provenance=p,
+                ),
+            ),
+        )
+    )
+
+    name = "execution.group.stop-new-claims"
+    operations.append(
+        AdapterOperation(
+            _definition(
+                name,
+                input_schema=_object(
+                    {"group_id": {"type": "string", "format": "uuid"}, "reason": {"type": "string", "minLength": 1}},
+                    required=("group_id", "reason"),
+                ),
+                result_schema=_DECISION_RESULT_SCHEMA,
+                authority="execution.group.manage",
+                semantics="write",
+                idempotency="required",
+            ),
+            served(name, lambda a, p, actor: app.stop_execution_group(
+                group_id=a["group_id"], actor=actor, reason=a["reason"], provenance=p,
+            )),
+        )
+    )
+
+    name = "execution.group.show"
+    operations.append(
+        AdapterOperation(
+            _definition(
+                name,
+                input_schema=_object({"group_id": {"type": "string", "format": "uuid"}}, required=("group_id",)),
+                result_schema={"$schema": SCHEMA_DIALECT, "anyOf": [_EXECUTION_GROUP_SCHEMA, {"type": "null"}]},
+                authority="execution.read",
+                semantics="read",
+                idempotency="not-allowed",
+            ),
+            lambda a, _context: _transport(app.show_execution_group(a["group_id"])),
+        )
+    )
+
+    name = "execution.group.list"
+    operations.append(
+        AdapterOperation(
+            _definition(
+                name,
+                input_schema=_object({"limit": limit}),
+                result_schema={"$schema": SCHEMA_DIALECT, "type": "array", "items": _EXECUTION_GROUP_SCHEMA},
+                authority="execution.read",
+                semantics="read",
+                idempotency="not-allowed",
+            ),
+            lambda a, _context: _transport(app.list_execution_groups(limit=a.get("limit", 50))),
         )
     )
 

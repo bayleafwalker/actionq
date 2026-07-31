@@ -287,6 +287,70 @@ class FakeSchemaConnection:
                         dispatch_constraint("c", ["request_sha256"], expression=self.dispatch_check_overrides.get("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text"), validated=self.dispatch_check_validated.get("request_sha256", True)),
                         dispatch_constraint("c", ["operation"], expression=self.dispatch_check_overrides.get("operation", "operation = 'execution.dispatch.enqueue'::text"), validated=self.dispatch_check_validated.get("operation", True)),
                     ])
+                def group_constraint(
+                    table,
+                    relation_oid,
+                    kind,
+                    columns,
+                    *,
+                    foreign_table=None,
+                    foreign_oid=None,
+                    expression="",
+                ):
+                    return {
+                        "table_name": table,
+                        "relation_oid": relation_oid,
+                        "contype": kind,
+                        "columns": columns,
+                        "foreign_namespace": query_schema if foreign_table else None,
+                        "foreign_table": foreign_table,
+                        "foreign_oid": foreign_oid,
+                        "foreign_columns": ["id"] if foreign_table else [],
+                        "update_action": "a",
+                        "delete_action": "r" if foreign_table else "a",
+                        "match_action": "s",
+                        "is_deferrable": False,
+                        "is_initially_deferred": False,
+                        "is_validated": True,
+                        "expression": expression,
+                    }
+
+                rows.extend([
+                    group_constraint("execution_groups", 104, "p", ["id"]),
+                    group_constraint("execution_groups", 104, "u", ["plan_ref"]),
+                    group_constraint("execution_groups", 104, "u", ["spec_sha256"]),
+                    group_constraint(
+                        "execution_groups", 104, "c", ["max_parallel"],
+                        expression="max_parallel >= 1 AND max_parallel <= 32",
+                    ),
+                    group_constraint(
+                        "execution_groups", 104, "c", ["failure_policy"],
+                        expression="failure_policy = 'continue-independent'::text",
+                    ),
+                    group_constraint(
+                        "execution_groups", 104, "c", ["claim_state"],
+                        expression="claim_state = ANY (ARRAY['active'::text, 'stopped'::text])",
+                    ),
+                    group_constraint(
+                        "execution_group_members", 105, "p", ["group_id", "action_id"]
+                    ),
+                    group_constraint(
+                        "execution_group_members", 105, "f", ["group_id"],
+                        foreign_table="execution_groups", foreign_oid=104,
+                    ),
+                    group_constraint(
+                        "execution_group_members", 105, "f", ["action_id"],
+                        foreign_table="actions", foreign_oid=101,
+                    ),
+                    group_constraint("execution_group_members", 105, "u", ["action_id"]),
+                    group_constraint(
+                        "execution_group_members", 105, "u", ["group_id", "ordinal"]
+                    ),
+                    group_constraint(
+                        "execution_group_members", 105, "c", ["ordinal"],
+                        expression="ordinal >= 0",
+                    ),
+                ])
             return _Rows(rows)
         if normalized.startswith("SELECT relation.relname AS table_name") and "pg_index" in normalized:
             rows = []
@@ -325,7 +389,7 @@ def _packaged_checksums() -> dict[int, str]:
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     migrations = schema.load_migrations()
 
-    assert [migration.version for migration in migrations] == [1, 2, 3, 4]
+    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5]
     rendered = schema._render(migrations[0], "aq")
     assert "{{schema}}" not in rendered
     assert '"aq".actions' in rendered
@@ -365,8 +429,8 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "domain": "execution",
         "api_version": "v1",
         "minimum_schema_version": 1,
-        "maximum_schema_version": 4,
-        "observed_schema_version": 4,
+        "maximum_schema_version": 5,
+        "observed_schema_version": 5,
         "state": "compatible",
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
@@ -448,6 +512,20 @@ def test_v3_not_valid_dispatch_check_fails_runtime_compatibility():
     assert result.compatible is False
     assert "constraint-missing-or-invalid:dispatch_requests.operation" in result.detail
     assert all(statement.startswith("SELECT") for statement, _ in conn.executed)
+
+
+def test_v5_execution_group_column_shape_drift_fails_runtime_compatibility():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        default_overrides={("execution_groups", "claim_state"): "'stopped'::text"},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert result.state == "shape-mismatch"
+    assert "column-default:execution_groups.claim_state" in result.detail
 
 
 def test_unversioned_v1_adoption_allows_only_expected_later_relation_absence():
@@ -623,8 +701,17 @@ def test_sql_canonicalization_preserves_semantic_tokens():
 @pytest.mark.parametrize(
     ("applied", "state"),
     [
-        ({1: "wrong", 2: _packaged_checksums()[2], 3: _packaged_checksums()[3], 4: _packaged_checksums()[4]}, "checksum-mismatch"),
-        ({**_packaged_checksums(), 5: "future"}, "too-new"),
+        (
+            {
+                1: "wrong",
+                2: _packaged_checksums()[2],
+                3: _packaged_checksums()[3],
+                4: _packaged_checksums()[4],
+                5: _packaged_checksums()[5],
+            },
+            "checksum-mismatch",
+        ),
+        ({**_packaged_checksums(), 6: "future"}, "too-new"),
     ],
 )
 def test_compatibility_rejects_unsupported_schema(applied, state):
@@ -642,7 +729,7 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
     first = schema.migrate(conn, "aq")
     second = schema.migrate(conn, "aq")
 
-    assert first["applied_versions"] == [1, 2, 3, 4]
+    assert first["applied_versions"] == [1, 2, 3, 4, 5]
     assert second["applied_versions"] == []
     assert second["compatibility"]["compatible"] is True
     locks = [

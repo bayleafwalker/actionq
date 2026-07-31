@@ -10,6 +10,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from actionq_contracts import (
+    EXECUTION_ENVELOPE_V1, canonical_bytes as contract_canonical_bytes,
+    require_compatible as require_contract_compatible, sha256_digest as contract_digest,
+)
+
 
 MAX_CHAIN_DEPTH = int(os.environ.get("ACTIONQ_MAX_CHAIN_DEPTH", "3"))
 DEFAULT_RATE_LIMIT_PER_HOUR = int(os.environ.get("ACTIONQ_RATE_LIMIT_PER_HOUR", "20"))
@@ -723,6 +728,177 @@ def list_dispatches(
     return summarize_dispatches(action_rows, [dict(row) for row in events])
 
 
+_GROUP_CONTRACT_ID = "execution-group/v1"
+_PLAN_REF_RE = re.compile(r"^artifact:sha256:[0-9a-f]{64}$")
+
+
+def _group_projection(conn, schema: str, row: dict[str, Any]) -> dict[str, Any]:
+    counts = conn.execute(
+        f"""
+        SELECT
+            count(*) FILTER (WHERE a.status = 'pending' AND g.claim_state = 'active') AS pending_claimable,
+            count(*) FILTER (WHERE a.status = 'pending' AND g.claim_state = 'stopped') AS pending_stopped,
+            count(*) FILTER (WHERE a.status = 'claimed') AS claimed,
+            count(*) FILTER (WHERE a.status = 'cancelling') AS cancelling,
+            count(*) FILTER (WHERE a.status = 'completed') AS completed,
+            count(*) FILTER (WHERE a.status = 'failed') AS failed,
+            count(*) FILTER (WHERE a.status = 'rejected') AS rejected,
+            count(*) FILTER (WHERE a.status = 'cancelled') AS cancelled
+        FROM {qname(schema, 'execution_groups')} g
+        JOIN {qname(schema, 'execution_group_members')} m ON m.group_id = g.id
+        JOIN {qname(schema, 'actions')} a ON a.id = m.action_id
+        WHERE g.id = %s
+        """,
+        (row["id"],),
+    ).fetchone()
+    members = conn.execute(
+        f"""SELECT m.action_id, m.ordinal, m.envelope_digest, a.status
+            FROM {qname(schema, 'execution_group_members')} m
+            JOIN {qname(schema, 'actions')} a ON a.id = m.action_id
+            WHERE m.group_id = %s ORDER BY m.ordinal""",
+        (row["id"],),
+    ).fetchall()
+    result = dict(row)
+    result.pop("spec_snapshot", None)
+    result["id"] = str(result["id"])
+    result["members"] = [dict(member) for member in members]
+    result["counts"] = {key: int(counts[key] or 0) for key in (
+        "pending_claimable", "pending_stopped", "claimed", "cancelling", "completed",
+        "failed", "rejected", "cancelled",
+    )}
+    return result
+
+
+def get_execution_group(conn, schema: str, group_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        f"SELECT * FROM {qname(schema, 'execution_groups')} WHERE id = %s", (group_id,),
+    ).fetchone()
+    return _group_projection(conn, schema, dict(row)) if row else None
+
+
+def list_execution_groups(conn, schema: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        f"SELECT * FROM {qname(schema, 'execution_groups')} ORDER BY created_at DESC LIMIT %s",
+        (limit,),
+    ).fetchall()
+    return [_group_projection(conn, schema, dict(row)) for row in rows]
+
+
+def realize_execution_group(
+    conn, schema: str, *, plan_ref: str, max_parallel: int,
+    failure_policy: str, members: list[dict[str, Any]], created_by: str,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not _PLAN_REF_RE.fullmatch(plan_ref):
+        raise ActionQError("execution group plan_ref must be an immutable artifact sha256 ref")
+    if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or not 1 <= max_parallel <= 32:
+        raise ActionQError("execution group max_parallel must be between 1 and 32")
+    if failure_policy != "continue-independent":
+        raise ActionQError("execution group supports only continue-independent")
+    if not members:
+        raise ActionQError("execution group requires at least one member")
+    normalized_members: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for member in members:
+        if set(member) != {"action_id", "envelope"}:
+            raise ActionQError("execution group members require exactly action_id and envelope")
+        action_id, envelope = member["action_id"], member["envelope"]
+        if isinstance(action_id, bool) or not isinstance(action_id, int) or action_id <= 0:
+            raise ActionQError("execution group action ids must be positive integers")
+        if action_id in seen:
+            raise ActionQError("execution group action ids must be unique")
+        if not isinstance(envelope, dict):
+            raise ActionQError("execution group envelope must be an object")
+        try:
+            contract_id = require_contract_compatible(envelope)
+        except ValueError as exc:
+            raise ActionQError(f"invalid execution group envelope: {exc}") from exc
+        if contract_id != EXECUTION_ENVELOPE_V1 or envelope["action_id"] != action_id:
+            raise ActionQError("execution group envelope/action identity mismatch")
+        seen.add(action_id)
+        normalized_members.append({"action_id": action_id, "envelope": envelope})
+    spec = {
+        "contract_id": _GROUP_CONTRACT_ID, "plan_ref": plan_ref,
+        "max_parallel": max_parallel, "failure_policy": failure_policy,
+        "members": normalized_members,
+    }
+    snapshot = contract_canonical_bytes(spec)
+    digest = contract_digest(spec)
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"execution-group:{plan_ref}",))
+        prior = conn.execute(
+            f"SELECT * FROM {qname(schema, 'execution_groups')} WHERE plan_ref = %s", (plan_ref,),
+        ).fetchone()
+        if prior is not None:
+            if prior["spec_sha256"] != digest:
+                raise ActionQError("execution group plan_ref already has a different immutable spec")
+            return _group_projection(conn, schema, dict(prior))
+        action_ids = sorted(seen)
+        rows = conn.execute(
+            f"SELECT id, status FROM {qname(schema, 'actions')} WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
+            (action_ids,),
+        ).fetchall()
+        if [int(row["id"]) for row in rows] != action_ids:
+            raise ActionQError("execution group references an unknown action")
+        if any(row["status"] != "pending" for row in rows):
+            raise ActionQError("execution group members must all be pending")
+        if conn.execute(
+            f"SELECT action_id FROM {qname(schema, 'execution_group_members')} WHERE action_id = ANY(%s)",
+            (action_ids,),
+        ).fetchone() is not None:
+            raise ActionQError("an action already belongs to an execution group")
+        group_id = str(uuid.uuid4())
+        group = conn.execute(
+            f"""INSERT INTO {qname(schema, 'execution_groups')}
+                (id, plan_ref, spec_sha256, spec_snapshot, max_parallel, failure_policy, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+            (group_id, plan_ref, digest, snapshot, max_parallel, failure_policy, created_by),
+        ).fetchone()
+        for ordinal, member in enumerate(normalized_members):
+            envelope_bytes = contract_canonical_bytes(member["envelope"])
+            conn.execute(
+                f"""INSERT INTO {qname(schema, 'execution_group_members')}
+                    (group_id, action_id, ordinal, envelope_digest, envelope_snapshot)
+                    VALUES (%s, %s, %s, %s, %s)""",
+                (group_id, member["action_id"], ordinal,
+                 contract_digest(member["envelope"]), envelope_bytes),
+            )
+        insert_event(
+            conn, schema, event_type="execution_group.realized", actor=created_by,
+            payload=event_payload_with_provenance({
+                "group_id": group_id, "plan_ref": plan_ref, "spec_sha256": digest,
+                "max_parallel": max_parallel, "failure_policy": failure_policy,
+                "action_ids": [member["action_id"] for member in normalized_members],
+            }, provenance),
+        )
+        return _group_projection(conn, schema, dict(group))
+
+
+def stop_execution_group(
+    conn, schema: str, *, group_id: str, actor: str, reason: str,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with conn.transaction():
+        row = conn.execute(
+            f"SELECT * FROM {qname(schema, 'execution_groups')} WHERE id = %s FOR UPDATE",
+            (group_id,),
+        ).fetchone()
+        if row is None:
+            raise ActionQError("execution group not found")
+        if row["claim_state"] == "active":
+            row = conn.execute(
+                f"""UPDATE {qname(schema, 'execution_groups')}
+                    SET claim_state='stopped', stopped_at=now(), stopped_by=%s, stop_reason=%s
+                    WHERE id=%s RETURNING *""",
+                (actor, reason, group_id),
+            ).fetchone()
+            insert_event(
+                conn, schema, event_type="execution_group.stopped", actor=actor,
+                payload=event_payload_with_provenance({"group_id": str(group_id), "reason": reason}, provenance),
+            )
+        return _group_projection(conn, schema, dict(row))
+
+
 def action_events(conn, schema: str, action_id: int) -> list[dict]:
     rows = conn.execute(
         f"""
@@ -745,26 +921,70 @@ def claim(
 ) -> dict:
     runner_auth_token = secrets.token_urlsafe(32)
     with conn.transaction():
-        row = conn.execute(
+        candidate_ids = conn.execute(
             f"""
-            UPDATE {qname(schema, "actions")}
-            SET status = 'claimed',
-                claimed_at = now(),
-                claimed_by = %s,
-                claim_deadline = now() + (%s * interval '1 minute'),
-                claim_receipt = %s,
-                runner_auth_digest = %s
-            WHERE id = (
-                SELECT id FROM {qname(schema, "actions")}
-                WHERE status = 'pending'
-                ORDER BY priority ASC, created_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING *
+            SELECT a.id
+            FROM {qname(schema, 'actions')} a
+            WHERE a.status = 'pending'
+            ORDER BY a.priority ASC, a.created_at ASC
+            LIMIT 64
             """,
-            (worker, timeout_minutes, str(uuid.uuid4()), receipt_digest(runner_auth_token)),
-        ).fetchone()
+        ).fetchall()
+        row = None
+        selected = None
+        for candidate_id in candidate_ids:
+            candidate = conn.execute(
+                f"""SELECT a.id, m.group_id, m.envelope_digest, m.envelope_snapshot
+                    FROM {qname(schema, 'actions')} a
+                    LEFT JOIN {qname(schema, 'execution_group_members')} m ON m.action_id = a.id
+                    WHERE a.id=%s AND a.status='pending'
+                    FOR UPDATE OF a SKIP LOCKED""",
+                (candidate_id["id"],),
+            ).fetchone()
+            if candidate is None:
+                continue
+            if candidate["group_id"] is not None:
+                group = conn.execute(
+                    f"SELECT * FROM {qname(schema, 'execution_groups')} WHERE id=%s FOR UPDATE",
+                    (candidate["group_id"],),
+                ).fetchone()
+                if group is None or group["claim_state"] != "active":
+                    continue
+                claimed = conn.execute(
+                    f"""SELECT count(*) AS count
+                        FROM {qname(schema, 'execution_group_members')} m
+                        JOIN {qname(schema, 'actions')} a ON a.id=m.action_id
+                        WHERE m.group_id=%s AND a.status IN ('claimed', 'cancelling')""",
+                    (candidate["group_id"],),
+                ).fetchone()["count"]
+                if int(claimed) >= int(group["max_parallel"]):
+                    continue
+                snapshot = candidate["envelope_snapshot"]
+                if isinstance(snapshot, memoryview):
+                    snapshot = snapshot.tobytes()
+                try:
+                    envelope = json.loads(bytes(snapshot).decode("utf-8"))
+                    contract_id = require_contract_compatible(envelope)
+                except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ActionQError("stored execution group envelope is invalid") from exc
+                if (
+                    contract_id != EXECUTION_ENVELOPE_V1
+                    or envelope.get("action_id") != int(candidate["id"])
+                    or contract_digest(envelope) != candidate["envelope_digest"]
+                    or contract_canonical_bytes(envelope) != bytes(snapshot)
+                ):
+                    raise ActionQError("stored execution group envelope failed integrity validation")
+            row = conn.execute(
+                f"""UPDATE {qname(schema, 'actions')}
+                    SET status='claimed', claimed_at=now(), claimed_by=%s,
+                        claim_deadline=now() + (%s * interval '1 minute'),
+                        claim_receipt=%s, runner_auth_digest=%s
+                    WHERE id=%s AND status='pending' RETURNING *""",
+                (worker, timeout_minutes, str(uuid.uuid4()), receipt_digest(runner_auth_token), candidate["id"]),
+            ).fetchone()
+            if row is not None:
+                selected = candidate
+                break
         if row is None:
             raise NoActionAvailable("no pending actions")
         insert_event(
@@ -784,6 +1004,10 @@ def claim(
         )
     result = dict(row)
     result["runner_auth_token"] = runner_auth_token
+    if selected is not None and selected["group_id"] is not None:
+        result["execution_group_id"] = str(selected["group_id"])
+        result["execution_envelope_digest"] = selected["envelope_digest"]
+        result["execution_envelope"] = envelope
     return result
 
 

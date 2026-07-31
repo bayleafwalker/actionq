@@ -132,6 +132,54 @@ def show(ctx, action_id: int) -> None:
     _echo_json(result)
 
 
+@cli.group("group")
+def execution_group() -> None:
+    """Manage immutable bounded projections over ordinary actions."""
+
+
+@execution_group.command("realize")
+@click.option("--spec-stdin", is_flag=True, required=True, help="Read execution-group/v1 JSON from stdin")
+@click.option("--created-by", default="human:cli", show_default=True)
+@click.pass_context
+def group_realize(ctx, spec_stdin: bool, created_by: str) -> None:
+    spec = json.load(sys.stdin)
+    if spec.get("contract_id") != "execution-group/v1" or set(spec) != {
+        "contract_id", "plan_ref", "max_parallel", "failure_policy", "members",
+    }:
+        raise click.ClickException("group spec must be exactly execution-group/v1")
+    result = _app(ctx).realize_execution_group(
+        plan_ref=spec["plan_ref"], max_parallel=spec["max_parallel"],
+        failure_policy=spec["failure_policy"], members=spec["members"], created_by=created_by,
+    )
+    _echo_json(result)
+
+
+@execution_group.command("show")
+@click.argument("group_id")
+@click.pass_context
+def group_show(ctx, group_id: str) -> None:
+    result = _app(ctx).show_execution_group(group_id)
+    if result is None:
+        raise click.ClickException("Execution group not found")
+    _echo_json(result)
+
+
+@execution_group.command("ls")
+@click.option("--limit", default=50, type=int, show_default=True)
+@click.pass_context
+def group_list(ctx, limit: int) -> None:
+    _echo_json(_app(ctx).list_execution_groups(limit=limit))
+
+
+@execution_group.command("stop-new-claims")
+@click.argument("group_id")
+@click.option("--reason", required=True)
+@click.option("--actor", default="human:cli", show_default=True)
+@click.pass_context
+def group_stop(ctx, group_id: str, reason: str, actor: str) -> None:
+    _echo_json(_app(ctx).stop_execution_group(group_id=group_id, actor=actor, reason=reason))
+
+
 @cli.command()
 @click.option("--proof-stdin", is_flag=True, required=True, help="Read signed runner proof as JSON from stdin")
 @click.option("--timeout", "timeout_minutes", default=30, type=int, show_default=True)
