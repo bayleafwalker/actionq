@@ -927,7 +927,6 @@ def claim(
             FROM {qname(schema, 'actions')} a
             WHERE a.status = 'pending'
             ORDER BY a.priority ASC, a.created_at ASC
-            LIMIT 64
             """,
         ).fetchall()
         row = None

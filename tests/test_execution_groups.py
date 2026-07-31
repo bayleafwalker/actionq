@@ -277,6 +277,22 @@ def test_stop_fences_new_claims_but_not_existing_claim_or_ungrouped_action(group
     assert projection["counts"]["pending_stopped"] == 1
 
 
+def test_stopped_group_prefix_cannot_starve_later_ordinary_action(group_db):
+    conn, schema = group_db
+    grouped = [_enqueue(conn, schema, f"stopped-{index}") for index in range(64)]
+    group = _realize(conn, schema, _spec(grouped, max_parallel=32))
+    db.stop_execution_group(
+        conn, schema, group_id=group["id"], actor="operator:test", reason="permanent stop",
+    )
+    conn.commit()
+    ordinary = _enqueue(conn, schema, "ordinary-after-stopped-prefix")
+
+    claimed = db.claim(conn, schema, worker="worker:ordinary", timeout_minutes=30)
+    conn.commit()
+    assert claimed["id"] == ordinary["id"]
+    assert "execution_group_id" not in claimed
+
+
 def test_claim_returns_exact_frozen_envelope_and_digest(group_db):
     conn, schema = group_db
     action = _enqueue(conn, schema, "exact")
