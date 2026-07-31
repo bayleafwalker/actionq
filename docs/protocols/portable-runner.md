@@ -74,3 +74,37 @@ The pilot never pushes Git, opens pull requests, promotes pre-#2032 spool
 records, deletes canonical bundles/receipts, or performs generalized garbage
 collection. A later trusted Git publisher may consume an accepted bundle but
 cannot run the harness that created it.
+
+## Second disposable implementation
+
+`actionq-runner oci-execute` is the second implementation of the released
+envelope. The #2033 pilot is intentionally offline and deterministic: a
+trusted supervisor freezes the exact source as a read-only Git bundle and
+starts a digest-pinned image through an explicitly configured rootless OCI
+engine. The worker has `network=none`, a read-only root filesystem, private
+PID/IPC namespaces, no added capabilities or new privileges, no devices or
+engine socket, and no writable host bind. Its only material workspace is a
+10 GiB kernel tmpfs; `/tmp`, `/run`, and the trusted control record are
+separately bounded.
+CPU, memory, disk, PID, and 1,800-second wall-clock ceilings are mandatory.
+
+Before untrusted bytes run, the supervisor reads back engine inspection state
+and fails closed if the engine weakened the image digest, UID mapping,
+network, mounts, namespaces, capabilities, tmpfs, or resource limits. A trusted
+engine seccomp profile is selected explicitly and accepted only when its bytes
+match the digest frozen by the coordinator. All Git operations over
+worker-controlled state run under the zero-capability worker identity; the PID-1
+wrapper kills and reaps every remaining namespace descendant before sealing.
+A deterministic container identity is removed after runner death and retried
+during daemon restart recovery. The immutable image wrapper exports only a
+candidate Git bundle, which the supervisor copies
+to private staging and validates in a fresh repository for object integrity,
+source ancestry, candidate cleanliness, modes, and the frozen path allowlist.
+Publication, registration, settlement, and recovery
+then use the same #2032 supervisor path as the devbox implementation. A
+successfully reconciled OCI attempt removes the exact container, tmpfs, and
+private staging record and records observed destruction; cancelled, crashed,
+or unreconciled attempts remain quarantined.
+
+Provider-backed model calls, allowlisted HTTPS egress, Kubernetes Jobs, image
+registry rollout, and generalized scheduling are not part of this proof.

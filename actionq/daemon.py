@@ -7,6 +7,7 @@ events, leaving queue mutation to ``actionctl``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -151,6 +152,17 @@ class ActionConfig:
     harness_profile: str | None = None
     publish_candidate: bool = False
     scope_iterate: ScopeIteratePolicy | None = None
+    # #2033 offline proof: a pinned image executed by a proven rootless OCI
+    # engine. The deterministic command is the only worker payload; model
+    # credentials and network egress are deliberately out of scope.
+    oci_engine: str | None = None
+    oci_image: str | None = None
+    oci_uid: int | None = None
+    oci_cpus: float = 2.0
+    oci_memory_bytes: int = 2 * 1024**3
+    oci_pids: int = 128
+    oci_disk_bytes: int = 10 * 1024**3
+    oci_seccomp_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -666,6 +678,14 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
                 load_policy(value["scope_iterate"], config_dir=path.parent.resolve())
                 if "scope_iterate" in value else None
             ),
+            oci_engine=(str(value["oci_engine"]) if "oci_engine" in value else None),
+            oci_image=(str(value["oci_image"]) if "oci_image" in value else None),
+            oci_uid=(int(value["oci_uid"]) if "oci_uid" in value else None),
+            oci_cpus=float(value.get("oci_cpus", 2)),
+            oci_memory_bytes=int(value.get("oci_memory_bytes", 2 * 1024**3)),
+            oci_pids=int(value.get("oci_pids", 128)),
+            oci_disk_bytes=int(value.get("oci_disk_bytes", 10 * 1024**3)),
+            oci_seccomp_sha256=(str(value["oci_seccomp_sha256"]) if "oci_seccomp_sha256" in value else None),
         )
         for name, value in raw.get("actions", {}).items()
     }
@@ -767,6 +787,16 @@ class Daemon:
             return False
         if self._pid_alive(record.pid):
             return True
+        if record.runner == "oci-scope-iterate":
+            action_config = self.actions.get(record.action_type)
+            if action_config is None or not action_config.oci_engine:
+                return True
+            try:
+                self._cleanup_oci_container(
+                    action_config, action_id=record.action_id, attempt_id=record.session_id,
+                )
+            except RuntimeError:
+                return True
         project = self.projects.get(record.project or "")
         released = self._takeup_release(project, record.session_id, "daemon-recovered")
         # Collect surviving commits/worktree evidence (#1115) when the
@@ -1103,7 +1133,8 @@ class Daemon:
         if action_config is None:
             self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.config.runner_id, claim_receipt=claim_receipt)
             return
-        if action_config.publish_candidate and action_config.runner != "scope-iterate":
+        scope_runners = {"scope-iterate", "oci-scope-iterate"}
+        if action_config.publish_candidate and action_config.runner not in scope_runners:
             self.client.fail(
                 action_id, reason="publication-policy: immutable candidates require scope-iterate",
                 actor=self.config.runner_id, claim_receipt=claim_receipt,
@@ -1166,6 +1197,27 @@ class Daemon:
             except RoutingError as exc:
                 self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.config.runner_id, claim_receipt=claim_receipt)
                 return
+        if action_config.runner == "oci-scope-iterate":
+            try:
+                if project is None or action_config.scope_iterate is None:
+                    raise RoutingError("runner 'oci-scope-iterate' requires project and scope_iterate policy")
+                if not self.config.context.enabled or not self.config.context.auto_claim:
+                    raise RoutingError("runner 'oci-scope-iterate' requires exact-target context claims")
+                if action.get("target_ref") is None:
+                    raise RoutingError("runner 'oci-scope-iterate' requires an exact target_ref")
+                if not action_config.command:
+                    raise RoutingError("runner 'oci-scope-iterate' requires a registered deterministic command")
+                if (not action_config.oci_engine or not action_config.oci_image
+                        or not action_config.oci_seccomp_sha256):
+                    raise RoutingError("runner 'oci-scope-iterate' requires an engine, pinned image, and seccomp digest")
+                if action_config.oci_uid != os.geteuid() or os.geteuid() == 0:
+                    raise RoutingError("rootless OCI keep-id requires the nonroot supervisor UID")
+                if (action_config.timeout_minutes or self.config.default_timeout_minutes) > 30:
+                    raise RoutingError("rootless OCI pilot timeout may not exceed 30 minutes")
+            except RoutingError as exc:
+                self.client.fail(action_id, reason=f"oci-routing: {exc}", actor=self.config.runner_id,
+                                 claim_receipt=claim_receipt)
+                return
         session_id = f"aqs:{uuid.uuid4()}"
         ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
         payload = {
@@ -1196,7 +1248,7 @@ class Daemon:
         context_result = self._context_candidates_request(project, action)
         prepared_scope: PreparedScopeIterate | None = None
         scope_result: VerificationResult | None = None
-        if action_config.runner == "scope-iterate":
+        if action_config.runner in scope_runners:
             assert project is not None and action_config.scope_iterate is not None
             try:
                 self._exact_target_item(action, context_result)
@@ -1284,7 +1336,7 @@ class Daemon:
         )
         output_path = (
             self._output_path(session_id)
-            if action_config.runner in {"command", "harness", "scope-iterate"}
+            if action_config.runner in {"command", "harness", "scope-iterate", "oci-scope-iterate"}
             else None
         )
         envelope = ExecutionEnvelope(
@@ -1295,7 +1347,7 @@ class Daemon:
             command_id=f"{action_type}:{action_config.runner}",
             allowed_paths=(
                 tuple(action_config.scope_iterate.path_acl.allow)
-                if action_config.runner == "scope-iterate" and action_config.scope_iterate is not None
+                if action_config.runner in scope_runners and action_config.scope_iterate is not None
                 else ()
             ),
         )
@@ -1438,13 +1490,68 @@ class Daemon:
                 self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.config.runner_id, claim_receipt=claim_receipt)
             if outcome not in {"claim-lost"} and settlement_error is None and hasattr(self.client, "reconcile_runner_spool"):
                 self.client.reconcile_runner_spool(action_id, attempt_id=session_id)
+            if (outcome == "completed" and settlement_error is None and publication is not None
+                    and action_config.runner == "oci-scope-iterate" and prepared_scope is not None):
+                self._destroy_oci_workspace(action_id, session_id, prepared_scope)
         except Exception as exc:
             self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.config.runner_id, claim_receipt=claim_receipt)
             raise
         finally:
             self._sprint_claim_leases.pop(session_id, None)
             self._child = None
-            self._write_state(None)
+            cleanup_ok = True
+            if action_config.runner == "oci-scope-iterate":
+                try:
+                    self._cleanup_oci_container(
+                        action_config, action_id=action_id, attempt_id=session_id,
+                    )
+                except RuntimeError as exc:
+                    cleanup_ok = False
+                    self.client.emit(
+                        "workspace.destruction_failed", action_id=action_id, actor=self.actor,
+                        payload={"attempt_id": session_id, "detail": str(exc)},
+                    )
+            if cleanup_ok:
+                self._write_state(None)
+
+    @staticmethod
+    def _oci_container_name(action_id: int, attempt_id: str) -> str:
+        digest = hashlib.sha256(f"{action_id}\0{attempt_id}".encode()).hexdigest()[:20]
+        return f"actionq-{digest}"
+
+    def _cleanup_oci_container(
+        self, action: ActionConfig, *, action_id: int, attempt_id: str,
+    ) -> None:
+        """Idempotently remove a deterministic attempt container after runner death."""
+        if not action.oci_engine:
+            raise RuntimeError("OCI cleanup requires the configured engine")
+        name = self._oci_container_name(action_id, attempt_id)
+        completed = subprocess.run(
+            [action.oci_engine, "rm", "--force", "--ignore", name],
+            text=True, capture_output=True, check=False,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr.strip() or "OCI container cleanup was not observed")
+
+    def _destroy_oci_workspace(
+        self, action_id: int, attempt_id: str, prepared: PreparedScopeIterate,
+    ) -> None:
+        """Remove only the exact supervisor-created worktree after settlement."""
+        workspace = prepared.worktree
+        root = prepared.policy.worktree_root.resolve()
+        resolved = workspace.resolve(strict=True)
+        if workspace.is_symlink() or root not in resolved.parents:
+            raise RuntimeError("refusing to destroy an untrusted OCI workspace path")
+        completed = subprocess.run(
+            ["git", "-C", str(prepared.request.repository), "worktree", "remove", "--force", str(resolved)],
+            text=True, capture_output=True, check=False,
+        )
+        if completed.returncode or resolved.exists():
+            raise RuntimeError(completed.stderr.strip() or "OCI workspace destruction was not observed")
+        self.client.emit(
+            "workspace.destroyed", action_id=action_id, actor=self.actor,
+            payload={"attempt_id": attempt_id, "workspace_destroyed": True},
+        )
 
     @staticmethod
     def _claim_ref(lease: SprintClaimLease | None) -> dict[str, Any] | None:
@@ -1687,6 +1794,47 @@ class Daemon:
             if not action.command:
                 raise RuntimeError("runner 'command' requires ActionConfig.command")
             return portable(list(action.command))
+        if action.runner == "oci-scope-iterate":
+            if (project is None or not action.command or not action.oci_engine
+                    or not action.oci_image or not action.oci_seccomp_sha256):
+                raise RuntimeError(
+                    "runner 'oci-scope-iterate' requires workspace, command, engine, image, and seccomp digest"
+                )
+            packet = {
+                "engine": action.oci_engine,
+                "image": action.oci_image,
+                "seccomp_sha256": action.oci_seccomp_sha256,
+                "envelope": envelope.as_dict(),
+                "registered_command_id": envelope.command_id,
+                "deterministic": True,
+                "command": list(action.command),
+                "workspace": str(project.path),
+                "network": "none",
+                "uid": action.oci_uid,
+                "environment": {"HOME": "/nonexistent", "LANG": "C.UTF-8", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+                "limits": {
+                    "cpus": action.oci_cpus,
+                    "memory_bytes": action.oci_memory_bytes,
+                    "pids": action.oci_pids,
+                    "disk_bytes": action.oci_disk_bytes,
+                    "timeout_seconds": (action.timeout_minutes or self.config.default_timeout_minutes) * 60,
+                },
+            }
+            output_target = output_path or self._output_path(str(envelope.attempt_id))
+            output_target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            output_stream = output_target.open("w", encoding="utf-8")
+            try:
+                child = subprocess.Popen(
+                    [self.config.runnerctl_bin, "oci-execute", "--packet-stdin"],
+                    stdin=subprocess.PIPE, stdout=output_stream, stderr=subprocess.STDOUT,
+                    text=True, start_new_session=True,
+                )
+            finally:
+                output_stream.close()
+            assert child.stdin is not None
+            child.stdin.write(json.dumps(packet, sort_keys=True))
+            child.stdin.close()
+            return child
         if action.runner in {"harness", "scope-iterate"}:
             if project is None or routing is None or prompt is None:
                 raise RuntimeError(f"runner {action.runner!r} requires project, routing, and prompt")
