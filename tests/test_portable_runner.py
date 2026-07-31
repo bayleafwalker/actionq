@@ -52,7 +52,7 @@ def test_staging_is_private_atomic_and_rejects_traversal(tmp_path: Path, monkeyp
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     attempt = staging_dir(2031, "claim-1")
     assert stat.S_IMODE(attempt.root.stat().st_mode) == 0o700
-    incoming = receive(attempt, "result.json", b"worker bytes")
+    incoming = receive(attempt, "result.json", b"worker secret bytes", redact=lambda _: b"worker bytes")
     assert incoming.read_bytes() == b"worker bytes"
     quarantined = quarantine(attempt, "result.json")
     assert quarantined.read_bytes() == b"worker bytes"
@@ -65,10 +65,12 @@ def test_staging_is_private_atomic_and_rejects_traversal(tmp_path: Path, monkeyp
         staging_dir(2031, "../escape")
     with pytest.raises(ValueError):
         seal(attempt, "../escape", b"x")
-    receive(attempt, "secret.txt", b"raw")
+    receive(attempt, "secret.txt", b"raw", redact=lambda value: value)
     quarantine(attempt, "secret.txt")
     with pytest.raises(ValueError, match="credential"):
         seal(attempt, "secret.txt", b"postgresql://secret")
+    with pytest.raises(ValueError, match="incoming"):
+        receive(attempt, "blocked.txt", b"raw", redact=lambda _: b"Authorization: Bearer secret")
 
 
 def test_gc_skips_unreconciled_and_obeys_terminal_retention(tmp_path: Path, monkeypatch):

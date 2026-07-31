@@ -9,11 +9,12 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FORBIDDEN = re.compile(
     rb"(?i)(postgres(?:ql)?://|authorization:\s*bearer|private[_ -]?key|"
-    rb"claim[_ -]?receipt|ssh_auth_sock|kubeconfig|git_askpass|provider[_ -]?token)"
+    rb"claim[_ -]?receipt(?![_ -]?digest)|ssh_auth_sock|kubeconfig|git_askpass|provider[_ -]?token)"
 )
 ACTIVE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 SEALED_RETENTION_SECONDS = 72 * 60 * 60
@@ -95,9 +96,17 @@ def _atomic_write(spool: AttemptSpool, phase: str, name: str, data: bytes) -> Pa
     return spool.root / phase / name
 
 
-def receive(spool: AttemptSpool, name: str, worker_bytes: bytes) -> Path:
-    """Receive transient worker output; it is never canonical evidence."""
-    return _atomic_write(spool, "incoming", name, worker_bytes)
+def receive(
+    spool: AttemptSpool, name: str, worker_bytes: bytes,
+    *, redact: Callable[[bytes], bytes],
+) -> Path:
+    """Redact in memory, then receive only credential-screened transient bytes."""
+    redacted = redact(worker_bytes)
+    if not isinstance(redacted, bytes):
+        raise TypeError("runner staging redactor must return bytes")
+    if _FORBIDDEN.search(redacted):
+        raise ValueError("incoming runner record contains forbidden credential material")
+    return _atomic_write(spool, "incoming", name, redacted)
 
 
 def quarantine(spool: AttemptSpool, name: str) -> Path:
