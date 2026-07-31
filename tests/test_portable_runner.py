@@ -20,6 +20,7 @@ from actionq_contracts import (
     require_compatible,
 )
 from actionq_runner.staging import collect, mark_reconciled, quarantine, receive, seal, staging_dir
+from actionq_runner.identity import sign_runner_request
 
 
 def test_contract_canonicalization_and_explicit_compatibility():
@@ -91,11 +92,13 @@ def test_installed_runner_executes_redacts_and_requires_reconciliation(tmp_path:
     state.mkdir()
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     envelope = ExecutionEnvelope(
-        EXECUTION_ENVELOPE_V1, 2031, "attempt-3", "abcdef1", "test-command",
+        EXECUTION_ENVELOPE_V1, 2031, "attempt-3", "unavailable", "test:command",
     ).as_dict()
     packet = {
         "envelope": envelope,
         "command": [sys.executable, "-c", "print('DATABASE_URL=postgresql://secret'); print('safe')"],
+        "registered_command_id": "test:command",
+        "contained_worker": False,
         "environment": {"PATH": os.environ["PATH"]},
         "grace_seconds": 0.1,
     }
@@ -110,9 +113,67 @@ def test_installed_runner_executes_redacts_and_requires_reconciliation(tmp_path:
     assert b"postgresql://secret" not in sealed
     assert b"[REDACTED]" in sealed and b"safe" in sealed
     assert collect(attempt, now=10**12) is False
+    proof = sign_runner_request(
+        Path(os.environ["ACTIONQ_RUNNER_PRIVATE_KEY"]), runner_id="runner:devbox",
+        operation="runner.spool.reconcile", resource="action:2031:attempt:attempt-3",
+        request_id="reconcile-attempt-3",
+    )
     reconciled = subprocess.run(
-        [str(binary), "reconcile", "--action-id", "2031", "--attempt-id", "attempt-3"],
+        [str(binary), "reconcile", "--proof-stdin"], input=json.dumps(proof),
         text=True, capture_output=True, check=False,
     )
     assert reconciled.returncode == 0, reconciled.stderr
     assert (attempt.root / "sealed/recovery-state.json").exists()
+
+
+def test_runner_enforces_source_commit_and_changed_path_allowlist(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("base\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, check=True, capture_output=True,
+    ).stdout.strip()
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    binary = Path(sys.executable).with_name("actionq-runner")
+    envelope = ExecutionEnvelope(
+        EXECUTION_ENVELOPE_V1, 2031, "allowlist-attempt", commit, "test:command", ("allowed/**",),
+    ).as_dict()
+    packet = {
+        "envelope": envelope, "registered_command_id": "test:command", "contained_worker": False,
+        "command": [sys.executable, "-c", "from pathlib import Path; Path('blocked.txt').write_text('x')"],
+        "cwd": str(repo), "environment": {"PATH": os.environ["PATH"]},
+    }
+    result = subprocess.run(
+        [str(binary), "execute"], input=json.dumps(packet), text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "outside the frozen allowlist" in result.stderr
+    packet["envelope"] = {**envelope, "source_commit": "0" * 40, "attempt_id": "source-attempt"}
+    result = subprocess.run(
+        [str(binary), "execute"], input=json.dumps(packet), text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "frozen source commit" in result.stderr
+
+
+def test_spool_reconcile_rejects_tampered_supervisor_proof(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    staging_dir(2031, "tamper-attempt")
+    proof = sign_runner_request(
+        Path(os.environ["ACTIONQ_RUNNER_PRIVATE_KEY"]), runner_id="runner:devbox",
+        operation="runner.spool.reconcile", resource="action:2031:attempt:tamper-attempt",
+        request_id="tamper-reconcile",
+    )
+    proof["resource"] = "action:2031:attempt:other-attempt"
+    binary = Path(sys.executable).with_name("actionq-runner")
+    result = subprocess.run(
+        [str(binary), "reconcile", "--proof-stdin"], input=json.dumps(proof),
+        text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert not (staging_dir(2031, "tamper-attempt").root / "sealed/recovery-state.json").exists()

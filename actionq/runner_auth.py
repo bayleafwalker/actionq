@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,9 @@ def _registry() -> dict[str, str]:
     registry_path = Path(path)
     if registry_path.is_symlink() or not registry_path.is_file():
         raise db.ActionQError("runner identity registry is not a regular file")
+    info = registry_path.stat()
+    if info.st_uid not in {0, os.geteuid()} or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise db.ActionQError("runner identity registry must be owner-controlled and not group/world writable")
     payload = json.loads(registry_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in payload.items()):
         raise db.ActionQError("runner identity registry must map runner ids to Ed25519 public keys")

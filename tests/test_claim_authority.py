@@ -356,11 +356,17 @@ def test_renew_cli_exits_nonzero_with_rejection_reason(
     ).output)
     assert claimed["id"] == action["id"]
 
-    ok = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:one", "--timeout", "45", "--claim-receipt", claimed["claim_receipt"]])
+    ok = runner.invoke(cli, ["renew", str(action["id"]), "--timeout", "45", "--proof-stdin"], input=json.dumps({
+        "claim_receipt": claimed["claim_receipt"],
+        "runner_proof": signed_runner_proof("worker:one", "execution.action.renew", f"action:{action['id']}"),
+    }))
     assert ok.exit_code == 0, ok.output
     assert json.loads(ok.output)["id"] == action["id"]
 
-    rejected = runner.invoke(cli, ["renew", str(action["id"]), "--worker", "worker:impostor", "--claim-receipt", claimed["claim_receipt"]])
+    rejected = runner.invoke(cli, ["renew", str(action["id"]), "--proof-stdin"], input=json.dumps({
+        "claim_receipt": claimed["claim_receipt"],
+        "runner_proof": signed_runner_proof("worker:test", "execution.action.renew", f"action:{action['id']}"),
+    }))
     assert rejected.exit_code == 2
     assert "claimed-by-different-worker" in rejected.output
 

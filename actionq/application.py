@@ -472,11 +472,20 @@ class ActionQApplication:
         self,
         *,
         action_id: int,
-        worker: str,
+        worker: str | None,
         timeout_minutes: int,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            identity = verify_runner_proof(
+                runner_proof, operation="execution.action.renew", resource=f"action:{action_id}"
+            )
+            worker = identity.runner_id
+        elif provenance is None or worker != provenance.actor:
+            raise db.ActionQError("renew requires signed runner proof or authenticated served identity")
+        assert worker is not None
         return self._mutate(
             operation="execution.action.renew",
             arguments={
@@ -502,7 +511,7 @@ class ActionQApplication:
         *,
         operation: str,
         action_id: int,
-        actor: str,
+        actor: str | None,
         arguments: dict[str, Any],
         provenance: InvocationProvenance | None,
         transition: Callable[[Any, dict[str, Any] | None], dict[str, Any]],
@@ -519,10 +528,18 @@ class ActionQApplication:
         *,
         action_id: int,
         result_ref: str,
-        actor: str,
+        actor: str | None,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            actor = verify_runner_proof(
+                runner_proof, operation="execution.action.complete", resource=f"action:{action_id}"
+            ).runner_id
+        elif provenance is None or actor != provenance.actor:
+            raise db.ActionQError("complete requires signed runner proof or authenticated served identity")
+        assert actor is not None
         return self._terminal(
             operation="execution.action.complete",
             action_id=action_id,
@@ -546,10 +563,18 @@ class ActionQApplication:
         *,
         action_id: int,
         reason: str,
-        actor: str,
+        actor: str | None,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            actor = verify_runner_proof(
+                runner_proof, operation="execution.action.fail", resource=f"action:{action_id}"
+            ).runner_id
+        elif provenance is None or actor != provenance.actor:
+            raise db.ActionQError("fail requires signed runner proof or authenticated served identity")
+        assert actor is not None
         return self._terminal(
             operation="execution.action.fail",
             action_id=action_id,
@@ -577,7 +602,15 @@ class ActionQApplication:
         actor: str,
         claim_receipt: str,
         provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
     ) -> Any:
+        if runner_proof is not None:
+            actor = verify_runner_proof(
+                runner_proof, operation="execution.action.reject", resource=f"action:{action_id}"
+            ).runner_id
+        elif provenance is None or actor != provenance.actor:
+            raise db.ActionQError("reject requires signed runner proof or authenticated served identity")
+        assert actor is not None
         return self._terminal(
             operation="execution.action.reject",
             action_id=action_id,

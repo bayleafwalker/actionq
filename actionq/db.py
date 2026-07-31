@@ -67,13 +67,16 @@ def consume_runner_request(
     lock_key = f"runner-auth:{runner_id}:{request_id}"
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
     prior = conn.execute(
-        f"""SELECT 1 FROM {qname(schema, 'events')}
+        f"""SELECT action_id, payload FROM {qname(schema, 'events')}
             WHERE event_type='runner.authenticated'
               AND payload->>'runner_id'=%s AND payload->>'request_id'=%s LIMIT 1""",
         (runner_id, request_id),
     ).fetchone()
     if prior is not None:
-        if allow_replay:
+        payload = prior["payload"]
+        if (allow_replay and payload.get("operation") == operation
+                and payload.get("resource") == resource
+                and (action_id is None or int(prior.get("action_id") or action_id) == action_id)):
             return False
         raise ActionQError("runner proof request id was already consumed")
     insert_event(

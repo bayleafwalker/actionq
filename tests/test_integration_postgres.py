@@ -72,7 +72,10 @@ def test_lifecycle_claim_complete_show(runner_env, signed_runner_proof):
 
     completed = _invoke_json(
         runner,
-        ["complete", str(action["id"]), "--result", "branch=agent/scope-iterate/1", "--actor", "worker:test", "--claim-receipt", claimed["claim_receipt"]],
+        ["complete", str(action["id"]), "--result", "branch=agent/scope-iterate/1", "--proof-stdin"],
+        input=json.dumps({"claim_receipt": claimed["claim_receipt"], "runner_proof": signed_runner_proof(
+            "worker:test", "execution.action.complete", f"action:{action['id']}"
+        )}),
     )
     assert completed["status"] == "completed"
 
@@ -130,7 +133,10 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_pr
 
     failed = _invoke_json(
         runner,
-        ["fail", str(action["id"]), "--reason", "usage-limit-paused: confirmed usage-limit signal matched", "--actor", "actionq-daemon:test", "--claim-receipt", claimed["claim_receipt"]],
+        ["fail", str(action["id"]), "--reason", "usage-limit-paused: confirmed usage-limit signal matched", "--proof-stdin"],
+        input=json.dumps({"claim_receipt": claimed["claim_receipt"], "runner_proof": signed_runner_proof(
+            "actionq-daemon:test", "execution.action.fail", f"action:{action['id']}"
+        )}),
     )
     assert failed["status"] == "failed"
 

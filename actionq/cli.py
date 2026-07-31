@@ -148,11 +148,10 @@ def claim(ctx, proof_stdin: bool, timeout_minutes: int) -> None:
 
 @cli.command()
 @click.argument("action_id", type=int)
-@click.option("--worker", required=True, help="Worker identity; must match the current claimant")
 @click.option("--timeout", "timeout_minutes", default=30, type=int, show_default=True)
-@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
+@click.option("--proof-stdin", is_flag=True, required=True, help="Read signed runner proof and claim receipt from stdin")
 @click.pass_context
-def renew(ctx, action_id: int, worker: str, timeout_minutes: int, claim_receipt: str) -> None:
+def renew(ctx, action_id: int, timeout_minutes: int, proof_stdin: bool) -> None:
     """Renew (extend) a claim's deadline as an authority command.
 
     Exits non-zero with the durable rejection reason for a stale or
@@ -161,12 +160,13 @@ def renew(ctx, action_id: int, worker: str, timeout_minutes: int, claim_receipt:
     claim_renewal_rejected event is still recorded for the caller to read
     back via `show`/`events`.
     """
+    proof = json.load(sys.stdin)
     try:
         action = _app(ctx).renew(
             action_id=action_id,
-            worker=worker,
+            worker=None,
             timeout_minutes=timeout_minutes,
-            claim_receipt=claim_receipt,
+            claim_receipt=str(proof["claim_receipt"]), runner_proof=dict(proof["runner_proof"]),
         )
     except db.ClaimRejected as exc:
         click.echo(str(exc), err=True)
@@ -177,14 +177,14 @@ def renew(ctx, action_id: int, worker: str, timeout_minutes: int, claim_receipt:
 @cli.command()
 @click.argument("action_id", type=int)
 @click.option("--result", "result_ref", required=True)
-@click.option("--actor", required=True, help="Current claimant identity")
-@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
+@click.option("--proof-stdin", is_flag=True, required=True)
 @click.pass_context
-def complete(ctx, action_id: int, result_ref: str, actor: str, claim_receipt: str) -> None:
+def complete(ctx, action_id: int, result_ref: str, proof_stdin: bool) -> None:
+    proof = json.load(sys.stdin)
     action = _app(ctx).complete(
         action_id=action_id,
         result_ref=result_ref,
-        actor=actor, claim_receipt=claim_receipt,
+        actor=None, claim_receipt=str(proof["claim_receipt"]), runner_proof=dict(proof["runner_proof"]),
     )
     _echo_json(action)
 
@@ -192,14 +192,14 @@ def complete(ctx, action_id: int, result_ref: str, actor: str, claim_receipt: st
 @cli.command()
 @click.argument("action_id", type=int)
 @click.option("--reason", required=True)
-@click.option("--actor", required=True, help="Current claimant identity")
-@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
+@click.option("--proof-stdin", is_flag=True, required=True)
 @click.pass_context
-def fail(ctx, action_id: int, reason: str, actor: str, claim_receipt: str) -> None:
+def fail(ctx, action_id: int, reason: str, proof_stdin: bool) -> None:
+    proof = json.load(sys.stdin)
     action = _app(ctx).fail(
         action_id=action_id,
         reason=reason,
-        actor=actor, claim_receipt=claim_receipt,
+        actor=None, claim_receipt=str(proof["claim_receipt"]), runner_proof=dict(proof["runner_proof"]),
     )
     _echo_json(action)
 
@@ -208,15 +208,15 @@ def fail(ctx, action_id: int, reason: str, actor: str, claim_receipt: str) -> No
 @click.argument("action_id", type=int)
 @click.option("--reason", required=True)
 @click.option("--validator", required=True)
-@click.option("--actor", required=True, help="Current claimant identity")
-@click.option("--claim-receipt", required=True, help="Opaque receipt from the current claim")
+@click.option("--proof-stdin", is_flag=True, required=True)
 @click.pass_context
-def reject(ctx, action_id: int, reason: str, validator: str, actor: str, claim_receipt: str) -> None:
+def reject(ctx, action_id: int, reason: str, validator: str, proof_stdin: bool) -> None:
+    proof = json.load(sys.stdin)
     action = _app(ctx).reject(
         action_id=action_id,
         reason=reason,
         validator=validator,
-        actor=actor, claim_receipt=claim_receipt,
+        actor=None, claim_receipt=str(proof["claim_receipt"]), runner_proof=dict(proof["runner_proof"]),
     )
     _echo_json(action)
 

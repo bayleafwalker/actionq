@@ -82,3 +82,39 @@ def test_unregistered_signed_runner_is_rejected(monkeypatch, actionq_cli_runner,
     result = runner.invoke(cli, ["claim", "--proof-stdin"], input=json.dumps(proof))
     assert result.exit_code != 0
     assert "not registered" in result.output
+
+
+def test_runner_registry_rejects_group_writable_file(
+    monkeypatch, runner_identity, actionq_cli_runner, signed_runner_proof,
+):
+    schema = _schema()
+    monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
+    runner = actionq_cli_runner
+    assert runner.invoke(cli, ["migrate"]).exit_code == 0
+    runner_identity["registry"].chmod(0o664)
+    try:
+        proof = signed_runner_proof("worker:one", "execution.action.claim", "queue:next")
+        result = runner.invoke(cli, ["claim", "--proof-stdin"], input=json.dumps(proof))
+        assert result.exit_code != 0
+        assert "owner-controlled" in result.output
+    finally:
+        runner_identity["registry"].chmod(0o644)
+
+
+def test_ack_replay_is_bound_to_exact_operation_and_resource(signed_runner_proof):
+    schema = _schema()
+    with db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"]) as migration:
+        db.migrate(migration, schema)
+    with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
+        proof = signed_runner_proof("worker:one", "execution.action.cancel-ack", "action:1:cancel:first")
+        db.consume_runner_request(
+            conn, schema, runner_id="worker:one", request_id=proof["request_id"],
+            operation="execution.action.cancel-ack", resource="action:1:cancel:first",
+            action_id=None,
+        )
+        with pytest.raises(db.ActionQError, match="already consumed"):
+            db.consume_runner_request(
+                conn, schema, runner_id="worker:one", request_id=proof["request_id"],
+                operation="execution.action.cancel-ack", resource="action:1:cancel:other",
+                action_id=None, allow_replay=True,
+            )

@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import pwd
 import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -112,6 +113,7 @@ class DaemonConfig:
     runnerctl_bin: str = "actionq-runner"
     runner_private_key_path: Path = Path("~/.local/state/actionq/runner-identity.pem")
     runner_id: str = "runner:devbox"
+    enforce_worker_isolation: bool = True
     takeup: TakeupConfig = TakeupConfig()
     audit: AuditConfig = AuditConfig()
     context: ContextConfig = ContextConfig()
@@ -291,7 +293,9 @@ class ActionctlClient:
         return result
 
     def renew(self, action_id: int, *, worker: str, timeout_minutes: int, claim_receipt: str) -> None:
-        self._run("renew", str(action_id), "--worker", worker, "--timeout", str(timeout_minutes), "--claim-receipt", claim_receipt)
+        proof = self._proof(runner_id=worker, operation="execution.action.renew", resource=f"action:{action_id}")
+        self._run("renew", str(action_id), "--timeout", str(timeout_minutes), "--proof-stdin",
+                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
 
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None:
         args = ["emit", "--type", event_type, "--actor", actor, "--payload", json.dumps(payload, sort_keys=True)]
@@ -300,10 +304,14 @@ class ActionctlClient:
         self._run(*args)
 
     def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None:
-        self._run("complete", str(action_id), "--result", result_ref, "--actor", actor, "--claim-receipt", claim_receipt)
+        proof = self._proof(runner_id=actor, operation="execution.action.complete", resource=f"action:{action_id}")
+        self._run("complete", str(action_id), "--result", result_ref, "--proof-stdin",
+                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
 
     def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
-        self._run("fail", str(action_id), "--reason", reason, "--actor", actor, "--claim-receipt", claim_receipt)
+        proof = self._proof(runner_id=actor, operation="execution.action.fail", resource=f"action:{action_id}")
+        self._run("fail", str(action_id), "--reason", reason, "--proof-stdin",
+                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
 
     def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
                                  former_claim_receipt: str, runner_auth_token: str) -> None:
@@ -321,9 +329,15 @@ class ActionctlClient:
         )
 
     def reconcile_runner_spool(self, action_id: int, *, attempt_id: str) -> None:
+        if self.runner_id is None:
+            raise RuntimeError("runner identity was not established by a claim")
+        proof = self._proof(
+            runner_id=self.runner_id, operation="runner.spool.reconcile",
+            resource=f"action:{action_id}:attempt:{attempt_id}",
+        )
         completed = subprocess.run(
-            [self.runnerctl, "reconcile", "--action-id", str(action_id),
-             "--attempt-id", attempt_id], text=True, capture_output=True, check=False,
+            [self.runnerctl, "reconcile", "--proof-stdin"], input=json.dumps(proof),
+            text=True, capture_output=True, check=False,
         )
         if completed.returncode:
             raise RuntimeError(completed.stderr.strip() or "runner spool reconciliation failed")
@@ -558,6 +572,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             "runner_private_key_path", DaemonConfig.runner_private_key_path
         )).expanduser(),
         runner_id=str(global_raw.get("runner_id", "runner:devbox")),
+        enforce_worker_isolation=bool(global_raw.get("enforce_worker_isolation", True)),
         takeup=TakeupConfig(
             enabled=bool(takeup_raw.get("enabled", False)),
             remote_only=bool(takeup_raw.get("remote_only", True)),
@@ -799,6 +814,15 @@ class Daemon:
                 )
                 if project is None:
                     raise RoutingError(f"runner {action_config.runner!r} requires a configured project worktree")
+                if self.config.enforce_worker_isolation:
+                    if action_config.worker_user is None:
+                        raise RoutingError(f"runner {action_config.runner!r} requires a distinct worker_user")
+                    try:
+                        worker_uid = pwd.getpwnam(action_config.worker_user).pw_uid
+                    except KeyError as exc:
+                        raise RoutingError("configured worker_user does not exist") from exc
+                    if worker_uid == os.geteuid():
+                        raise RoutingError("worker_user must differ from the trusted supervisor identity")
                 if action_config.runner == "harness" and not (action.get("prompt") or action_config.prompt):
                     raise RoutingError("runner 'harness' requires an explicit or action-class prompt")
                 if action_config.runner == "scope-iterate":
@@ -950,7 +974,11 @@ class Daemon:
             attempt_id=session_id,
             source_commit=base_commit or "unavailable",
             command_id=f"{action_type}:{action_config.runner}",
-            allowed_paths=(),
+            allowed_paths=(
+                tuple(action_config.scope_iterate.path_acl.allow)
+                if action_config.runner == "scope-iterate" and action_config.scope_iterate is not None
+                else ()
+            ),
         )
         require_compatible(envelope.as_dict())
         self.client.emit(
@@ -1294,6 +1322,8 @@ class Daemon:
             packet = {
                 "envelope": envelope.as_dict(), "command": command,
                 "cwd": str(cwd) if cwd else None, "environment": clean_env,
+                "registered_command_id": envelope.command_id,
+                "contained_worker": self.config.enforce_worker_isolation,
                 "stdin": stdin_text, "output_path": str(output_path) if output_path else None,
                 # Leave the outer coordinator enough time to observe the
                 # runner's waitpid after the runner escalates its child.

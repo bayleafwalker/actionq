@@ -77,6 +77,7 @@ def _daemon(
         },
     )
     config = DaemonConfig(
+        enforce_worker_isolation=False,
         session_state_path=tmp_path / "state.json",
         pause_file=tmp_path / "PAUSED",
         handoff_dir=tmp_path / "handoff",
@@ -247,7 +248,7 @@ def test_scope_iterate_worker_runs_through_contained_identity(tmp_path: Path, mo
     from actionq_contracts import EXECUTION_ENVELOPE_V1, ExecutionEnvelope
     daemon._start_child(
         action, project=project, routing=routing, prompt="work",
-        envelope=ExecutionEnvelope(EXECUTION_ENVELOPE_V1, 1, "attempt-1", "abcdef1", "test"),
+        envelope=ExecutionEnvelope(EXECUTION_ENVELOPE_V1, 1, "attempt-1", "abcdef1", "test:harness"),
     )
 
     assert captured["command"] == ["actionq-runner", "execute"]

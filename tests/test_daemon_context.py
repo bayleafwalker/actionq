@@ -197,8 +197,9 @@ def test_scope_iterate_claims_exact_target_branch_and_settles_verified_commit(tm
     )
     claim = FakeClaim()
     daemon = Daemon(
-        DaemonConfig(
-            heartbeat_interval_seconds=0.01,
+            DaemonConfig(
+                heartbeat_interval_seconds=0.01,
+                enforce_worker_isolation=False,
             session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
             context=ContextConfig(enabled=True),
             routing=RoutingContext(harnesses={"codex": HarnessRoute("codex")}),
@@ -257,7 +258,8 @@ def test_scope_iterate_rejects_context_target_mismatch_before_claim(tmp_path: Pa
     context = FakeContext(_packet(explicit_item_id=6, found=True, eligible_rank1=True))
     claim = FakeClaim()
     daemon = Daemon(
-        DaemonConfig(
+            DaemonConfig(
+                enforce_worker_isolation=False,
             session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
             context=ContextConfig(enabled=True),
             routing=RoutingContext(harnesses={"codex": HarnessRoute("codex")}),
