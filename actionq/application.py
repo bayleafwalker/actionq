@@ -323,7 +323,7 @@ class ActionQApplication:
                         elif operation.startswith("execution.action.") or operation == (
                             "execution.dispatch.enqueue"
                         ):
-                            result_id = result.get("id")
+                            result_id = result.get("id", result.get("action_id"))
                             if isinstance(result_id, int):
                                 action_id = result_id
                 except db.ClaimRejected as error:
@@ -411,6 +411,37 @@ class ActionQApplication:
                 priority=priority,
                 parent_id=parent_id,
                 created_by=created_by,
+                provenance=event_provenance,
+            ),
+        )
+
+    def create_immutable_action(
+        self,
+        *,
+        request: dict[str, Any],
+        spec: dict[str, Any],
+        input_refs: list[str],
+        project: str | None,
+        priority: int,
+        created_by: str,
+        provenance: InvocationProvenance | None = None,
+    ) -> Any:
+        """Persist a compiler-frozen candidate action as an ordinary action."""
+        if provenance is not None:
+            self._authorize(provenance, "execution.candidate-action.create", "create")
+        role = request.get("role") if isinstance(request, dict) else None
+        if role not in {"candidate-verification", "candidate-integration", "candidate-review"}:
+            raise db.ActionQError("immutable candidate action role is invalid")
+        arguments = {
+            "request": request, "spec": spec, "input_refs": input_refs, "project": project,
+            "priority": priority, "created_by": created_by,
+        }
+        return self._mutate(
+            operation="execution.action.create-immutable-candidate", arguments=arguments,
+            provenance=provenance,
+            mutation=lambda conn, event_provenance: db.create_immutable_action(
+                conn, self.schema, request=request, spec=spec, input_refs=input_refs,
+                action_type=role, project=project, priority=priority, created_by=created_by,
                 provenance=event_provenance,
             ),
         )

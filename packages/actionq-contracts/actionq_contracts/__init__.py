@@ -1,15 +1,21 @@
 """Versioned portable execution contracts shared by ActionQ and its runner."""
 
 from .execution import (
+    ACTION_CREATION_REQUEST_V1, CANDIDATE_INTEGRATION_RESULT_V1,
+    CANDIDATE_INTEGRATION_SPEC_V1, CANDIDATE_REVIEW_RESULT_V1,
+    CANDIDATE_REVIEW_SPEC_V1, CANDIDATE_VERIFICATION_RESULT_V1,
+    CANDIDATE_VERIFICATION_SPEC_V1,
     CANDIDATE_V1, CLAIM_V1, EXECUTION_ENVELOPE_V1, EXECUTION_V1,
-    PUBLICATION_V1, RUNNER_AUTH_V1, SUPPORTED_CONTRACT_IDS, VERIFICATION_V1, Candidate, Claim,
+    PUBLICATION_V1, RUNNER_AUTH_V1, SUPPORTED_CONTRACT_IDS, VERIFICATION_PROFILE_V1, VERIFICATION_V1, Candidate, Claim,
     ContractRecord, Execution, ExecutionEnvelope, Publication, RunnerAuth, Verification,
-    canonical_bytes, require_compatible, sha256_digest,
+    artifact_digest, canonical_bytes, require_compatible, sha256_digest,
 )
 
 __all__ = [
-    "CANDIDATE_V1", "CLAIM_V1", "EXECUTION_ENVELOPE_V1", "EXECUTION_V1",
-    "PUBLICATION_V1", "RUNNER_AUTH_V1", "SUPPORTED_CONTRACT_IDS", "VERIFICATION_V1", "Candidate", "Claim",
+    "ACTION_CREATION_REQUEST_V1", "CANDIDATE_INTEGRATION_RESULT_V1", "CANDIDATE_INTEGRATION_SPEC_V1",
+    "CANDIDATE_REVIEW_RESULT_V1", "CANDIDATE_REVIEW_SPEC_V1", "CANDIDATE_VERIFICATION_RESULT_V1",
+    "CANDIDATE_VERIFICATION_SPEC_V1", "CANDIDATE_V1", "CLAIM_V1", "EXECUTION_ENVELOPE_V1", "EXECUTION_V1",
+    "PUBLICATION_V1", "RUNNER_AUTH_V1", "SUPPORTED_CONTRACT_IDS", "VERIFICATION_PROFILE_V1", "VERIFICATION_V1", "Candidate", "Claim",
     "ContractRecord", "Execution", "ExecutionEnvelope", "Publication", "RunnerAuth", "Verification",
-    "canonical_bytes", "require_compatible", "sha256_digest",
+    "artifact_digest", "canonical_bytes", "require_compatible", "sha256_digest",
 ]

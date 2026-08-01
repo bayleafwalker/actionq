@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from actionq_contracts import (
+    ACTION_CREATION_REQUEST_V1,
     EXECUTION_ENVELOPE_V1, canonical_bytes as contract_canonical_bytes,
     require_compatible as require_contract_compatible, sha256_digest as contract_digest,
 )
@@ -99,6 +100,145 @@ def consume_runner_request(
 _ARTIFACT_REF_RE = re.compile(r"^artifact:sha256:[0-9a-f]{64}$")
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_IMMUTABLE_REF_RE = re.compile(r"^artifact:sha256:[0-9a-f]{64}$")
+_IMMUTABLE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IMMUTABLE_ROLE_CONTRACTS = {
+    "candidate-verification": "candidate-verification-spec/v1",
+    "candidate-integration": "candidate-integration-spec/v1",
+    "candidate-review": "candidate-review-spec/v1",
+}
+
+
+def immutable_input_set_digest(inputs: list[str]) -> str:
+    """Digest the compiler's ordered immutable input set.
+
+    Order is significant: wave integration is bound to the frozen execution
+    group ordinal order, so sorting here would silently alter its semantics.
+    """
+    if not isinstance(inputs, list) or not inputs:
+        raise ActionQError("immutable input set must be a non-empty ordered list")
+    if any(not isinstance(item, str) or not _IMMUTABLE_REF_RE.fullmatch(item) for item in inputs):
+        raise ActionQError("immutable input set contains an invalid artifact reference")
+    if len(inputs) != len(set(inputs)):
+        raise ActionQError("immutable input set entries must be unique")
+    return contract_digest({"contract_id": "immutable-input-set/v1", "inputs": inputs})
+
+
+def _immutable_snapshot(value: dict[str, Any], *, expected_contract: str | None = None) -> tuple[bytes, str]:
+    try:
+        actual = require_contract_compatible(value)
+    except (TypeError, ValueError) as exc:
+        raise ActionQError(f"invalid immutable contract: {exc}") from exc
+    if expected_contract is not None and actual != expected_contract:
+        raise ActionQError(f"expected immutable contract {expected_contract}")
+    raw = contract_canonical_bytes(value)
+    return raw, contract_digest(value)
+
+
+def immutable_spec_input_refs(spec: dict[str, Any]) -> list[str]:
+    """Return the sole ordered input set admitted by one frozen spec."""
+    contract = require_contract_compatible(spec)
+    if contract == "candidate-verification-spec/v1":
+        return [spec["candidate_ref"], spec["profile_ref"], spec["publication_ref"]]
+    if contract == "candidate-integration-spec/v1":
+        return list(spec["member_result_refs"])
+    if contract == "candidate-review-spec/v1":
+        return [spec["candidate_ref"], spec["verification_result_ref"], spec["publication_ref"]]
+    raise ActionQError("immutable action spec contract is unsupported")
+
+
+def create_immutable_action(
+    conn,
+    schema: str,
+    *,
+    request: dict[str, Any],
+    spec: dict[str, Any],
+    input_refs: list[str],
+    action_type: str,
+    project: str | None,
+    priority: int,
+    created_by: str,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create one ordinary action from an exact compiler request.
+
+    PostgreSQL stores both canonical request and spec bytes.  A CAS locator is
+    checked as an identity claim but never read or treated as a second source
+    of truth.  Logical replay returns the original action only for byte-identical
+    input; changed bytes under the same plan/role/subject conflict before any
+    action is enqueued.
+    """
+    request_raw, request_digest = _immutable_snapshot(
+        request, expected_contract=ACTION_CREATION_REQUEST_V1,
+    )
+    expected_contract = _IMMUTABLE_ROLE_CONTRACTS.get(request["role"])
+    if expected_contract is None or action_type != request["role"]:
+        raise ActionQError("immutable action role must equal the ordinary action type")
+    spec_raw, spec_digest = _immutable_snapshot(spec, expected_contract=expected_contract)
+    if request["spec_digest"] != spec_digest or request["spec_ref"] != "artifact:" + spec_digest:
+        raise ActionQError("immutable action request does not bind exact spec bytes")
+    if request["role"] == "candidate-integration" and request["topology"] != spec["topology"]:
+        raise ActionQError("integration request topology must equal the exact spec topology")
+    expected_spec_inputs = immutable_spec_input_refs(spec)
+    if input_refs != expected_spec_inputs:
+        raise ActionQError("immutable action input refs must equal the exact ordered spec inputs")
+    expected_inputs = immutable_input_set_digest(expected_spec_inputs)
+    if request["input_set_digest"] != expected_inputs:
+        raise ActionQError("immutable action request input_set_digest mismatch")
+    request_ref = "artifact:" + request_digest
+    if not _IMMUTABLE_REF_RE.fullmatch(request_ref):
+        raise ActionQError("immutable action request digest is invalid")
+    with conn.transaction():
+        lock = "\x1f".join(("immutable-action", request["plan_ref"], request["topology"], request["role"], request["subject"]))
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock,))
+        prior = conn.execute(
+            f"""SELECT r.*, a.status FROM {qname(schema, 'immutable_action_requests')} r
+                 JOIN {qname(schema, 'actions')} a ON a.id=r.action_id
+                 WHERE r.plan_ref=%s AND r.topology=%s AND r.role=%s AND r.subject=%s""",
+            (request["plan_ref"], request["topology"], request["role"], request["subject"]),
+        ).fetchone()
+        if prior is not None:
+            if bytes(prior["request_snapshot"]) != request_raw:
+                raise ActionQError("immutable action logical identity conflicts with different request bytes")
+            return {
+                "action_id": int(prior["action_id"]), "status": prior["status"],
+                "request_ref": prior["request_ref"], "request_digest": prior["request_digest"],
+                "replayed": True,
+            }
+        spec_prior = conn.execute(
+            f"SELECT spec_digest, spec_snapshot FROM {qname(schema, 'immutable_action_specs')} WHERE spec_ref=%s",
+            (request["spec_ref"],),
+        ).fetchone()
+        if spec_prior is None:
+            conn.execute(
+                f"INSERT INTO {qname(schema, 'immutable_action_specs')} (spec_ref, spec_digest, spec_snapshot) VALUES (%s,%s,%s)",
+                (request["spec_ref"], spec_digest, spec_raw),
+            )
+        elif spec_prior["spec_digest"] != spec_digest or bytes(spec_prior["spec_snapshot"]) != spec_raw:
+            raise ActionQError("immutable spec reference conflicts with different bytes")
+        action = enqueue(
+            conn, schema, action_type=action_type, project=project, target_ref=request["subject"],
+            source_refs=list(input_refs), priority=priority, parent_id=None, created_by=created_by,
+            provenance=provenance,
+        )
+        conn.execute(
+            f"""INSERT INTO {qname(schema, 'immutable_action_requests')}
+                (action_id, request_ref, request_digest, request_snapshot, plan_ref, topology, role, subject,
+                 spec_ref, spec_digest, input_set_digest)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (action["id"], request_ref, request_digest, request_raw, request["plan_ref"], request["topology"],
+             request["role"], request["subject"], request["spec_ref"], spec_digest, expected_inputs),
+        )
+        insert_event(
+            conn, schema, action_id=action["id"], event_type="immutable_action.created", actor=created_by,
+            payload=event_payload_with_provenance({
+                "request_ref": request_ref, "request_digest": request_digest, "spec_ref": request["spec_ref"],
+                "spec_digest": spec_digest, "input_set_digest": expected_inputs, "role": request["role"],
+                "topology": request["topology"], "subject": request["subject"],
+            }, provenance),
+        )
+    return {"action_id": int(action["id"]), "status": "pending", "request_ref": request_ref,
+            "request_digest": request_digest, "replayed": False}
 
 
 def register_publication(
@@ -911,6 +1051,79 @@ def action_events(conn, schema: str, action_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _validate_immutable_claim(conn, schema: str, action_id: int) -> dict[str, Any] | None:
+    """Return an immutable runtime grant only after byte-level revalidation."""
+    request_row = conn.execute(
+        f"SELECT * FROM {qname(schema, 'immutable_action_requests')} WHERE action_id=%s",
+        (action_id,),
+    ).fetchone()
+    if request_row is None:
+        return None
+    action_row = conn.execute(
+        f"SELECT action_type, target_ref, source_refs FROM {qname(schema, 'actions')} WHERE id=%s",
+        (action_id,),
+    ).fetchone()
+    if action_row is None:
+        raise ActionQError("immutable action is missing its ordinary action row")
+    spec_row = conn.execute(
+        f"SELECT * FROM {qname(schema, 'immutable_action_specs')} WHERE spec_ref=%s",
+        (request_row["spec_ref"],),
+    ).fetchone()
+    if spec_row is None:
+        raise ActionQError("immutable action request references a missing spec")
+    try:
+        request_value = json.loads(bytes(request_row["request_snapshot"]).decode("utf-8"))
+        spec_value = json.loads(bytes(spec_row["spec_snapshot"]).decode("utf-8"))
+        request_raw, request_digest = _immutable_snapshot(request_value, expected_contract=ACTION_CREATION_REQUEST_V1)
+        expected_contract = _IMMUTABLE_ROLE_CONTRACTS.get(request_value["role"])
+        if expected_contract is None:
+            raise ActionQError("immutable action role is invalid")
+        spec_raw, spec_digest = _immutable_snapshot(spec_value, expected_contract=expected_contract)
+    except (UnicodeDecodeError, json.JSONDecodeError, ActionQError) as exc:
+        raise ActionQError("immutable action request bytes are invalid") from exc
+    if (
+        request_raw != bytes(request_row["request_snapshot"])
+        or spec_raw != bytes(spec_row["spec_snapshot"])
+        or request_digest != request_row["request_digest"]
+        or spec_digest != spec_row["spec_digest"]
+        or request_value["spec_ref"] != request_row["spec_ref"]
+        or request_value["spec_digest"] != request_row["spec_digest"]
+        or request_value["input_set_digest"] != request_row["input_set_digest"]
+        or "artifact:" + request_digest != request_row["request_ref"]
+        or action_row["action_type"] != request_value["role"]
+        or action_row["target_ref"] != request_value["subject"]
+        or list(action_row["source_refs"]) != immutable_spec_input_refs(spec_value)
+        or request_value["input_set_digest"] != immutable_input_set_digest(immutable_spec_input_refs(spec_value))
+        or (request_value["role"] == "candidate-integration" and request_value["topology"] != spec_value["topology"])
+    ):
+        raise ActionQError("immutable action request failed claim-time integrity validation")
+    grant = {
+        "contract_id": "immutable-action-runtime-grant/v1", "action_id": action_id,
+        "request_digest": request_digest, "spec_digest": spec_digest,
+        "input_set_digest": request_row["input_set_digest"],
+    }
+    grant_digest = contract_digest(grant)
+    prior = conn.execute(
+        f"SELECT * FROM {qname(schema, 'immutable_action_runtime_grants')} WHERE action_id=%s",
+        (action_id,),
+    ).fetchone()
+    if prior is None:
+        conn.execute(
+            f"""INSERT INTO {qname(schema, 'immutable_action_runtime_grants')}
+                (action_id, request_digest, spec_digest, input_set_digest, grant_digest)
+                VALUES (%s,%s,%s,%s,%s)""",
+            (action_id, request_digest, spec_digest, request_row["input_set_digest"], grant_digest),
+        )
+    elif (
+        prior["request_digest"] != request_digest or prior["spec_digest"] != spec_digest
+        or prior["input_set_digest"] != request_row["input_set_digest"] or prior["grant_digest"] != grant_digest
+    ):
+        raise ActionQError("immutable action runtime grant conflicts with request bytes")
+    return {"request_ref": request_row["request_ref"], "request_digest": request_digest,
+            "spec_ref": request_row["spec_ref"], "spec_digest": spec_digest,
+            "input_set_digest": request_row["input_set_digest"], "grant_digest": grant_digest}
+
+
 def claim(
     conn,
     schema: str,
@@ -948,6 +1161,7 @@ def claim(
         row = None
         selected = None
         selected_envelope = None
+        selected_immutable_grant = None
 
         class SkipClaimCandidate(Exception):
             pass
@@ -1001,6 +1215,7 @@ def claim(
                             or contract_canonical_bytes(envelope) != bytes(snapshot)
                         ):
                             raise ActionQError("stored execution group envelope failed integrity validation")
+                    immutable_grant = _validate_immutable_claim(conn, schema, int(candidate["id"]))
                     row = conn.execute(
                         f"""UPDATE {qname(schema, 'actions')}
                             SET status='claimed', claimed_at=now(), claimed_by=%s,
@@ -1016,6 +1231,7 @@ def claim(
             if row is not None:
                 selected = candidate
                 selected_envelope = envelope
+                selected_immutable_grant = immutable_grant
                 break
         if row is None:
             raise NoActionAvailable("no pending actions")
@@ -1040,6 +1256,8 @@ def claim(
         result["execution_group_id"] = str(selected["group_id"])
         result["execution_envelope_digest"] = selected["envelope_digest"]
         result["execution_envelope"] = selected_envelope
+    if selected is not None and selected_immutable_grant is not None:
+        result["immutable_runtime_grant"] = selected_immutable_grant
     return result
 
 

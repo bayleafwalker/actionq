@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 5
+MAX_SCHEMA_VERSION = 6
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
@@ -94,6 +94,34 @@ _COLUMN_SHAPE = {
         "envelope_digest": ("text", "NO", None),
         "envelope_snapshot": ("bytea", "NO", None),
     },
+    "immutable_action_specs": {
+        "spec_ref": ("text", "NO", None),
+        "spec_digest": ("text", "NO", None),
+        "spec_snapshot": ("bytea", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "immutable_action_requests": {
+        "action_id": ("bigint", "NO", None),
+        "request_ref": ("text", "NO", None),
+        "request_digest": ("text", "NO", None),
+        "request_snapshot": ("bytea", "NO", None),
+        "plan_ref": ("text", "NO", None),
+        "topology": ("text", "NO", None),
+        "role": ("text", "NO", None),
+        "subject": ("text", "NO", None),
+        "spec_ref": ("text", "NO", None),
+        "spec_digest": ("text", "NO", None),
+        "input_set_digest": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "immutable_action_runtime_grants": {
+        "action_id": ("bigint", "NO", None),
+        "request_digest": ("text", "NO", None),
+        "spec_digest": ("text", "NO", None),
+        "input_set_digest": ("text", "NO", None),
+        "grant_digest": ("text", "NO", None),
+        "issued_at": ("timestamp with time zone", "NO", "now()"),
+    },
 }
 _REQUIRED_COLUMNS = {
     table: set(columns) for table, columns in _COLUMN_SHAPE.items()
@@ -104,6 +132,9 @@ _REQUIRED_CONSTRAINT_COUNTS = {
     "dispatch_requests": {"p": 1, "f": 1, "u": 2, "c": 3},
     "execution_groups": {"p": 1, "u": 2, "c": 3},
     "execution_group_members": {"p": 1, "f": 2, "u": 2, "c": 1},
+    "immutable_action_specs": {"p": 1, "u": 1, "c": 3},
+    "immutable_action_requests": {"p": 1, "f": 2, "u": 3, "c": 5},
+    "immutable_action_runtime_grants": {"p": 1, "f": 1, "c": 4},
 }
 _REQUIRED_INDEXES = {
     "actions.claim-lookup": (
@@ -133,6 +164,9 @@ _REQUIRED_INDEXES = {
     ),
     "execution-group-members.action": (
         "execution_group_members", (("action_id", False, False),), None,
+    ),
+    "immutable-action-requests.created": (
+        "immutable_action_requests", (("created_at", False, False), ("action_id", False, False)), None,
     ),
 }
 
@@ -643,6 +677,31 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
             "execution-group-members-ordinal-unique",
             has_constraint("execution_group_members", "u", ("group_id", "ordinal")),
         ),
+        ("immutable-action-specs-primary-key", has_constraint("immutable_action_specs", "p", ("spec_ref",))),
+        ("immutable-action-specs-digest-unique", has_constraint("immutable_action_specs", "u", ("spec_digest",))),
+        ("immutable-action-requests-primary-key", has_constraint("immutable_action_requests", "p", ("action_id",))),
+        (
+            "immutable-action-requests-action-foreign-key",
+            has_constraint("immutable_action_requests", "f", ("action_id",),
+                           foreign_namespace=schema, foreign_table="actions",
+                           foreign_oid=table_oids.get("actions"), foreign_columns=("id",), delete_action="r"),
+        ),
+        (
+            "immutable-action-requests-spec-foreign-key",
+            has_constraint("immutable_action_requests", "f", ("spec_ref",),
+                           foreign_namespace=schema, foreign_table="immutable_action_specs",
+                           foreign_oid=table_oids.get("immutable_action_specs"), foreign_columns=("spec_ref",), delete_action="r"),
+        ),
+        ("immutable-action-requests-request-ref-unique", has_constraint("immutable_action_requests", "u", ("request_ref",))),
+        ("immutable-action-requests-request-digest-unique", has_constraint("immutable_action_requests", "u", ("request_digest",))),
+        ("immutable-action-requests-logical-identity-unique", has_constraint("immutable_action_requests", "u", ("plan_ref", "topology", "role", "subject"))),
+        ("immutable-action-runtime-grants-primary-key", has_constraint("immutable_action_runtime_grants", "p", ("action_id",))),
+        (
+            "immutable-action-runtime-grants-action-foreign-key",
+            has_constraint("immutable_action_runtime_grants", "f", ("action_id",),
+                           foreign_namespace=schema, foreign_table="actions",
+                           foreign_oid=table_oids.get("actions"), foreign_columns=("id",), delete_action="r"),
+        ),
     )
     for name, present in required_constraints:
         if not present:
@@ -838,6 +897,12 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
         "constraint-missing-or-invalid:execution_groups.",
         "constraint-missing-or-invalid:execution_group_members.",
         "index-missing-or-invalid:execution-group-members.",
+        "column-missing:immutable_action_specs.",
+        "column-missing:immutable_action_requests.",
+        "column-missing:immutable_action_runtime_grants.",
+        "constraint-missing-or-invalid:immutable-action-",
+        "constraint-missing-or-invalid:immutable_action_",
+        "index-missing-or-invalid:immutable-action-requests.",
     )
     return [
         issue for issue in issues
@@ -1016,6 +1081,19 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
             schema_identifier, sql.Identifier("execution_group_members"), role_identifier
         )
     )
+    # Immutable compiler records are append-only. Runtime claim validation
+    # reads the canonical bytes and may create a first runtime grant, but it
+    # cannot rewrite either a request/spec binding or a grant.
+    for table in (
+        "immutable_action_specs",
+        "immutable_action_requests",
+        "immutable_action_runtime_grants",
+    ):
+        conn.execute(
+            sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+                schema_identifier, sql.Identifier(table), role_identifier
+            )
+        )
     conn.execute(
         sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
             schema_identifier,

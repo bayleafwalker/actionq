@@ -295,6 +295,7 @@ class FakeSchemaConnection:
                     *,
                     foreign_table=None,
                     foreign_oid=None,
+                    foreign_columns=None,
                     expression="",
                 ):
                     return {
@@ -305,7 +306,7 @@ class FakeSchemaConnection:
                         "foreign_namespace": query_schema if foreign_table else None,
                         "foreign_table": foreign_table,
                         "foreign_oid": foreign_oid,
-                        "foreign_columns": ["id"] if foreign_table else [],
+                        "foreign_columns": foreign_columns or (["id"] if foreign_table else []),
                         "update_action": "a",
                         "delete_action": "r" if foreign_table else "a",
                         "match_action": "s",
@@ -350,6 +351,38 @@ class FakeSchemaConnection:
                         "execution_group_members", 105, "c", ["ordinal"],
                         expression="ordinal >= 0",
                     ),
+                    group_constraint("immutable_action_specs", 106, "p", ["spec_ref"]),
+                    group_constraint("immutable_action_specs", 106, "u", ["spec_digest"]),
+                    group_constraint("immutable_action_specs", 106, "c", ["spec_ref"]),
+                    group_constraint("immutable_action_specs", 106, "c", ["spec_digest"]),
+                    group_constraint("immutable_action_specs", 106, "c", ["spec_ref", "spec_digest"]),
+                    group_constraint("immutable_action_requests", 107, "p", ["action_id"]),
+                    group_constraint(
+                        "immutable_action_requests", 107, "f", ["action_id"],
+                        foreign_table="actions", foreign_oid=101,
+                    ),
+                    group_constraint(
+                        "immutable_action_requests", 107, "f", ["spec_ref"],
+                        foreign_table="immutable_action_specs", foreign_oid=106,
+                        foreign_columns=["spec_ref"],
+                    ),
+                    group_constraint("immutable_action_requests", 107, "u", ["request_ref"]),
+                    group_constraint("immutable_action_requests", 107, "u", ["request_digest"]),
+                    group_constraint("immutable_action_requests", 107, "u", ["plan_ref", "topology", "role", "subject"]),
+                    group_constraint("immutable_action_requests", 107, "c", ["plan_ref"]),
+                    group_constraint("immutable_action_requests", 107, "c", ["topology"]),
+                    group_constraint("immutable_action_requests", 107, "c", ["role"]),
+                    group_constraint("immutable_action_requests", 107, "c", ["request_ref", "request_digest"]),
+                    group_constraint("immutable_action_requests", 107, "c", ["spec_ref", "spec_digest"]),
+                    group_constraint("immutable_action_runtime_grants", 108, "p", ["action_id"]),
+                    group_constraint(
+                        "immutable_action_runtime_grants", 108, "f", ["action_id"],
+                        foreign_table="actions", foreign_oid=101,
+                    ),
+                    group_constraint("immutable_action_runtime_grants", 108, "c", ["request_digest"]),
+                    group_constraint("immutable_action_runtime_grants", 108, "c", ["spec_digest"]),
+                    group_constraint("immutable_action_runtime_grants", 108, "c", ["input_set_digest"]),
+                    group_constraint("immutable_action_runtime_grants", 108, "c", ["grant_digest"]),
                 ])
             return _Rows(rows)
         if normalized.startswith("SELECT relation.relname AS table_name") and "pg_index" in normalized:
@@ -389,7 +422,7 @@ def _packaged_checksums() -> dict[int, str]:
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     migrations = schema.load_migrations()
 
-    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5]
+    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5, 6]
     rendered = schema._render(migrations[0], "aq")
     assert "{{schema}}" not in rendered
     assert '"aq".actions' in rendered
@@ -429,8 +462,8 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "domain": "execution",
         "api_version": "v1",
         "minimum_schema_version": 1,
-        "maximum_schema_version": 5,
-        "observed_schema_version": 5,
+        "maximum_schema_version": 6,
+        "observed_schema_version": 6,
         "state": "compatible",
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
@@ -705,13 +738,14 @@ def test_sql_canonicalization_preserves_semantic_tokens():
             {
                 1: "wrong",
                 2: _packaged_checksums()[2],
-                3: _packaged_checksums()[3],
-                4: _packaged_checksums()[4],
-                5: _packaged_checksums()[5],
-            },
-            "checksum-mismatch",
-        ),
-        ({**_packaged_checksums(), 6: "future"}, "too-new"),
+                    3: _packaged_checksums()[3],
+                    4: _packaged_checksums()[4],
+                    5: _packaged_checksums()[5],
+                    6: _packaged_checksums()[6],
+                },
+                "checksum-mismatch",
+            ),
+            ({**_packaged_checksums(), 7: "future"}, "too-new"),
     ],
 )
 def test_compatibility_rejects_unsupported_schema(applied, state):
@@ -729,7 +763,7 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
     first = schema.migrate(conn, "aq")
     second = schema.migrate(conn, "aq")
 
-    assert first["applied_versions"] == [1, 2, 3, 4, 5]
+    assert first["applied_versions"] == [1, 2, 3, 4, 5, 6]
     assert second["applied_versions"] == []
     assert second["compatibility"]["compatible"] is True
     locks = [

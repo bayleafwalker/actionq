@@ -257,8 +257,8 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
         )
         if schema_contract.MAX_SCHEMA_VERSION >= 4:
             expected_indexes.add("idx_actions_cancelling_deadline")
-        if schema_contract.MAX_SCHEMA_VERSION >= 5:
-            expected_indexes.update(
+            if schema_contract.MAX_SCHEMA_VERSION >= 5:
+                expected_indexes.update(
                 {
                     "execution_groups_plan_ref_key",
                     "execution_groups_spec_sha256_key",
@@ -266,8 +266,18 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
                     "execution_group_members_group_id_ordinal_key",
                     "idx_execution_group_members_group",
                     "idx_execution_group_members_action",
-                }
-            )
+                    }
+                )
+            if schema_contract.MAX_SCHEMA_VERSION >= 6:
+                expected_indexes.update(
+                    {
+                        "immutable_action_specs_spec_digest_key",
+                        "immutable_action_requests_request_ref_key",
+                        "immutable_action_requests_request_digest_key",
+                        "immutable_action_requests_plan_ref_topology_role_subject_key",
+                        "idx_immutable_action_requests_created",
+                    }
+                )
     assert before <= expected_indexes
     assert after == expected_indexes
 
@@ -753,6 +763,16 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
                 runtime_identifier,
             )
         )
+        for table in (
+            "immutable_action_specs",
+            "immutable_action_requests",
+            "immutable_action_runtime_grants",
+        ):
+            admin_conn.execute(
+                sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+                    schema_identifier, sql.Identifier(table), runtime_identifier
+                )
+            )
         admin_conn.execute(
             sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
                 schema_identifier,

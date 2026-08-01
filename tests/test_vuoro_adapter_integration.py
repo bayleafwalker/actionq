@@ -9,6 +9,7 @@ import pytest
 
 from actionq import db, schema as schema_contract
 from actionq.application import ActionQApplication
+from actionq_contracts import CANDIDATE_VERIFICATION_SPEC_V1, sha256_digest
 from actionq.vuoro import (
     SCHEMA_DIALECT,
     build_operations,
@@ -54,6 +55,7 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
         "execution.session.record",
         "execution.dispatch.enqueue",
         "execution.dispatch.enqueue.v1",
+        "execution.action.create-immutable-candidate",
         "execution.dispatch.list",
         "execution.group.realize",
         "execution.group.stop-new-claims",
@@ -77,6 +79,9 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
         "worker" not in by_name["execution.action.renew"]["input_schema"]["properties"]
     )
     assert "requested_by" not in by_name["execution.dispatch.enqueue"]["input_schema"]["properties"]
+    immutable = by_name["execution.action.create-immutable-candidate"]
+    assert immutable["required_authority"] == "execution.candidate-action.create"
+    assert immutable["input_schema"]["properties"]["input_refs"]["minItems"] == 1
 
 
 def test_registry_composition_accepts_an_injected_protocol_definition_factory():
@@ -116,6 +121,34 @@ def _handlers(application):
     return {
         operation.definition["name"]: operation.handler
         for operation in build_operations(application)
+    }
+
+
+def _artifact(letter: str) -> str:
+    return "artifact:sha256:" + letter * 64
+
+
+def _immutable_candidate_arguments() -> dict:
+    spec = {
+        "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
+        "candidate_ref": _artifact("b"), "candidate_digest": "sha256:" + "b" * 64,
+        "profile_ref": _artifact("c"), "profile_digest": "sha256:" + "c" * 64,
+        "publication_ref": _artifact("d"), "publication_digest": "sha256:" + "d" * 64,
+    }
+    input_refs = [spec["candidate_ref"], spec["profile_ref"], spec["publication_ref"]]
+    return {
+        "request": {
+            "contract_id": "action-creation-request/v1",
+            "plan_ref": _artifact("f"), "topology": "independent",
+            "role": "candidate-verification", "subject": "candidate:one",
+            "spec_ref": "artifact:" + sha256_digest(spec),
+            "spec_digest": sha256_digest(spec),
+            "input_set_digest": db.immutable_input_set_digest(input_refs),
+        },
+        "spec": spec,
+        "input_refs": input_refs,
+        "project": "actionq",
+        "priority": 100,
     }
 
 
@@ -164,6 +197,33 @@ def test_adapter_idempotency_and_durable_provenance(runtime_application):
         reference.startswith("actionq:event:")
         for reference in first["decision"]["event_refs"]
     )
+
+
+def test_adapter_creates_immutable_candidate_action_with_authorization(runtime_application):
+    application = ActionQApplication(
+        schema=runtime_application.schema,
+        connection_factory=lambda: db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]),
+        authorizer=lambda provenance, resource, verb: (
+            provenance.actor == "compiler:trusted"
+            and (resource, verb) == ("execution.candidate-action.create", "create")
+        ),
+    )
+    create = _handlers(application)["execution.action.create-immutable-candidate"]
+    arguments = _immutable_candidate_arguments()
+
+    first = create(
+        arguments,
+        _context(actor="compiler:trusted", request_id="immutable-1", idempotency_key="immutable"),
+    )
+    replay = create(
+        arguments,
+        _context(actor="compiler:trusted", request_id="immutable-2", idempotency_key="immutable"),
+    )
+
+    assert first["decision"]["status"] == "accepted"
+    assert first["result"]["action_id"] >= 1
+    assert replay["decision"]["replayed"] is True
+    assert replay["result"]["action_id"] == first["result"]["action_id"]
 
 
 def test_adapter_claim_renew_stale_worker_and_terminal_retry(runtime_application):

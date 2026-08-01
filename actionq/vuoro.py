@@ -145,6 +145,14 @@ _EXECUTION_GROUP_SCHEMA = {
     "required": ["id", "plan_ref", "spec_sha256", "max_parallel", "failure_policy", "claim_state", "members", "counts"],
     "additionalProperties": True,
 }
+_IMMUTABLE_CANDIDATE_ACTION_INPUT_SCHEMA = _object(
+    {
+        "request": {"type": "object"}, "spec": {"type": "object"},
+        "input_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^artifact:sha256:[0-9a-f]{64}$"}},
+        "project": _NULLABLE_STRING, "priority": {"type": "integer", "minimum": 1, "maximum": 1000},
+    },
+    required=("request", "spec", "input_refs", "project"),
+)
 
 
 @dataclass(frozen=True)
@@ -253,6 +261,22 @@ def build_operations(
     # explicitly below so callers cannot silently select it.
     name = "execution.dispatch.enqueue"
     operations.append(AdapterOperation(_definition(name, input_schema=_DISPATCH_V2_INPUT_SCHEMA, result_schema=_DISPATCH_V2_RESULT_SCHEMA, authority="execution.enqueue", semantics="enqueue", idempotency="required"), served(name, lambda a, p, actor: app.enqueue_dispatch_v2({**a, "requested_by": actor}, provenance=p))))
+
+    name = "execution.action.create-immutable-candidate"
+    operations.append(
+        AdapterOperation(
+            _definition(
+                name, input_schema=_IMMUTABLE_CANDIDATE_ACTION_INPUT_SCHEMA,
+                result_schema=_DECISION_RESULT_SCHEMA, authority="execution.candidate-action.create",
+                semantics="enqueue", idempotency="required",
+            ),
+            served(name, lambda a, p, actor: app.create_immutable_action(
+                request=a["request"], spec=a["spec"], input_refs=list(a["input_refs"]),
+                project=a.get("project"), priority=a.get("priority", 100), created_by=actor,
+                provenance=p,
+            )),
+        )
+    )
 
     name = "execution.action.list"
     operations.append(
