@@ -304,12 +304,13 @@ def _require_immutable_v1(value: dict[str, Any], contract_id: str) -> None:
             _artifact_binding(value, ref, digest)
     if contract_id == ACTION_CREATION_REQUEST_V1:
         _artifact_binding(value, "spec_ref", "spec_digest")
+        if not isinstance(value["plan_ref"], str) or not _ARTIFACT.fullmatch(value["plan_ref"]):
+            raise ValueError("plan_ref must be an immutable artifact locator")
         if value["topology"] not in {"independent", "stacked", "wave-integrated"}:
             raise ValueError("topology is invalid")
         if value["role"] not in {"candidate-verification", "candidate-integration", "candidate-review"}:
             raise ValueError("role is invalid")
-        for field in ("plan_ref", "subject"):
-            _exact_string(value[field], field)
+        _exact_string(value["subject"], "subject")
     elif contract_id == VERIFICATION_PROFILE_V1:
         _artifact_binding(value, "registry_ref", "registry_digest")
         for field in ("profile_id", "command_id"):
