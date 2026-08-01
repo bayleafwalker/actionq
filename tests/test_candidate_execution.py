@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from actionq_contracts import (
     CANDIDATE_INTEGRATION_RESULT_V1,
     CANDIDATE_INTEGRATION_SPEC_V1,
@@ -12,7 +14,11 @@ from actionq_contracts import (
     artifact_digest,
     canonical_bytes,
 )
-from actionq_runner.candidate_execution import integrate_wave, verify_candidate
+from actionq_runner.candidate_execution import (
+    CandidateExecutionCancelled,
+    integrate_wave,
+    verify_candidate,
+)
 from actionq_runner.candidates import resolve_exact_contract
 from actionq_runner.publisher import artifact_ref
 
@@ -80,6 +86,10 @@ def test_verification_runs_only_registered_frozen_command_in_fresh_bundle(tmp_pa
     result = resolve_exact_contract(store, result_ref, CANDIDATE_VERIFICATION_RESULT_V1)
     assert result["outcome"] == "passed"
     assert result["candidate_ref"] == candidate_ref
+    before = set(store.objects)
+    with pytest.raises(CandidateExecutionCancelled):
+        verify_candidate(store, spec_ref=spec_ref, cancelled=lambda: True)
+    assert set(store.objects) == before
 
 
 def test_wave_integration_preserves_frozen_member_ordinal_order(tmp_path):
@@ -119,6 +129,12 @@ def test_wave_integration_preserves_frozen_member_ordinal_order(tmp_path):
     result = resolve_exact_contract(store, result_ref, CANDIDATE_INTEGRATION_RESULT_V1)
     assert result["outcome"] == "integrated"
     assert result["candidate_ref"] is not None
+    before_replay = set(store.objects)
+    assert integrate_wave(store, spec_ref=integration_ref, author_name="ActionQ", author_email="actionq@example.invalid", commit_timestamp="2026-08-01T00:00:00Z") == result_ref
+    assert set(store.objects) == before_replay
+    with pytest.raises(CandidateExecutionCancelled):
+        integrate_wave(store, spec_ref=integration_ref, author_name="ActionQ", author_email="actionq@example.invalid", commit_timestamp="2026-08-01T00:00:00Z", cancelled=lambda: True)
+    assert set(store.objects) == before_replay
 
 
 def test_stacked_integration_returns_the_existing_tip_without_a_synthetic_bundle(tmp_path):
@@ -204,3 +220,48 @@ def test_wave_conflict_from_individually_passed_candidates_publishes_no_bundle(t
         "outcome": "conflict", "candidate_ref": None, "candidate_digest": None,
     }
     assert set(store.objects) - before == {_put_contract(store, integration), result_ref}
+
+
+def test_missing_candidate_and_wrong_frozen_base_publish_no_result(tmp_path):
+    store = MemoryStore()
+    bundle, base, _head = _candidate_bundle(tmp_path, "one")
+    candidate_ref = store.put(bundle)
+    registry_ref = _put_contract(store, {"commands": {"pass": ["true"]}})
+    profile_ref = _put_contract(store, {
+        "contract_id": VERIFICATION_PROFILE_V1, "profile_id": "default", "command_id": "pass",
+        "registry_ref": registry_ref, "registry_digest": artifact_digest(registry_ref),
+    })
+    verification_spec = {
+        "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
+        "request_ref": "artifact:sha256:" + "1" * 64, "request_digest": "sha256:" + "1" * 64,
+        "candidate_ref": candidate_ref, "candidate_digest": artifact_digest(candidate_ref),
+        "profile_ref": profile_ref, "profile_digest": artifact_digest(profile_ref),
+    }
+    verification_spec_ref = _put_contract(store, verification_spec)
+    del store.objects[candidate_ref]
+    before_missing = set(store.objects)
+    with pytest.raises(KeyError):
+        verify_candidate(store, spec_ref=verification_spec_ref)
+    assert set(store.objects) == before_missing
+
+    # A syntactically valid but unavailable base cannot be turned into a
+    # conflict artifact: it is a protocol failure before integration starts.
+    candidate_ref = store.put(bundle)
+    evidence = store.put(canonical_bytes({"ok": True}))
+    verification_result_ref = _put_contract(store, {
+        "contract_id": CANDIDATE_VERIFICATION_RESULT_V1,
+        "spec_ref": verification_spec_ref, "spec_digest": artifact_digest(verification_spec_ref),
+        "candidate_ref": candidate_ref, "candidate_digest": artifact_digest(candidate_ref),
+        "outcome": "passed", "evidence_ref": evidence, "evidence_digest": artifact_digest(evidence),
+    })
+    integration = {
+        "contract_id": CANDIDATE_INTEGRATION_SPEC_V1,
+        "request_ref": "artifact:sha256:" + "2" * 64, "request_digest": "sha256:" + "2" * 64,
+        "topology": "wave-integrated", "base_commit": "f" * 40,
+        "member_result_refs": [verification_result_ref], "input_set_digest": "sha256:" + "3" * 64,
+    }
+    integration_ref = _put_contract(store, integration)
+    before_base = set(store.objects)
+    with pytest.raises(RuntimeError, match="frozen integration base"):
+        integrate_wave(store, spec_ref=integration_ref, author_name="ActionQ", author_email="actionq@example.invalid", commit_timestamp="2026-08-01T00:00:00Z")
+    assert set(store.objects) == before_base

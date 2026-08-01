@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from actionq_contracts import (
     CANDIDATE_INTEGRATION_RESULT_V1,
@@ -27,6 +27,15 @@ from actionq_contracts import (
 
 from .candidates import CandidateRecoveryJournal, resolve_exact_contract
 from .publisher import ArtifactStore, artifact_ref
+
+
+class CandidateExecutionCancelled(RuntimeError):
+    """Raised before any candidate result is published after cancellation."""
+
+
+def _require_not_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise CandidateExecutionCancelled("candidate operation was cancelled")
 
 
 def _put_contract(store: ArtifactStore, value: dict[str, Any]) -> str:
@@ -100,6 +109,7 @@ def verify_candidate(
     recovery_root: Path | str | None = None,
     operation_id: str | None = None,
     timeout_seconds: float = 600,
+    cancelled: Callable[[], bool] | None = None,
 ) -> str:
     """Execute only a frozen registered profile in a new bundle checkout.
 
@@ -108,6 +118,7 @@ def verify_candidate(
     """
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("verification timeout must be between zero and one hour")
+    _require_not_cancelled(cancelled)
     spec = resolve_exact_contract(store, spec_ref, CANDIDATE_VERIFICATION_SPEC_V1)
     profile = resolve_exact_contract(store, spec["profile_ref"], VERIFICATION_PROFILE_V1)
     command = _registry_command(store, profile)
@@ -132,6 +143,7 @@ def verify_candidate(
             outcome = "candidate-failed"
             evidence = {"contract_id": "candidate-verification-evidence/v1", "command_id": profile["command_id"],
                         "exit_code": None, "timed_out": True}
+    _require_not_cancelled(cancelled)
     evidence_raw = canonical_bytes(evidence)
     evidence_ref = store.put(evidence_raw)
     result = {
@@ -155,6 +167,7 @@ def integrate_wave(
     commit_timestamp: str,
     recovery_root: Path | str | None = None,
     operation_id: str | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> str:
     """Build a deterministic, local-only wave integration candidate.
 
@@ -164,6 +177,7 @@ def integrate_wave(
     """
     if not author_name or not author_email or not commit_timestamp:
         raise ValueError("integration commit identity and timestamp are required policy inputs")
+    _require_not_cancelled(cancelled)
     spec = resolve_exact_contract(store, spec_ref, CANDIDATE_INTEGRATION_SPEC_V1)
     journal = None
     if recovery_root is not None:
@@ -173,6 +187,7 @@ def integrate_wave(
         journal.write("intent", {"spec_ref": spec_ref, "topology": spec["topology"]})
     members: list[bytes] = []
     for result_ref in spec["member_result_refs"]:
+        _require_not_cancelled(cancelled)
         result = resolve_exact_contract(store, result_ref, CANDIDATE_VERIFICATION_RESULT_V1)
         if result["outcome"] != "passed":
             raise RuntimeError("wave integration requires every frozen member result to be passed")
@@ -206,6 +221,7 @@ def integrate_wave(
         result = {"contract_id": CANDIDATE_INTEGRATION_RESULT_V1, "spec_ref": spec_ref,
                   "spec_digest": artifact_digest(spec_ref), "outcome": "integrated",
                   "candidate_ref": artifact_ref(members[-1]), "candidate_digest": artifact_digest(artifact_ref(members[-1]))}
+        _require_not_cancelled(cancelled)
         result_ref = _put_contract(store, result)
         if journal is not None:
             journal.write("result", {"spec_ref": spec_ref, "result_ref": result_ref})
@@ -226,6 +242,7 @@ def integrate_wave(
                        capture_output=True, text=True)
         candidate_commits: list[str] = []
         for ordinal, raw in enumerate(members):
+            _require_not_cancelled(cancelled)
             bundle = root / f"member-{ordinal}.bundle"
             bundle.write_bytes(raw)
             os.chmod(bundle, 0o600)
@@ -243,6 +260,7 @@ def integrate_wave(
                        "GIT_AUTHOR_DATE": commit_timestamp, "GIT_COMMITTER_DATE": commit_timestamp}
         message = f"actionq integration {artifact_digest(spec_ref)}"
         for commit in candidate_commits:
+            _require_not_cancelled(cancelled)
             merged = subprocess.run(
                 ["git", "-C", os.fspath(checkout), "merge", "--no-ff", "--no-edit", "-m", message, commit],
                 env=environment, capture_output=True, text=True, check=False,
@@ -259,7 +277,9 @@ def integrate_wave(
         bundle = root / "integration.bundle"
         subprocess.run(["git", "-C", os.fspath(checkout), "bundle", "create", os.fspath(bundle), "HEAD"], check=True,
                        capture_output=True, text=True)
+        _require_not_cancelled(cancelled)
         candidate_ref = store.put(bundle.read_bytes())
+    _require_not_cancelled(cancelled)
     result = {"contract_id": CANDIDATE_INTEGRATION_RESULT_V1, "spec_ref": spec_ref,
               "spec_digest": artifact_digest(spec_ref), "outcome": "integrated",
               "candidate_ref": candidate_ref, "candidate_digest": artifact_digest(candidate_ref)}
