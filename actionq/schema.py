@@ -897,6 +897,12 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
         "constraint-missing-or-invalid:execution_groups.",
         "constraint-missing-or-invalid:execution_group_members.",
         "index-missing-or-invalid:execution-group-members.",
+        "column-missing:immutable_action_specs.",
+        "column-missing:immutable_action_requests.",
+        "column-missing:immutable_action_runtime_grants.",
+        "constraint-missing-or-invalid:immutable-action-",
+        "constraint-missing-or-invalid:immutable_action_",
+        "index-missing-or-invalid:immutable-action-requests.",
     )
     return [
         issue for issue in issues
