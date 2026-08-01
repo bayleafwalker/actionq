@@ -153,7 +153,7 @@ _IMMUTABLE_V1_FIELDS: dict[str, frozenset[str]] = {
         "spec_digest", "input_set_digest",
     }),
     VERIFICATION_PROFILE_V1: frozenset({
-        "contract_id", "profile_id", "command_id", "registry_ref", "registry_digest", "profile_digest",
+        "contract_id", "profile_id", "command_id", "registry_ref", "registry_digest",
     }),
     CANDIDATE_VERIFICATION_SPEC_V1: frozenset({
         "contract_id", "request_ref", "request_digest", "candidate_ref", "candidate_digest",
@@ -321,8 +321,10 @@ def _require_immutable_v1(value: dict[str, Any], contract_id: str) -> None:
         if not isinstance(value["base_commit"], str) or not _GIT_OID.fullmatch(value["base_commit"]):
             raise ValueError("base_commit must be a full lowercase Git object id")
         refs = value["member_result_refs"]
-        if not isinstance(refs, list) or not refs or refs != sorted(refs) or len(refs) != len(set(refs)):
-            raise ValueError("member_result_refs must be a non-empty sorted unique list")
+        # This list is the compiler's frozen #2034 ordinal order.  Sorting by
+        # digest would silently change a wave's integration topology.
+        if not isinstance(refs, list) or not refs or len(refs) != len(set(refs)):
+            raise ValueError("member_result_refs must be a non-empty unique ordinal list")
         if any(not isinstance(ref, str) or not _ARTIFACT.fullmatch(ref) for ref in refs):
             raise ValueError("member_result_refs must be immutable artifact locators")
     elif contract_id == CANDIDATE_VERIFICATION_RESULT_V1:

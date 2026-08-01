@@ -38,7 +38,7 @@ def records() -> list[dict]:
     }
     profile = {
         "contract_id": VERIFICATION_PROFILE_V1, "profile_id": "test", "command_id": "pytest",
-        "registry_ref": ref("d"), "registry_digest": digest("d"), "profile_digest": digest("e"),
+        "registry_ref": ref("d"), "registry_digest": digest("d"),
     }
     verification_spec = {
         "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
@@ -121,5 +121,7 @@ def test_conflict_result_has_no_candidate_artifact(records):
 def test_wave_members_are_frozen_in_ordinal_input_order(records):
     record = copy.deepcopy(records[4])
     record["member_result_refs"] = list(reversed(record["member_result_refs"]))
-    with pytest.raises(ValueError, match="sorted unique"):
+    assert require_compatible(record) == CANDIDATE_INTEGRATION_SPEC_V1
+    record["member_result_refs"].append(record["member_result_refs"][0])
+    with pytest.raises(ValueError, match="unique ordinal"):
         require_compatible(record)
