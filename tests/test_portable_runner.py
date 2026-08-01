@@ -47,7 +47,7 @@ def test_server_and_runner_distributions_have_no_cross_imports():
     root_metadata = tomllib.loads((ROOT / "pyproject.toml").read_text())
     runner_metadata = tomllib.loads((ROOT / "packages/actionq-runner/pyproject.toml").read_text())
     assert "actionq-runner" not in " ".join(root_metadata["project"]["dependencies"])
-    assert runner_metadata["project"]["dependencies"] == ["actionq-contracts==0.1.0", "cryptography>=45"]
+    assert runner_metadata["project"]["dependencies"] == ["actionq-contracts==0.1.1", "cryptography>=45"]
 
 
 def test_staging_is_private_atomic_and_rejects_traversal(tmp_path: Path, monkeypatch):
