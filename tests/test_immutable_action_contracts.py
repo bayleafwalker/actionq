@@ -42,7 +42,6 @@ def records() -> list[dict]:
     }
     verification_spec = {
         "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
-        "request_ref": ref("f"), "request_digest": digest("f"),
         "candidate_ref": ref("1"), "candidate_digest": digest("1"),
         "profile_ref": ref("2"), "profile_digest": digest("2"),
     }
@@ -53,8 +52,7 @@ def records() -> list[dict]:
         "outcome": "passed", "evidence_ref": ref("5"), "evidence_digest": digest("5"),
     }
     integration_spec = {
-        "contract_id": CANDIDATE_INTEGRATION_SPEC_V1,
-        "request_ref": ref("6"), "request_digest": digest("6"), "topology": "wave-integrated",
+        "contract_id": CANDIDATE_INTEGRATION_SPEC_V1, "topology": "wave-integrated",
         "base_commit": "a" * 40, "member_result_refs": [ref("7"), ref("8")],
         "input_set_digest": digest("9"),
     }
@@ -65,7 +63,6 @@ def records() -> list[dict]:
     }
     review_spec = {
         "contract_id": CANDIDATE_REVIEW_SPEC_V1,
-        "request_ref": ref("c"), "request_digest": digest("c"),
         "candidate_ref": ref("d"), "candidate_digest": digest("d"),
         "verification_result_ref": ref("e"), "verification_result_digest": digest("e"),
     }

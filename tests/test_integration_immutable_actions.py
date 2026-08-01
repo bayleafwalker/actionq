@@ -20,14 +20,13 @@ def _ref(letter: str) -> str:
 def _spec() -> dict:
     return {
         "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
-        "request_ref": _ref("a"), "request_digest": "sha256:" + "a" * 64,
         "candidate_ref": _ref("b"), "candidate_digest": "sha256:" + "b" * 64,
         "profile_ref": _ref("c"), "profile_digest": "sha256:" + "c" * 64,
     }
 
 
 def _request(spec: dict, *, subject: str = "candidate:one") -> tuple[dict, list[str]]:
-    refs = [_ref("d"), _ref("e")]
+    refs = [spec["candidate_ref"], spec["profile_ref"]]
     digest = sha256_digest(spec)
     return {
         "contract_id": "action-creation-request/v1",
@@ -101,6 +100,35 @@ def test_claim_fails_closed_when_authoritative_request_bytes_are_corrupt(immutab
         )
         corruptor.commit()
     with pytest.raises(db.ActionQError, match="request bytes are invalid|claim-time integrity"):
+        db.claim(conn, name, worker="worker:one", timeout_minutes=30)
+    conn.rollback()
+    assert db.get_action(conn, name, created["action_id"])["status"] == "pending"
+
+
+def test_role_inputs_and_mutable_action_projection_are_fenced(immutable_db, postgres_urls):
+    conn, name = immutable_db
+    actual = _spec()
+    request, refs = _request(actual)
+    with pytest.raises(db.ActionQError, match="ordinary action type"):
+        db.create_immutable_action(
+            conn, name, request=request, spec=actual, input_refs=refs,
+            action_type="candidate-review", project="demo", priority=100, created_by="compiler:test",
+        )
+    conn.rollback()
+    with pytest.raises(db.ActionQError, match="exact ordered spec inputs"):
+        db.create_immutable_action(
+            conn, name, request=request, spec=actual, input_refs=list(reversed(refs)),
+            action_type="candidate-verification", project="demo", priority=100, created_by="compiler:test",
+        )
+    conn.rollback()
+    created = _create(conn, name)
+    with db.connect(postgres_urls["migration"]) as corruptor:
+        corruptor.execute(
+            f"UPDATE {db.qname(name, 'actions')} SET source_refs=%s WHERE id=%s",
+            (db.to_json(["artifact:sha256:" + "0" * 64]), created["action_id"]),
+        )
+        corruptor.commit()
+    with pytest.raises(db.ActionQError, match="claim-time integrity"):
         db.claim(conn, name, worker="worker:one", timeout_minutes=30)
     conn.rollback()
     assert db.get_action(conn, name, created["action_id"])["status"] == "pending"

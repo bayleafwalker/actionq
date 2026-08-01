@@ -122,7 +122,6 @@ def test_review_result_is_immutable_and_requires_passed_bound_verification():
     }))
     spec = {
         "contract_id": CANDIDATE_REVIEW_SPEC_V1,
-        "request_ref": _ref("b"), "request_digest": "sha256:" + "b" * 64,
         "candidate_ref": candidate_ref, "candidate_digest": candidate_ref.removeprefix("artifact:"),
         "verification_result_ref": verification_ref,
         "verification_result_digest": verification_ref.removeprefix("artifact:"),

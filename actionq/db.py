@@ -102,6 +102,11 @@ _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _IMMUTABLE_REF_RE = re.compile(r"^artifact:sha256:[0-9a-f]{64}$")
 _IMMUTABLE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IMMUTABLE_ROLE_CONTRACTS = {
+    "candidate-verification": "candidate-verification-spec/v1",
+    "candidate-integration": "candidate-integration-spec/v1",
+    "candidate-review": "candidate-review-spec/v1",
+}
 
 
 def immutable_input_set_digest(inputs: list[str]) -> str:
@@ -130,6 +135,18 @@ def _immutable_snapshot(value: dict[str, Any], *, expected_contract: str | None 
     return raw, contract_digest(value)
 
 
+def immutable_spec_input_refs(spec: dict[str, Any]) -> list[str]:
+    """Return the sole ordered input set admitted by one frozen spec."""
+    contract = require_contract_compatible(spec)
+    if contract == "candidate-verification-spec/v1":
+        return [spec["candidate_ref"], spec["profile_ref"]]
+    if contract == "candidate-integration-spec/v1":
+        return list(spec["member_result_refs"])
+    if contract == "candidate-review-spec/v1":
+        return [spec["candidate_ref"], spec["verification_result_ref"]]
+    raise ActionQError("immutable action spec contract is unsupported")
+
+
 def create_immutable_action(
     conn,
     schema: str,
@@ -154,10 +171,18 @@ def create_immutable_action(
     request_raw, request_digest = _immutable_snapshot(
         request, expected_contract=ACTION_CREATION_REQUEST_V1,
     )
-    spec_raw, spec_digest = _immutable_snapshot(spec)
+    expected_contract = _IMMUTABLE_ROLE_CONTRACTS.get(request["role"])
+    if expected_contract is None or action_type != request["role"]:
+        raise ActionQError("immutable action role must equal the ordinary action type")
+    spec_raw, spec_digest = _immutable_snapshot(spec, expected_contract=expected_contract)
     if request["spec_digest"] != spec_digest or request["spec_ref"] != "artifact:" + spec_digest:
         raise ActionQError("immutable action request does not bind exact spec bytes")
-    expected_inputs = immutable_input_set_digest(input_refs)
+    if request["role"] == "candidate-integration" and request["topology"] != spec["topology"]:
+        raise ActionQError("integration request topology must equal the exact spec topology")
+    expected_spec_inputs = immutable_spec_input_refs(spec)
+    if input_refs != expected_spec_inputs:
+        raise ActionQError("immutable action input refs must equal the exact ordered spec inputs")
+    expected_inputs = immutable_input_set_digest(expected_spec_inputs)
     if request["input_set_digest"] != expected_inputs:
         raise ActionQError("immutable action request input_set_digest mismatch")
     request_ref = "artifact:" + request_digest
@@ -1034,6 +1059,12 @@ def _validate_immutable_claim(conn, schema: str, action_id: int) -> dict[str, An
     ).fetchone()
     if request_row is None:
         return None
+    action_row = conn.execute(
+        f"SELECT action_type, target_ref, source_refs FROM {qname(schema, 'actions')} WHERE id=%s",
+        (action_id,),
+    ).fetchone()
+    if action_row is None:
+        raise ActionQError("immutable action is missing its ordinary action row")
     spec_row = conn.execute(
         f"SELECT * FROM {qname(schema, 'immutable_action_specs')} WHERE spec_ref=%s",
         (request_row["spec_ref"],),
@@ -1044,7 +1075,10 @@ def _validate_immutable_claim(conn, schema: str, action_id: int) -> dict[str, An
         request_value = json.loads(bytes(request_row["request_snapshot"]).decode("utf-8"))
         spec_value = json.loads(bytes(spec_row["spec_snapshot"]).decode("utf-8"))
         request_raw, request_digest = _immutable_snapshot(request_value, expected_contract=ACTION_CREATION_REQUEST_V1)
-        spec_raw, spec_digest = _immutable_snapshot(spec_value)
+        expected_contract = _IMMUTABLE_ROLE_CONTRACTS.get(request_value["role"])
+        if expected_contract is None:
+            raise ActionQError("immutable action role is invalid")
+        spec_raw, spec_digest = _immutable_snapshot(spec_value, expected_contract=expected_contract)
     except (UnicodeDecodeError, json.JSONDecodeError, ActionQError) as exc:
         raise ActionQError("immutable action request bytes are invalid") from exc
     if (
@@ -1056,6 +1090,11 @@ def _validate_immutable_claim(conn, schema: str, action_id: int) -> dict[str, An
         or request_value["spec_digest"] != request_row["spec_digest"]
         or request_value["input_set_digest"] != request_row["input_set_digest"]
         or "artifact:" + request_digest != request_row["request_ref"]
+        or action_row["action_type"] != request_value["role"]
+        or action_row["target_ref"] != request_value["subject"]
+        or list(action_row["source_refs"]) != immutable_spec_input_refs(spec_value)
+        or request_value["input_set_digest"] != immutable_input_set_digest(immutable_spec_input_refs(spec_value))
+        or (request_value["role"] == "candidate-integration" and request_value["topology"] != spec_value["topology"])
     ):
         raise ActionQError("immutable action request failed claim-time integrity validation")
     grant = {

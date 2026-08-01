@@ -16,7 +16,6 @@ def _ref(letter: str) -> str:
 def _spec() -> dict:
     return {
         "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
-        "request_ref": _ref("a"), "request_digest": "sha256:" + "a" * 64,
         "candidate_ref": _ref("b"), "candidate_digest": "sha256:" + "b" * 64,
         "profile_ref": _ref("c"), "profile_digest": "sha256:" + "c" * 64,
     }

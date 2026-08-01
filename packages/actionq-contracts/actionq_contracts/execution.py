@@ -156,7 +156,7 @@ _IMMUTABLE_V1_FIELDS: dict[str, frozenset[str]] = {
         "contract_id", "profile_id", "command_id", "registry_ref", "registry_digest",
     }),
     CANDIDATE_VERIFICATION_SPEC_V1: frozenset({
-        "contract_id", "request_ref", "request_digest", "candidate_ref", "candidate_digest",
+        "contract_id", "candidate_ref", "candidate_digest",
         "profile_ref", "profile_digest",
     }),
     CANDIDATE_VERIFICATION_RESULT_V1: frozenset({
@@ -164,7 +164,7 @@ _IMMUTABLE_V1_FIELDS: dict[str, frozenset[str]] = {
         "outcome", "evidence_ref", "evidence_digest",
     }),
     CANDIDATE_INTEGRATION_SPEC_V1: frozenset({
-        "contract_id", "request_ref", "request_digest", "topology", "base_commit",
+        "contract_id", "topology", "base_commit",
         "member_result_refs", "input_set_digest",
     }),
     CANDIDATE_INTEGRATION_RESULT_V1: frozenset({
@@ -172,7 +172,7 @@ _IMMUTABLE_V1_FIELDS: dict[str, frozenset[str]] = {
         "candidate_digest",
     }),
     CANDIDATE_REVIEW_SPEC_V1: frozenset({
-        "contract_id", "request_ref", "request_digest", "candidate_ref", "candidate_digest",
+        "contract_id", "candidate_ref", "candidate_digest",
         "verification_result_ref", "verification_result_digest",
     }),
     CANDIDATE_REVIEW_RESULT_V1: frozenset({

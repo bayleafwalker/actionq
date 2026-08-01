@@ -42,14 +42,25 @@ def _put_contract(store: ArtifactStore, value: dict[str, Any]) -> str:
     require_compatible(value)
     raw = canonical_bytes(value)
     reference = store.put(raw)
-    if artifact_digest(reference) != sha256_digest(value):  # defensive CAS contract
+    if artifact_digest(reference) != sha256_digest(value) or store.get(reference) != raw:
         raise RuntimeError("CAS failed to preserve canonical contract bytes")
     return reference
 
 
-def _registry_command(store: ArtifactStore, profile: dict[str, Any]) -> tuple[str, ...]:
+def _put_exact(store: ArtifactStore, raw: bytes, *, label: str) -> str:
+    reference = store.put(raw)
+    if artifact_ref(raw) != reference or store.get(reference) != raw:
+        raise RuntimeError(f"CAS failed to preserve {label} bytes")
+    return reference
+
+
+def _registry_command(
+    store: ArtifactStore, profile: dict[str, Any], *, trusted_registry_ref: str,
+) -> tuple[str, ...]:
     """Read one exact, operator-owned command registry entry without a shell."""
-    raw = store.get(profile["registry_ref"])
+    if profile["registry_ref"] != trusted_registry_ref:
+        raise RuntimeError("verification profile registry is not the operator-trusted registry")
+    raw = store.get(trusted_registry_ref)
     if artifact_ref(raw) != profile["registry_ref"]:
         raise RuntimeError("verification registry locator does not match its bytes")
     try:
@@ -110,6 +121,7 @@ def verify_candidate(
     operation_id: str | None = None,
     timeout_seconds: float = 600,
     cancelled: Callable[[], bool] | None = None,
+    trusted_registry_ref: str | None = None,
 ) -> str:
     """Execute only a frozen registered profile in a new bundle checkout.
 
@@ -119,9 +131,11 @@ def verify_candidate(
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("verification timeout must be between zero and one hour")
     _require_not_cancelled(cancelled)
+    if trusted_registry_ref is None:
+        raise ValueError("an operator-trusted verification registry reference is required")
     spec = resolve_exact_contract(store, spec_ref, CANDIDATE_VERIFICATION_SPEC_V1)
     profile = resolve_exact_contract(store, spec["profile_ref"], VERIFICATION_PROFILE_V1)
-    command = _registry_command(store, profile)
+    command = _registry_command(store, profile, trusted_registry_ref=trusted_registry_ref)
     candidate_raw = store.get(spec["candidate_ref"])
     if artifact_ref(candidate_raw) != spec["candidate_ref"]:
         raise RuntimeError("candidate locator does not match its bytes")
@@ -145,7 +159,7 @@ def verify_candidate(
                         "exit_code": None, "timed_out": True}
     _require_not_cancelled(cancelled)
     evidence_raw = canonical_bytes(evidence)
-    evidence_ref = store.put(evidence_raw)
+    evidence_ref = _put_exact(store, evidence_raw, label="verification evidence")
     result = {
         "contract_id": CANDIDATE_VERIFICATION_RESULT_V1,
         "spec_ref": spec_ref, "spec_digest": artifact_digest(spec_ref),
@@ -168,6 +182,7 @@ def integrate_wave(
     recovery_root: Path | str | None = None,
     operation_id: str | None = None,
     cancelled: Callable[[], bool] | None = None,
+    trusted_registry_ref: str | None = None,
 ) -> str:
     """Build a deterministic, local-only wave integration candidate.
 
@@ -178,6 +193,8 @@ def integrate_wave(
     if not author_name or not author_email or not commit_timestamp:
         raise ValueError("integration commit identity and timestamp are required policy inputs")
     _require_not_cancelled(cancelled)
+    if trusted_registry_ref is None:
+        raise ValueError("an operator-trusted verification registry reference is required")
     spec = resolve_exact_contract(store, spec_ref, CANDIDATE_INTEGRATION_SPEC_V1)
     journal = None
     if recovery_root is not None:
@@ -191,6 +208,20 @@ def integrate_wave(
         result = resolve_exact_contract(store, result_ref, CANDIDATE_VERIFICATION_RESULT_V1)
         if result["outcome"] != "passed":
             raise RuntimeError("wave integration requires every frozen member result to be passed")
+        verification_spec = resolve_exact_contract(
+            store, result["spec_ref"], CANDIDATE_VERIFICATION_SPEC_V1,
+        )
+        profile = resolve_exact_contract(
+            store, verification_spec["profile_ref"], VERIFICATION_PROFILE_V1,
+        )
+        _registry_command(store, profile, trusted_registry_ref=trusted_registry_ref)
+        evidence = store.get(result["evidence_ref"])
+        if artifact_ref(evidence) != result["evidence_ref"]:
+            raise RuntimeError("verification evidence locator does not match its bytes")
+        if (result["candidate_ref"], result["candidate_digest"]) != (
+            verification_spec["candidate_ref"], verification_spec["candidate_digest"],
+        ):
+            raise RuntimeError("passed verification result does not bind its exact verification spec candidate")
         raw = store.get(result["candidate_ref"])
         if artifact_ref(raw) != result["candidate_ref"]:
             raise RuntimeError("verified candidate locator does not match its bytes")
@@ -278,7 +309,7 @@ def integrate_wave(
         subprocess.run(["git", "-C", os.fspath(checkout), "bundle", "create", os.fspath(bundle), "HEAD"], check=True,
                        capture_output=True, text=True)
         _require_not_cancelled(cancelled)
-        candidate_ref = store.put(bundle.read_bytes())
+        candidate_ref = _put_exact(store, bundle.read_bytes(), label="integration candidate bundle")
     _require_not_cancelled(cancelled)
     result = {"contract_id": CANDIDATE_INTEGRATION_RESULT_V1, "spec_ref": spec_ref,
               "spec_digest": artifact_digest(spec_ref), "outcome": "integrated",
