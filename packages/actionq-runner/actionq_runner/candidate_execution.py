@@ -32,6 +32,17 @@ from .publisher import ArtifactStore, artifact_ref
 INTEGRATION_AUTHOR_NAME = "ActionQ Integration"
 INTEGRATION_AUTHOR_EMAIL = "integration@actionq.invalid"
 INTEGRATION_COMMIT_TIMESTAMP = "2000-01-01T00:00:00Z"
+_GIT_CONFIG = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "gc.auto=0",
+    "-c", "maintenance.auto=false",
+)
+
+
+def _git(*args: str) -> list[str]:
+    """Run disposable candidate Git operations without hooks or maintenance."""
+    return ["git", *_GIT_CONFIG, *args]
 
 
 class CandidateExecutionCancelled(RuntimeError):
@@ -109,13 +120,13 @@ def _checkout_bundle(raw: bytes, directory: Path) -> Path:
     os.chmod(bundle, 0o600)
     checkout = directory / "checkout"
     completed = subprocess.run(
-        ["git", "clone", "--no-checkout", os.fspath(bundle), os.fspath(checkout)],
+        _git("clone", "--no-checkout", os.fspath(bundle), os.fspath(checkout)),
         capture_output=True, text=True, check=False,
     )
     if completed.returncode:
         raise RuntimeError("candidate artifact is not a cloneable Git bundle")
     completed = subprocess.run(
-        ["git", "-C", os.fspath(checkout), "checkout", "--detach"],
+        _git("-C", os.fspath(checkout), "checkout", "--detach"),
         capture_output=True, text=True, check=False,
     )
     if completed.returncode:
@@ -125,7 +136,7 @@ def _checkout_bundle(raw: bytes, directory: Path) -> Path:
 
 def _require_descends_from(checkout: Path, base_commit: str, candidate_commit: str) -> None:
     relation = subprocess.run(
-        ["git", "-C", os.fspath(checkout), "merge-base", "--is-ancestor", base_commit, candidate_commit],
+        _git("-C", os.fspath(checkout), "merge-base", "--is-ancestor", base_commit, candidate_commit),
         capture_output=True, text=True, check=False,
     )
     if relation.returncode:
@@ -258,19 +269,19 @@ def integrate_wave(
             root = Path(temporary)
             previous = _checkout_bundle(members[0], root / "member-0")
             previous_head = subprocess.run(
-                ["git", "-C", os.fspath(previous), "rev-parse", "HEAD"], check=True,
+                _git("-C", os.fspath(previous), "rev-parse", "HEAD"), check=True,
                 capture_output=True, text=True,
             ).stdout.strip()
             _require_descends_from(previous, spec["base_commit"], previous_head)
             for ordinal, raw in enumerate(members[1:], start=1):
                 current = _checkout_bundle(raw, root / f"member-{ordinal}")
                 current_head = subprocess.run(
-                    ["git", "-C", os.fspath(current), "rev-parse", "HEAD"], check=True,
+                    _git("-C", os.fspath(current), "rev-parse", "HEAD"), check=True,
                     capture_output=True, text=True,
                 ).stdout.strip()
                 _require_descends_from(current, spec["base_commit"], current_head)
                 ordered = subprocess.run(
-                    ["git", "-C", os.fspath(current), "merge-base", "--is-ancestor", previous_head, current_head],
+                    _git("-C", os.fspath(current), "merge-base", "--is-ancestor", previous_head, current_head),
                     capture_output=True, text=True, check=False,
                 )
                 if ordered.returncode:
@@ -289,15 +300,15 @@ def integrate_wave(
         root = Path(temporary)
         checkout = _checkout_bundle(members[0], root / "member-0")
         initial_head = subprocess.run(
-            ["git", "-C", os.fspath(checkout), "rev-parse", "HEAD"], check=True,
+            _git("-C", os.fspath(checkout), "rev-parse", "HEAD"), check=True,
             capture_output=True, text=True,
         ).stdout.strip()
         _require_descends_from(checkout, spec["base_commit"], initial_head)
-        base = subprocess.run(["git", "-C", os.fspath(checkout), "rev-parse", spec["base_commit"]],
+        base = subprocess.run(_git("-C", os.fspath(checkout), "rev-parse", spec["base_commit"]),
                               capture_output=True, text=True, check=False)
         if base.returncode:
             raise RuntimeError("integration base is unavailable from the frozen candidate")
-        subprocess.run(["git", "-C", os.fspath(checkout), "checkout", "--detach", spec["base_commit"]], check=True,
+        subprocess.run(_git("-C", os.fspath(checkout), "checkout", "--detach", spec["base_commit"]), check=True,
                        capture_output=True, text=True)
         candidate_commits: list[str] = []
         for ordinal, raw in enumerate(members):
@@ -306,10 +317,10 @@ def integrate_wave(
             bundle.write_bytes(raw)
             os.chmod(bundle, 0o600)
             source = _checkout_bundle(raw, root / f"source-{ordinal}")
-            commit = subprocess.run(["git", "-C", os.fspath(source), "rev-parse", "HEAD"], check=True,
+            commit = subprocess.run(_git("-C", os.fspath(source), "rev-parse", "HEAD"), check=True,
                                     capture_output=True, text=True).stdout.strip()
             _require_descends_from(source, spec["base_commit"], commit)
-            fetched = subprocess.run(["git", "-C", os.fspath(checkout), "fetch", os.fspath(bundle), commit],
+            fetched = subprocess.run(_git("-C", os.fspath(checkout), "fetch", os.fspath(bundle), commit),
                                      capture_output=True, text=True, check=False)
             if fetched.returncode:
                 raise RuntimeError("candidate bundle cannot be imported for integration")
@@ -325,11 +336,11 @@ def integrate_wave(
         for commit in candidate_commits:
             _require_not_cancelled(cancelled)
             merged = subprocess.run(
-                ["git", "-C", os.fspath(checkout), "merge", "--no-ff", "--no-edit", "-m", message, commit],
+                _git("-C", os.fspath(checkout), "merge", "--no-ff", "--no-edit", "-m", message, commit),
                 env=environment, capture_output=True, text=True, check=False,
             )
             if merged.returncode:
-                subprocess.run(["git", "-C", os.fspath(checkout), "merge", "--abort"], capture_output=True, text=True)
+                subprocess.run(_git("-C", os.fspath(checkout), "merge", "--abort"), capture_output=True, text=True)
                 result = {"contract_id": CANDIDATE_INTEGRATION_RESULT_V1, "spec_ref": spec_ref,
                           "spec_digest": artifact_digest(spec_ref), "outcome": "conflict",
                           "candidate_ref": None, "candidate_digest": None}
@@ -339,7 +350,7 @@ def integrate_wave(
                     journal.write("result", {"spec_ref": spec_ref, "result_ref": result_ref})
                 return result_ref
         bundle = root / "integration.bundle"
-        subprocess.run(["git", "-C", os.fspath(checkout), "bundle", "create", os.fspath(bundle), "HEAD"], check=True,
+        subprocess.run(_git("-C", os.fspath(checkout), "bundle", "create", os.fspath(bundle), "HEAD"), check=True,
                        capture_output=True, text=True)
         _require_not_cancelled(cancelled)
         candidate_ref = _put_exact(

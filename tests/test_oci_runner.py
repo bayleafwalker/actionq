@@ -12,7 +12,9 @@ from types import SimpleNamespace
 import pytest
 
 from actionq_contracts import EXECUTION_ENVELOPE_V1
-from actionq_runner.oci import OciPolicyError, oci_execute, oci_preflight
+from actionq_runner.oci import (
+    OciPolicyError, _validate_candidate_bundle, oci_execute, oci_preflight,
+)
 
 
 INFO = {
@@ -181,6 +183,34 @@ def test_preflight_requires_rootless_seccomp_and_all_cgroup_v2_controllers():
             }
         }), stderr="")
     assert oci_preflight("podman", run=podman_run)["cgroup_version"] == 2
+
+
+def test_candidate_bundle_is_verified_in_private_repository(tmp_path):
+    source_repo = tmp_path / "source"
+    source_repo.mkdir()
+    git(source_repo, "init", "-q")
+    git(source_repo, "config", "user.email", "runner@example.invalid")
+    git(source_repo, "config", "user.name", "Runner")
+    (source_repo / "README.md").write_text("source\n")
+    git(source_repo, "add", ".")
+    git(source_repo, "commit", "-qm", "source")
+    source = git(source_repo, "rev-parse", "HEAD")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    subprocess.run(
+        ["git", "-C", str(source_repo), "bundle", "create",
+         str(stage / "candidate.bundle"), "HEAD"],
+        check=True,
+    )
+    (stage / "candidate.bundle").chmod(0o600)
+
+    candidate, changed, _manifest, _digest = _validate_candidate_bundle(
+        stage, source, {"allowed_paths": ["docs/**"]},
+    )
+
+    assert candidate == source
+    assert changed == ()
+    assert git(stage / "verify.git", "rev-parse", "--is-bare-repository") == "true"
 
 
 @pytest.mark.parametrize("field,value,match", [
