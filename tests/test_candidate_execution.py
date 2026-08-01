@@ -146,6 +146,18 @@ def test_wave_integration_preserves_frozen_member_ordinal_order(tmp_path):
     before_replay = set(store.objects)
     assert integrate_wave(store, spec_ref=integration_ref, author_name="ActionQ", author_email="actionq@example.invalid", commit_timestamp="2026-08-01T00:00:00Z", trusted_registry_ref=registry_ref) == result_ref
     assert set(store.objects) == before_replay
+    recovery = tmp_path / "recovery"
+    recovery.mkdir(mode=0o700)
+    assert integrate_wave(
+        store, spec_ref=integration_ref, author_name="ActionQ", author_email="actionq@example.invalid",
+        commit_timestamp="2026-08-01T00:00:00Z", trusted_registry_ref=registry_ref,
+        recovery_root=recovery, operation_id="wave-one",
+    ) == result_ref
+    assert integrate_wave(
+        store, spec_ref=integration_ref, author_name="ActionQ", author_email="actionq@example.invalid",
+        commit_timestamp="2026-08-01T00:00:00Z", trusted_registry_ref=registry_ref,
+        recovery_root=recovery, operation_id="wave-one",
+    ) == result_ref
     with pytest.raises(CandidateExecutionCancelled):
         integrate_wave(store, spec_ref=integration_ref, author_name="ActionQ", author_email="actionq@example.invalid", commit_timestamp="2026-08-01T00:00:00Z", cancelled=lambda: True, trusted_registry_ref=registry_ref)
     assert set(store.objects) == before_replay
