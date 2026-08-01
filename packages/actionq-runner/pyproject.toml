@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "actionq-runner"
-version = "0.3.1"
+version = "0.3.2"
 requires-python = ">=3.11"
 dependencies = ["actionq-contracts==0.1.1", "cryptography>=45"]
 description = "Unprivileged ActionQ harness runner"

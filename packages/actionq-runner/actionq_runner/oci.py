@@ -433,7 +433,15 @@ def _validate_candidate_bundle(stage: Path, source: str, envelope: Mapping[str, 
     metadata = bundle.lstat()
     if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
         raise OciPolicyError("candidate bundle must be a mode-0600 regular file")
-    verify = subprocess.run(["git", *_GIT_CONFIG, "bundle", "verify", os.fspath(bundle)],
+    verify_repo = stage / "verify.git"
+    initialized = subprocess.run(
+        ["git", *_GIT_CONFIG, "init", "--bare", "--quiet", os.fspath(verify_repo)],
+        capture_output=True, check=False, env=_git_env(),
+    )
+    if initialized.returncode:
+        raise OciPolicyError("candidate verification repository could not be initialized")
+    verify = subprocess.run(["git", *_GIT_CONFIG, "-C", os.fspath(verify_repo),
+                             "bundle", "verify", os.fspath(bundle)],
                             capture_output=True, check=False, env=_git_env())
     if verify.returncode:
         raise OciPolicyError("candidate Git bundle failed verification")
