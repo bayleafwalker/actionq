@@ -44,11 +44,13 @@ def records() -> list[dict]:
         "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
         "candidate_ref": ref("1"), "candidate_digest": digest("1"),
         "profile_ref": ref("2"), "profile_digest": digest("2"),
+        "publication_ref": ref("6"), "publication_digest": digest("6"),
     }
     verification_result = {
         "contract_id": CANDIDATE_VERIFICATION_RESULT_V1,
         "spec_ref": ref("3"), "spec_digest": digest("3"),
         "candidate_ref": ref("4"), "candidate_digest": digest("4"),
+        "publication_ref": ref("6"), "publication_digest": digest("6"),
         "outcome": "passed", "evidence_ref": ref("5"), "evidence_digest": digest("5"),
     }
     integration_spec = {

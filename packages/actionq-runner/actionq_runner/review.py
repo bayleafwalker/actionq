@@ -5,13 +5,14 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from actionq_contracts import (
     ACTION_CREATION_REQUEST_V1,
     CANDIDATE_REVIEW_RESULT_V1,
     CANDIDATE_REVIEW_SPEC_V1,
     CANDIDATE_VERIFICATION_RESULT_V1,
+    PUBLICATION_V1,
     artifact_digest,
     canonical_bytes,
     require_compatible,
@@ -34,6 +35,11 @@ _IDENTITY_FIELDS = (
     "verification_result_ref", "review_result_artifact_ref",
 )
 _FINDING_FIELDS = frozenset({"id", "category", "summary"})
+
+
+def _require_not_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise RuntimeError("candidate review was cancelled")
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,7 @@ def _validate_metadata(metadata: dict[str, Any]) -> None:
 
 def publish_review_result(
     store: ArtifactStore, *, spec_ref: str, findings: Sequence[Mapping[str, str]],
+    cancelled: Callable[[], bool] | None = None,
 ) -> str:
     """Publish a bounded immutable review result before any Auditctl observation.
 
@@ -98,6 +105,7 @@ def publish_review_result(
     logs, prompts, credentials, approval language, and review transcripts have
     no place in the candidate protocol artifact.
     """
+    _require_not_cancelled(cancelled)
     spec = resolve_exact_contract(store, spec_ref, CANDIDATE_REVIEW_SPEC_V1)
     verification = resolve_exact_contract(
         store, spec["verification_result_ref"], CANDIDATE_VERIFICATION_RESULT_V1,
@@ -108,6 +116,13 @@ def publish_review_result(
         spec["candidate_ref"], spec["candidate_digest"],
     ):
         raise RuntimeError("review candidate does not match its verification result")
+    if (verification["publication_ref"], verification["publication_digest"]) != (
+        spec["publication_ref"], spec["publication_digest"],
+    ):
+        raise RuntimeError("review publication does not match its verification eligibility binding")
+    publication = resolve_exact_contract(store, spec["publication_ref"], PUBLICATION_V1)
+    if publication["terminal_status"] != "verified":
+        raise RuntimeError("review publication is not eligible")
     normalized: list[dict[str, str]] = []
     for finding in findings:
         if not isinstance(finding, Mapping) or set(finding) != _FINDING_FIELDS:
@@ -119,6 +134,7 @@ def publish_review_result(
             raise ValueError("review finding contains forbidden protocol material")
         normalized.append(copied)
     findings_raw = canonical_bytes({"contract_id": "candidate-review-findings/v1", "findings": normalized})
+    _require_not_cancelled(cancelled)
     findings_ref = store.put(findings_raw)
     if artifact_ref(findings_raw) != findings_ref or store.get(findings_ref) != findings_raw:
         raise RuntimeError("CAS failed to preserve review findings bytes")
@@ -132,6 +148,7 @@ def publish_review_result(
     }
     require_compatible(result)
     raw = canonical_bytes(result)
+    _require_not_cancelled(cancelled)
     result_ref = store.put(raw)
     if artifact_ref(raw) != result_ref or store.get(result_ref) != raw:
         raise RuntimeError("CAS failed to preserve review result bytes")

@@ -18,6 +18,7 @@ def _spec() -> dict:
         "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
         "candidate_ref": _ref("b"), "candidate_digest": "sha256:" + "b" * 64,
         "profile_ref": _ref("c"), "profile_digest": "sha256:" + "c" * 64,
+        "publication_ref": _ref("d"), "publication_digest": "sha256:" + "d" * 64,
     }
 
 

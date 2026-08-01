@@ -114,10 +114,16 @@ def test_review_result_is_immutable_and_requires_passed_bound_verification(fake_
     store = MemoryStore()
     candidate_ref = store.put(b"candidate bundle")
     evidence_ref = store.put(canonical_bytes({"ok": True}))
+    publication_ref = store.put(canonical_bytes({
+        "contract_id": "publication/v1", "action_id": 1, "attempt_id": "attempt-1",
+        "candidate_digest": "sha256:" + "1" * 64,
+        "verification_digest": "sha256:" + "2" * 64, "terminal_status": "verified",
+    }))
     verification_ref = store.put(canonical_bytes({
         "contract_id": CANDIDATE_VERIFICATION_RESULT_V1,
         "spec_ref": _ref("a"), "spec_digest": "sha256:" + "a" * 64,
         "candidate_ref": candidate_ref, "candidate_digest": candidate_ref.removeprefix("artifact:"),
+        "publication_ref": publication_ref, "publication_digest": publication_ref.removeprefix("artifact:"),
         "outcome": "passed", "evidence_ref": evidence_ref, "evidence_digest": evidence_ref.removeprefix("artifact:"),
     }))
     spec = {
@@ -125,7 +131,7 @@ def test_review_result_is_immutable_and_requires_passed_bound_verification(fake_
         "candidate_ref": candidate_ref, "candidate_digest": candidate_ref.removeprefix("artifact:"),
         "verification_result_ref": verification_ref,
         "verification_result_digest": verification_ref.removeprefix("artifact:"),
-        "publication_ref": _ref("d"), "publication_digest": "sha256:" + "d" * 64,
+        "publication_ref": publication_ref, "publication_digest": publication_ref.removeprefix("artifact:"),
         "subject_kind": "candidate", "reviewed_commit": "e" * 40,
     }
     spec_ref = store.put(canonical_bytes(spec))

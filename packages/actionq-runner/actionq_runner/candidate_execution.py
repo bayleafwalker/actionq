@@ -18,6 +18,7 @@ from actionq_contracts import (
     CANDIDATE_INTEGRATION_SPEC_V1,
     CANDIDATE_VERIFICATION_RESULT_V1,
     CANDIDATE_VERIFICATION_SPEC_V1,
+    PUBLICATION_V1,
     VERIFICATION_PROFILE_V1,
     artifact_digest,
     canonical_bytes,
@@ -27,6 +28,10 @@ from actionq_contracts import (
 
 from .candidates import CandidateRecoveryJournal, resolve_exact_contract
 from .publisher import ArtifactStore, artifact_ref
+
+INTEGRATION_AUTHOR_NAME = "ActionQ Integration"
+INTEGRATION_AUTHOR_EMAIL = "integration@actionq.invalid"
+INTEGRATION_COMMIT_TIMESTAMP = "2000-01-01T00:00:00Z"
 
 
 class CandidateExecutionCancelled(RuntimeError):
@@ -38,16 +43,23 @@ def _require_not_cancelled(cancelled: Callable[[], bool] | None) -> None:
         raise CandidateExecutionCancelled("candidate operation was cancelled")
 
 
-def _put_contract(store: ArtifactStore, value: dict[str, Any]) -> str:
+def _put_contract(
+    store: ArtifactStore, value: dict[str, Any], *, cancelled: Callable[[], bool] | None = None,
+) -> str:
     require_compatible(value)
     raw = canonical_bytes(value)
+    _require_not_cancelled(cancelled)
     reference = store.put(raw)
     if artifact_digest(reference) != sha256_digest(value) or store.get(reference) != raw:
         raise RuntimeError("CAS failed to preserve canonical contract bytes")
     return reference
 
 
-def _put_exact(store: ArtifactStore, raw: bytes, *, label: str) -> str:
+def _put_exact(
+    store: ArtifactStore, raw: bytes, *, label: str,
+    cancelled: Callable[[], bool] | None = None,
+) -> str:
+    _require_not_cancelled(cancelled)
     reference = store.put(raw)
     if artifact_ref(raw) != reference or store.get(reference) != raw:
         raise RuntimeError(f"CAS failed to preserve {label} bytes")
@@ -77,6 +89,13 @@ def _registry_command(
             or any(not isinstance(part, str) or not part for part in command)):
         raise RuntimeError("verification profile command is absent from the read-only registry")
     return tuple(command)
+
+
+def _require_eligible_publication(store: ArtifactStore, reference: str) -> dict[str, Any]:
+    publication = resolve_exact_contract(store, reference, PUBLICATION_V1)
+    if publication["terminal_status"] != "verified":
+        raise RuntimeError("candidate publication is not eligible for verification")
+    return publication
 
 
 def _checkout_bundle(raw: bytes, directory: Path) -> Path:
@@ -134,6 +153,7 @@ def verify_candidate(
     if trusted_registry_ref is None:
         raise ValueError("an operator-trusted verification registry reference is required")
     spec = resolve_exact_contract(store, spec_ref, CANDIDATE_VERIFICATION_SPEC_V1)
+    _require_eligible_publication(store, spec["publication_ref"])
     profile = resolve_exact_contract(store, spec["profile_ref"], VERIFICATION_PROFILE_V1)
     command = _registry_command(store, profile, trusted_registry_ref=trusted_registry_ref)
     candidate_raw = store.get(spec["candidate_ref"])
@@ -159,15 +179,17 @@ def verify_candidate(
                         "exit_code": None, "timed_out": True}
     _require_not_cancelled(cancelled)
     evidence_raw = canonical_bytes(evidence)
-    evidence_ref = _put_exact(store, evidence_raw, label="verification evidence")
+    evidence_ref = _put_exact(store, evidence_raw, label="verification evidence", cancelled=cancelled)
     result = {
         "contract_id": CANDIDATE_VERIFICATION_RESULT_V1,
         "spec_ref": spec_ref, "spec_digest": artifact_digest(spec_ref),
         "candidate_ref": spec["candidate_ref"], "candidate_digest": spec["candidate_digest"],
+        "publication_ref": spec["publication_ref"], "publication_digest": spec["publication_digest"],
         "outcome": outcome, "evidence_ref": evidence_ref, "evidence_digest": artifact_digest(evidence_ref),
     }
-    result_ref = _put_contract(store, result)
+    result_ref = _put_contract(store, result, cancelled=cancelled)
     if journal is not None:
+        _require_not_cancelled(cancelled)
         journal.write("result", {"spec_ref": spec_ref, "result_ref": result_ref})
     return result_ref
 
@@ -176,9 +198,6 @@ def integrate_wave(
     store: ArtifactStore,
     *,
     spec_ref: str,
-    author_name: str,
-    author_email: str,
-    commit_timestamp: str,
     recovery_root: Path | str | None = None,
     operation_id: str | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -190,12 +209,15 @@ def integrate_wave(
     A conflict returns an immutable result but emits neither a bundle nor any
     settlement receipt.
     """
-    if not author_name or not author_email or not commit_timestamp:
-        raise ValueError("integration commit identity and timestamp are required policy inputs")
     _require_not_cancelled(cancelled)
     if trusted_registry_ref is None:
         raise ValueError("an operator-trusted verification registry reference is required")
     spec = resolve_exact_contract(store, spec_ref, CANDIDATE_INTEGRATION_SPEC_V1)
+    expected_input_set_digest = sha256_digest({
+        "contract_id": "immutable-input-set/v1", "inputs": spec["member_result_refs"],
+    })
+    if spec["input_set_digest"] != expected_input_set_digest:
+        raise RuntimeError("integration input_set_digest does not match ordered member results")
     journal = None
     if recovery_root is not None:
         if not operation_id:
@@ -211,6 +233,7 @@ def integrate_wave(
         verification_spec = resolve_exact_contract(
             store, result["spec_ref"], CANDIDATE_VERIFICATION_SPEC_V1,
         )
+        _require_eligible_publication(store, verification_spec["publication_ref"])
         profile = resolve_exact_contract(
             store, verification_spec["profile_ref"], VERIFICATION_PROFILE_V1,
         )
@@ -222,6 +245,10 @@ def integrate_wave(
             verification_spec["candidate_ref"], verification_spec["candidate_digest"],
         ):
             raise RuntimeError("passed verification result does not bind its exact verification spec candidate")
+        if (result["publication_ref"], result["publication_digest"]) != (
+            verification_spec["publication_ref"], verification_spec["publication_digest"],
+        ):
+            raise RuntimeError("passed verification result does not bind its eligible publication")
         raw = store.get(result["candidate_ref"])
         if artifact_ref(raw) != result["candidate_ref"]:
             raise RuntimeError("verified candidate locator does not match its bytes")
@@ -253,8 +280,9 @@ def integrate_wave(
                   "spec_digest": artifact_digest(spec_ref), "outcome": "integrated",
                   "candidate_ref": artifact_ref(members[-1]), "candidate_digest": artifact_digest(artifact_ref(members[-1]))}
         _require_not_cancelled(cancelled)
-        result_ref = _put_contract(store, result)
+        result_ref = _put_contract(store, result, cancelled=cancelled)
         if journal is not None:
+            _require_not_cancelled(cancelled)
             journal.write("result", {"spec_ref": spec_ref, "result_ref": result_ref})
         return result_ref
     with tempfile.TemporaryDirectory(prefix="actionq-integrate-") as temporary:
@@ -286,9 +314,13 @@ def integrate_wave(
             if fetched.returncode:
                 raise RuntimeError("candidate bundle cannot be imported for integration")
             candidate_commits.append(commit)
-        environment = {**os.environ, "GIT_AUTHOR_NAME": author_name, "GIT_AUTHOR_EMAIL": author_email,
-                       "GIT_COMMITTER_NAME": author_name, "GIT_COMMITTER_EMAIL": author_email,
-                       "GIT_AUTHOR_DATE": commit_timestamp, "GIT_COMMITTER_DATE": commit_timestamp}
+        environment = {**os.environ,
+                       "GIT_AUTHOR_NAME": INTEGRATION_AUTHOR_NAME,
+                       "GIT_AUTHOR_EMAIL": INTEGRATION_AUTHOR_EMAIL,
+                       "GIT_COMMITTER_NAME": INTEGRATION_AUTHOR_NAME,
+                       "GIT_COMMITTER_EMAIL": INTEGRATION_AUTHOR_EMAIL,
+                       "GIT_AUTHOR_DATE": INTEGRATION_COMMIT_TIMESTAMP,
+                       "GIT_COMMITTER_DATE": INTEGRATION_COMMIT_TIMESTAMP}
         message = f"actionq integration {artifact_digest(spec_ref)}"
         for commit in candidate_commits:
             _require_not_cancelled(cancelled)
@@ -301,20 +333,24 @@ def integrate_wave(
                 result = {"contract_id": CANDIDATE_INTEGRATION_RESULT_V1, "spec_ref": spec_ref,
                           "spec_digest": artifact_digest(spec_ref), "outcome": "conflict",
                           "candidate_ref": None, "candidate_digest": None}
-                result_ref = _put_contract(store, result)
+                result_ref = _put_contract(store, result, cancelled=cancelled)
                 if journal is not None:
+                    _require_not_cancelled(cancelled)
                     journal.write("result", {"spec_ref": spec_ref, "result_ref": result_ref})
                 return result_ref
         bundle = root / "integration.bundle"
         subprocess.run(["git", "-C", os.fspath(checkout), "bundle", "create", os.fspath(bundle), "HEAD"], check=True,
                        capture_output=True, text=True)
         _require_not_cancelled(cancelled)
-        candidate_ref = _put_exact(store, bundle.read_bytes(), label="integration candidate bundle")
+        candidate_ref = _put_exact(
+            store, bundle.read_bytes(), label="integration candidate bundle", cancelled=cancelled,
+        )
     _require_not_cancelled(cancelled)
     result = {"contract_id": CANDIDATE_INTEGRATION_RESULT_V1, "spec_ref": spec_ref,
               "spec_digest": artifact_digest(spec_ref), "outcome": "integrated",
               "candidate_ref": candidate_ref, "candidate_digest": artifact_digest(candidate_ref)}
-    result_ref = _put_contract(store, result)
+    result_ref = _put_contract(store, result, cancelled=cancelled)
     if journal is not None:
+        _require_not_cancelled(cancelled)
         journal.write("result", {"spec_ref": spec_ref, "result_ref": result_ref})
     return result_ref

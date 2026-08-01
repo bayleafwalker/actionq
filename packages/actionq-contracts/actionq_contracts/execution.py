@@ -157,11 +157,11 @@ _IMMUTABLE_V1_FIELDS: dict[str, frozenset[str]] = {
     }),
     CANDIDATE_VERIFICATION_SPEC_V1: frozenset({
         "contract_id", "candidate_ref", "candidate_digest",
-        "profile_ref", "profile_digest",
+        "profile_ref", "profile_digest", "publication_ref", "publication_digest",
     }),
     CANDIDATE_VERIFICATION_RESULT_V1: frozenset({
         "contract_id", "spec_ref", "spec_digest", "candidate_ref", "candidate_digest",
-        "outcome", "evidence_ref", "evidence_digest",
+        "publication_ref", "publication_digest", "outcome", "evidence_ref", "evidence_digest",
     }),
     CANDIDATE_INTEGRATION_SPEC_V1: frozenset({
         "contract_id", "topology", "base_commit",

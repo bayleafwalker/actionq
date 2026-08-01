@@ -139,11 +139,11 @@ def immutable_spec_input_refs(spec: dict[str, Any]) -> list[str]:
     """Return the sole ordered input set admitted by one frozen spec."""
     contract = require_contract_compatible(spec)
     if contract == "candidate-verification-spec/v1":
-        return [spec["candidate_ref"], spec["profile_ref"]]
+        return [spec["candidate_ref"], spec["profile_ref"], spec["publication_ref"]]
     if contract == "candidate-integration-spec/v1":
         return list(spec["member_result_refs"])
     if contract == "candidate-review-spec/v1":
-        return [spec["candidate_ref"], spec["verification_result_ref"]]
+        return [spec["candidate_ref"], spec["verification_result_ref"], spec["publication_ref"]]
     raise ActionQError("immutable action spec contract is unsupported")
 
 

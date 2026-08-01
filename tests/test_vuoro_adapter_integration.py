@@ -133,8 +133,9 @@ def _immutable_candidate_arguments() -> dict:
         "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
         "candidate_ref": _artifact("b"), "candidate_digest": "sha256:" + "b" * 64,
         "profile_ref": _artifact("c"), "profile_digest": "sha256:" + "c" * 64,
+        "publication_ref": _artifact("d"), "publication_digest": "sha256:" + "d" * 64,
     }
-    input_refs = [spec["candidate_ref"], spec["profile_ref"]]
+    input_refs = [spec["candidate_ref"], spec["profile_ref"], spec["publication_ref"]]
     return {
         "request": {
             "contract_id": "action-creation-request/v1",
