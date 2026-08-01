@@ -5,7 +5,19 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
+
+from actionq_contracts import (
+    CANDIDATE_REVIEW_RESULT_V1,
+    CANDIDATE_REVIEW_SPEC_V1,
+    CANDIDATE_VERIFICATION_RESULT_V1,
+    artifact_digest,
+    canonical_bytes,
+    require_compatible,
+)
+
+from .candidates import resolve_exact_contract
+from .publisher import ArtifactStore, artifact_ref
 
 
 _ARTIFACT = re.compile(r"artifact:sha256:[0-9a-f]{64}\Z")
@@ -20,6 +32,7 @@ _IDENTITY_FIELDS = (
     "action_id", "attempt_id", "plan_ref", "subject_kind", "publication_ref",
     "verification_result_ref", "review_result_artifact_ref",
 )
+_FINDING_FIELDS = frozenset({"id", "category", "summary"})
 
 
 @dataclass(frozen=True)
@@ -73,6 +86,53 @@ def _validate_metadata(metadata: dict[str, Any]) -> None:
     forbidden = ("approval", "acceptance", "merge", "release", "prompt", "transcript", "receipt", "credential", "secret", "token", "raw_log")
     if any(any(term in key.lower() for term in forbidden) for key in metadata):
         raise ValueError("review metadata contains forbidden authority material")
+
+
+def publish_review_result(
+    store: ArtifactStore, *, spec_ref: str, findings: Sequence[Mapping[str, str]],
+) -> str:
+    """Publish a bounded immutable review result before any Auditctl observation.
+
+    Findings are deliberately short identifiers/categories/summaries only: raw
+    logs, prompts, credentials, approval language, and review transcripts have
+    no place in the candidate protocol artifact.
+    """
+    spec = resolve_exact_contract(store, spec_ref, CANDIDATE_REVIEW_SPEC_V1)
+    verification = resolve_exact_contract(
+        store, spec["verification_result_ref"], CANDIDATE_VERIFICATION_RESULT_V1,
+    )
+    if verification["outcome"] != "passed":
+        raise RuntimeError("candidate review requires an exact passed verification result")
+    if (verification["candidate_ref"], verification["candidate_digest"]) != (
+        spec["candidate_ref"], spec["candidate_digest"],
+    ):
+        raise RuntimeError("review candidate does not match its verification result")
+    normalized: list[dict[str, str]] = []
+    for finding in findings:
+        if not isinstance(finding, Mapping) or set(finding) != _FINDING_FIELDS:
+            raise ValueError("review findings must have exact id, category, and summary fields")
+        copied = dict(finding)
+        if any(not isinstance(copied[field], str) or not copied[field] for field in _FINDING_FIELDS):
+            raise ValueError("review finding fields must be non-empty strings")
+        if any(term in " ".join(copied.values()).lower() for term in ("approval", "merge", "release", "token", "secret", "credential", "prompt", "transcript")):
+            raise ValueError("review finding contains forbidden protocol material")
+        normalized.append(copied)
+    findings_raw = canonical_bytes({"contract_id": "candidate-review-findings/v1", "findings": normalized})
+    findings_ref = store.put(findings_raw)
+    result = {
+        "contract_id": CANDIDATE_REVIEW_RESULT_V1,
+        "spec_ref": spec_ref,
+        "spec_digest": artifact_digest(spec_ref),
+        "outcome": "findings-recorded" if normalized else "no-findings",
+        "findings_ref": findings_ref,
+        "findings_digest": artifact_digest(findings_ref),
+    }
+    require_compatible(result)
+    raw = canonical_bytes(result)
+    result_ref = store.put(raw)
+    if artifact_ref(raw) != result_ref:
+        raise RuntimeError("CAS failed to preserve review result bytes")
+    return result_ref
 
 
 def _matching(event: dict[str, Any], observation: ReviewObservation) -> bool:

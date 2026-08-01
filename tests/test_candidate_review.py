@@ -6,7 +6,28 @@ from pathlib import Path
 
 import pytest
 
-from actionq_runner.review import ReviewObservation, publish_review, reconcile_review
+from actionq_contracts import (
+    CANDIDATE_REVIEW_RESULT_V1,
+    CANDIDATE_REVIEW_SPEC_V1,
+    CANDIDATE_VERIFICATION_RESULT_V1,
+    canonical_bytes,
+)
+from actionq_runner.publisher import artifact_ref
+from actionq_runner.candidates import resolve_exact_contract
+from actionq_runner.review import ReviewObservation, publish_review, publish_review_result, reconcile_review
+
+
+class MemoryStore:
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+
+    def put(self, value: bytes) -> str:
+        reference = artifact_ref(value)
+        self.objects.setdefault(reference, value)
+        return reference
+
+    def get(self, reference: str) -> bytes:
+        return self.objects[reference]
 
 
 def _ref(letter: str) -> str:
@@ -87,3 +108,31 @@ def test_review_metadata_has_no_authority_or_hidden_fields():
         _observation(metadata={"approval": "yes"})
     with pytest.raises(ValueError, match="full lowercase"):
         _observation(reviewed_commit="short")
+
+
+def test_review_result_is_immutable_and_requires_passed_bound_verification():
+    store = MemoryStore()
+    candidate_ref = store.put(b"candidate bundle")
+    evidence_ref = store.put(canonical_bytes({"ok": True}))
+    verification_ref = store.put(canonical_bytes({
+        "contract_id": CANDIDATE_VERIFICATION_RESULT_V1,
+        "spec_ref": _ref("a"), "spec_digest": "sha256:" + "a" * 64,
+        "candidate_ref": candidate_ref, "candidate_digest": candidate_ref.removeprefix("artifact:"),
+        "outcome": "passed", "evidence_ref": evidence_ref, "evidence_digest": evidence_ref.removeprefix("artifact:"),
+    }))
+    spec = {
+        "contract_id": CANDIDATE_REVIEW_SPEC_V1,
+        "request_ref": _ref("b"), "request_digest": "sha256:" + "b" * 64,
+        "candidate_ref": candidate_ref, "candidate_digest": candidate_ref.removeprefix("artifact:"),
+        "verification_result_ref": verification_ref,
+        "verification_result_digest": verification_ref.removeprefix("artifact:"),
+    }
+    spec_ref = store.put(canonical_bytes(spec))
+
+    result_ref = publish_review_result(store, spec_ref=spec_ref, findings=[])
+    result = resolve_exact_contract(store, result_ref, CANDIDATE_REVIEW_RESULT_V1)
+    assert result["outcome"] == "no-findings"
+    with pytest.raises(ValueError, match="forbidden"):
+        publish_review_result(store, spec_ref=spec_ref, findings=[{
+            "id": "one", "category": "protocol", "summary": "approval granted",
+        }])
