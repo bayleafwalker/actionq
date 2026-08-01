@@ -152,3 +152,55 @@ def test_stacked_integration_returns_the_existing_tip_without_a_synthetic_bundle
     result = resolve_exact_contract(store, result_ref, CANDIDATE_INTEGRATION_RESULT_V1)
     assert result["outcome"] == "integrated"
     assert result["candidate_ref"] == second_ref
+
+
+def test_wave_conflict_from_individually_passed_candidates_publishes_no_bundle(tmp_path):
+    store = MemoryStore()
+    base_repo = tmp_path / "base"
+    subprocess.run(["git", "init", "-q", str(base_repo)], check=True)
+    _git(base_repo, "config", "user.name", "ActionQ Test")
+    _git(base_repo, "config", "user.email", "test@example.invalid")
+    (base_repo / "shared.txt").write_text("base\n")
+    _git(base_repo, "add", "shared.txt")
+    _git(base_repo, "commit", "-qm", "base")
+    base = _git(base_repo, "rev-parse", "HEAD")
+
+    bundles: list[bytes] = []
+    for name, value in (("first", "first\n"), ("second", "second\n")):
+        repo = tmp_path / name
+        subprocess.run(["git", "clone", "-q", str(base_repo), str(repo)], check=True)
+        _git(repo, "config", "user.name", "ActionQ Test")
+        _git(repo, "config", "user.email", "test@example.invalid")
+        (repo / "shared.txt").write_text(value)
+        _git(repo, "add", "shared.txt")
+        _git(repo, "commit", "-qm", name)
+        bundle = tmp_path / f"{name}.bundle"
+        _git(repo, "bundle", "create", str(bundle), "HEAD")
+        bundles.append(bundle.read_bytes())
+    candidate_refs = [store.put(bundle) for bundle in bundles]
+    evidence = store.put(canonical_bytes({"ok": True}))
+
+    result_refs = []
+    for ordinal, candidate_ref in enumerate(candidate_refs):
+        spec_ref = "artifact:sha256:" + str(ordinal + 1) * 64
+        result_refs.append(_put_contract(store, {
+            "contract_id": CANDIDATE_VERIFICATION_RESULT_V1,
+            "spec_ref": spec_ref, "spec_digest": artifact_digest(spec_ref),
+            "candidate_ref": candidate_ref, "candidate_digest": artifact_digest(candidate_ref),
+            "outcome": "passed", "evidence_ref": evidence, "evidence_digest": artifact_digest(evidence),
+        }))
+    integration = {
+        "contract_id": CANDIDATE_INTEGRATION_SPEC_V1,
+        "request_ref": "artifact:sha256:" + "a" * 64, "request_digest": "sha256:" + "a" * 64,
+        "topology": "wave-integrated", "base_commit": base,
+        "member_result_refs": result_refs, "input_set_digest": "sha256:" + "b" * 64,
+    }
+    before = set(store.objects)
+    result_ref = integrate_wave(store, spec_ref=_put_contract(store, integration), author_name="ActionQ", author_email="actionq@example.invalid", commit_timestamp="2026-08-01T00:00:00Z")
+    result = resolve_exact_contract(store, result_ref, CANDIDATE_INTEGRATION_RESULT_V1)
+    assert result == {
+        "contract_id": CANDIDATE_INTEGRATION_RESULT_V1,
+        "spec_ref": _put_contract(store, integration), "spec_digest": artifact_digest(_put_contract(store, integration)),
+        "outcome": "conflict", "candidate_ref": None, "candidate_digest": None,
+    }
+    assert set(store.objects) - before == {_put_contract(store, integration), result_ref}
