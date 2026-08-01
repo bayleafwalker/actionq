@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN pip3 install psycopg[binary]
 COPY . /app
-RUN pip3 install /app
+RUN pip3 install /app/packages/actionq-contracts /app
 
 ENV PORT=8080
 ENV HOST=0.0.0.0

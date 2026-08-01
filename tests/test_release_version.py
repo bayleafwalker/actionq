@@ -15,3 +15,8 @@ def test_source_metadata_and_cli_version_are_identical():
     result = CliRunner().invoke(cli, ["--version"])
     assert result.exit_code == 0
     assert __version__ in result.output
+
+
+def test_container_installs_the_vendored_contract_package_before_actionq():
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text()
+    assert "pip3 install /app/packages/actionq-contracts /app" in dockerfile
