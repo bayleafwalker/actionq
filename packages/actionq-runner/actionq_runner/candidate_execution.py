@@ -84,6 +84,15 @@ def _checkout_bundle(raw: bytes, directory: Path) -> Path:
     return checkout
 
 
+def _require_descends_from(checkout: Path, base_commit: str, candidate_commit: str) -> None:
+    relation = subprocess.run(
+        ["git", "-C", os.fspath(checkout), "merge-base", "--is-ancestor", base_commit, candidate_commit],
+        capture_output=True, text=True, check=False,
+    )
+    if relation.returncode:
+        raise RuntimeError("candidate does not descend from the frozen integration base")
+
+
 def verify_candidate(
     store: ArtifactStore,
     *,
@@ -179,12 +188,14 @@ def integrate_wave(
                 ["git", "-C", os.fspath(previous), "rev-parse", "HEAD"], check=True,
                 capture_output=True, text=True,
             ).stdout.strip()
+            _require_descends_from(previous, spec["base_commit"], previous_head)
             for ordinal, raw in enumerate(members[1:], start=1):
                 current = _checkout_bundle(raw, root / f"member-{ordinal}")
                 current_head = subprocess.run(
                     ["git", "-C", os.fspath(current), "rev-parse", "HEAD"], check=True,
                     capture_output=True, text=True,
                 ).stdout.strip()
+                _require_descends_from(current, spec["base_commit"], current_head)
                 ordered = subprocess.run(
                     ["git", "-C", os.fspath(current), "merge-base", "--is-ancestor", previous_head, current_head],
                     capture_output=True, text=True, check=False,
@@ -202,6 +213,11 @@ def integrate_wave(
     with tempfile.TemporaryDirectory(prefix="actionq-integrate-") as temporary:
         root = Path(temporary)
         checkout = _checkout_bundle(members[0], root / "member-0")
+        initial_head = subprocess.run(
+            ["git", "-C", os.fspath(checkout), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        _require_descends_from(checkout, spec["base_commit"], initial_head)
         base = subprocess.run(["git", "-C", os.fspath(checkout), "rev-parse", spec["base_commit"]],
                               capture_output=True, text=True, check=False)
         if base.returncode:
@@ -216,6 +232,7 @@ def integrate_wave(
             source = _checkout_bundle(raw, root / f"source-{ordinal}")
             commit = subprocess.run(["git", "-C", os.fspath(source), "rev-parse", "HEAD"], check=True,
                                     capture_output=True, text=True).stdout.strip()
+            _require_descends_from(source, spec["base_commit"], commit)
             fetched = subprocess.run(["git", "-C", os.fspath(checkout), "fetch", os.fspath(bundle), commit],
                                      capture_output=True, text=True, check=False)
             if fetched.returncode:
