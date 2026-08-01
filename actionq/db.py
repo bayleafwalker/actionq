@@ -155,9 +155,6 @@ def create_immutable_action(
         request, expected_contract=ACTION_CREATION_REQUEST_V1,
     )
     spec_raw, spec_digest = _immutable_snapshot(spec)
-    if request["request_ref"] if "request_ref" in request else False:
-        # action-creation-request/v1 intentionally has no self-reference.
-        raise ActionQError("immutable action request must not self-reference")
     if request["spec_digest"] != spec_digest or request["spec_ref"] != "artifact:" + spec_digest:
         raise ActionQError("immutable action request does not bind exact spec bytes")
     expected_inputs = immutable_input_set_digest(input_refs)
