@@ -65,6 +65,8 @@ def records() -> list[dict]:
         "contract_id": CANDIDATE_REVIEW_SPEC_V1,
         "candidate_ref": ref("d"), "candidate_digest": digest("d"),
         "verification_result_ref": ref("e"), "verification_result_digest": digest("e"),
+        "publication_ref": ref("f"), "publication_digest": digest("f"),
+        "subject_kind": "candidate", "reviewed_commit": "a" * 40,
     }
     review_result = {
         "contract_id": CANDIDATE_REVIEW_RESULT_V1,

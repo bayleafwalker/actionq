@@ -14,7 +14,7 @@ from actionq_contracts import (
 )
 from actionq_runner.publisher import artifact_ref
 from actionq_runner.candidates import resolve_exact_contract
-from actionq_runner.review import ReviewObservation, publish_review, publish_review_result, reconcile_review
+from actionq_runner.review import ReviewObservation, _publish_observation, publish_review, publish_review_result, reconcile_review
 
 
 class MemoryStore:
@@ -73,14 +73,14 @@ def fake_auditctl(tmp_path: Path, monkeypatch):
 def test_publish_review_is_exact_and_reconciles_before_retry(fake_auditctl):
     binary, path = fake_auditctl
     observation = _observation(work_item_id=2035, sprint_id=543)
-    assert publish_review(str(binary), observation) == "published"
+    assert _publish_observation(str(binary), observation) == "published"
     events = json.loads(path.read_text())
     assert len(events) == 1
     assert events[0]["type"] == "candidate.reviewed"
     assert events[0]["source"] == "actionq-review"
     assert events[0]["refs"] == ["sha:" + "f" * 40, "wi:2035", "sprint:543"]
     assert events[0]["metadata"] == observation.metadata
-    assert publish_review(str(binary), observation) == "published"
+    assert _publish_observation(str(binary), observation) == "published"
     assert len(json.loads(path.read_text())) == 1
 
 
@@ -92,14 +92,14 @@ def test_reconcile_fails_closed_on_divergent_immutable_result(fake_auditctl):
         "type": "candidate.reviewed", "source": "actionq-review", "metadata": conflicting.metadata,
     }]))
     assert reconcile_review(str(binary), observed) == "conflict"
-    assert publish_review(str(binary), observed) == "conflict"
+    assert _publish_observation(str(binary), observed) == "conflict"
 
 
 def test_reconcile_bound_exhaustion_is_inconclusive_and_never_retries(fake_auditctl):
     binary, path = fake_auditctl
     path.write_text(json.dumps([{"type": "other", "source": "x", "metadata": {}}] * 1000))
     assert reconcile_review(str(binary), _observation()) == "inconclusive"
-    assert publish_review(str(binary), _observation()) == "inconclusive"
+    assert _publish_observation(str(binary), _observation()) == "inconclusive"
     assert len(json.loads(path.read_text())) == 1000
 
 
@@ -110,7 +110,7 @@ def test_review_metadata_has_no_authority_or_hidden_fields():
         _observation(reviewed_commit="short")
 
 
-def test_review_result_is_immutable_and_requires_passed_bound_verification():
+def test_review_result_is_immutable_and_requires_passed_bound_verification(fake_auditctl):
     store = MemoryStore()
     candidate_ref = store.put(b"candidate bundle")
     evidence_ref = store.put(canonical_bytes({"ok": True}))
@@ -125,12 +125,28 @@ def test_review_result_is_immutable_and_requires_passed_bound_verification():
         "candidate_ref": candidate_ref, "candidate_digest": candidate_ref.removeprefix("artifact:"),
         "verification_result_ref": verification_ref,
         "verification_result_digest": verification_ref.removeprefix("artifact:"),
+        "publication_ref": _ref("d"), "publication_digest": "sha256:" + "d" * 64,
+        "subject_kind": "candidate", "reviewed_commit": "e" * 40,
     }
     spec_ref = store.put(canonical_bytes(spec))
 
     result_ref = publish_review_result(store, spec_ref=spec_ref, findings=[])
     result = resolve_exact_contract(store, result_ref, CANDIDATE_REVIEW_RESULT_V1)
     assert result["outcome"] == "no-findings"
+    binary, events_path = fake_auditctl
+    request = {
+        "contract_id": "action-creation-request/v1", "plan_ref": _ref("a"),
+        "topology": "independent", "role": "candidate-review", "subject": "candidate:one",
+        "spec_ref": spec_ref, "spec_digest": spec_ref.removeprefix("artifact:"),
+        "input_set_digest": "sha256:" + "b" * 64,
+    }
+    assert publish_review(
+        str(binary), store=store, request=request, action_id=2035, attempt_id="attempt-1",
+        actor="reviewer:one", review_spec_ref=spec_ref, review_result_ref=result_ref,
+    ) == "published"
+    event = json.loads(events_path.read_text())[0]
+    assert event["metadata"]["publication_ref"] == spec["publication_ref"]
+    assert event["metadata"]["review_result_artifact_ref"] == result_ref
     with pytest.raises(ValueError, match="forbidden"):
         publish_review_result(store, spec_ref=spec_ref, findings=[{
             "id": "one", "category": "protocol", "summary": "approval granted",

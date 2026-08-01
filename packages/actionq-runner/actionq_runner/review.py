@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from actionq_contracts import (
+    ACTION_CREATION_REQUEST_V1,
     CANDIDATE_REVIEW_RESULT_V1,
     CANDIDATE_REVIEW_SPEC_V1,
     CANDIDATE_VERIFICATION_RESULT_V1,
@@ -119,6 +120,8 @@ def publish_review_result(
         normalized.append(copied)
     findings_raw = canonical_bytes({"contract_id": "candidate-review-findings/v1", "findings": normalized})
     findings_ref = store.put(findings_raw)
+    if artifact_ref(findings_raw) != findings_ref or store.get(findings_ref) != findings_raw:
+        raise RuntimeError("CAS failed to preserve review findings bytes")
     result = {
         "contract_id": CANDIDATE_REVIEW_RESULT_V1,
         "spec_ref": spec_ref,
@@ -130,7 +133,7 @@ def publish_review_result(
     require_compatible(result)
     raw = canonical_bytes(result)
     result_ref = store.put(raw)
-    if artifact_ref(raw) != result_ref:
+    if artifact_ref(raw) != result_ref or store.get(result_ref) != raw:
         raise RuntimeError("CAS failed to preserve review result bytes")
     return result_ref
 
@@ -180,7 +183,7 @@ def reconcile_review(
     return "inconclusive" if len(events) >= 1000 else "absent"
 
 
-def publish_review(
+def _publish_observation(
     auditctl_bin: str, observation: ReviewObservation, *, timeout_seconds: float = 10.0,
 ) -> str:
     """Publish once after reconciliation; never blindly retries ``auditctl add``."""
@@ -201,3 +204,52 @@ def publish_review(
     if completed.returncode == 0:
         return "published"
     return reconcile_review(auditctl_bin, observation, timeout_seconds=timeout_seconds)
+
+
+def publish_review(
+    auditctl_bin: str,
+    *,
+    store: ArtifactStore,
+    request: dict[str, Any],
+    action_id: int,
+    attempt_id: str,
+    actor: str,
+    review_spec_ref: str,
+    review_result_ref: str,
+    runtime_session_id: str | None = None,
+    timeout_seconds: float = 10.0,
+) -> str:
+    """Derive one Auditctl v2 observation only from frozen review artifacts.
+
+    The caller may provide runtime identity fields, but every candidate,
+    publication, outcome, and immutable reference is reconstructed from the
+    compiler request and exact CAS records before the bounded subprocess call.
+    """
+    require_compatible(request)
+    if request.get("contract_id") != ACTION_CREATION_REQUEST_V1 or request.get("role") != "candidate-review":
+        raise ValueError("review observation requires a candidate-review creation request")
+    spec = resolve_exact_contract(store, review_spec_ref, CANDIDATE_REVIEW_SPEC_V1)
+    result = resolve_exact_contract(store, review_result_ref, CANDIDATE_REVIEW_RESULT_V1)
+    if request.get("spec_ref") != review_spec_ref or request.get("spec_digest") != artifact_digest(review_spec_ref):
+        raise ValueError("review request does not bind the exact review spec")
+    if result["spec_ref"] != review_spec_ref or result["spec_digest"] != artifact_digest(review_spec_ref):
+        raise ValueError("review result does not bind the exact review spec")
+    findings = store.get(result["findings_ref"])
+    if artifact_ref(findings) != result["findings_ref"]:
+        raise RuntimeError("review findings locator does not match its bytes")
+    metadata = {
+        "action_id": str(action_id), "attempt_id": attempt_id,
+        "plan_ref": request["plan_ref"], "subject_kind": spec["subject_kind"],
+        "publication_ref": spec["publication_ref"],
+        "verification_result_ref": spec["verification_result_ref"],
+        "review_result_artifact_ref": review_result_ref,
+        "topology": request["topology"], "findings_digest": result["findings_digest"],
+        "review_outcome": result["outcome"],
+    }
+    if runtime_session_id is not None:
+        metadata["runtime_session_id"] = runtime_session_id
+    return _publish_observation(
+        auditctl_bin,
+        ReviewObservation(actor=actor, reviewed_commit=spec["reviewed_commit"], metadata=metadata),
+        timeout_seconds=timeout_seconds,
+    )

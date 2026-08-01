@@ -173,7 +173,8 @@ _IMMUTABLE_V1_FIELDS: dict[str, frozenset[str]] = {
     }),
     CANDIDATE_REVIEW_SPEC_V1: frozenset({
         "contract_id", "candidate_ref", "candidate_digest",
-        "verification_result_ref", "verification_result_digest",
+        "verification_result_ref", "verification_result_digest", "publication_ref",
+        "publication_digest", "subject_kind", "reviewed_commit",
     }),
     CANDIDATE_REVIEW_RESULT_V1: frozenset({
         "contract_id", "spec_ref", "spec_digest", "outcome", "findings_ref", "findings_digest",
@@ -282,12 +283,12 @@ def _deny_forbidden(value: Any, path: str = "contract") -> None:
 def _require_immutable_v1(value: dict[str, Any], contract_id: str) -> None:
     _deny_forbidden(value)
     for name in ("plan_ref", "spec_ref", "request_ref", "profile_ref", "candidate_ref",
-                 "evidence_ref", "verification_result_ref", "findings_ref"):
+                 "evidence_ref", "verification_result_ref", "findings_ref", "publication_ref"):
         if name in value:
             # conflict results deliberately have no candidate artifact.
             if value[name] is not None and not _ARTIFACT.fullmatch(str(value[name])):
                 raise ValueError(f"{name} must be an immutable artifact locator")
-    for name in ("spec_digest", "request_digest", "profile_digest", "candidate_digest",
+    for name in ("spec_digest", "request_digest", "profile_digest", "candidate_digest", "publication_digest",
                  "evidence_digest", "verification_result_digest", "findings_digest", "registry_digest",
                  "input_set_digest"):
         if name in value:
@@ -299,6 +300,7 @@ def _require_immutable_v1(value: dict[str, Any], contract_id: str) -> None:
         ("evidence_ref", "evidence_digest"),
         ("verification_result_ref", "verification_result_digest"),
         ("findings_ref", "findings_digest"), ("registry_ref", "registry_digest"),
+        ("publication_ref", "publication_digest"),
     ):
         if ref in value and value[ref] is not None:
             _artifact_binding(value, ref, digest)
@@ -340,3 +342,8 @@ def _require_immutable_v1(value: dict[str, Any], contract_id: str) -> None:
     elif contract_id == CANDIDATE_REVIEW_RESULT_V1:
         if value["outcome"] not in {"no-findings", "findings-recorded"}:
             raise ValueError("review outcome is invalid")
+    elif contract_id == CANDIDATE_REVIEW_SPEC_V1:
+        if value["subject_kind"] not in {"candidate", "integration"}:
+            raise ValueError("review subject_kind is invalid")
+        if not isinstance(value["reviewed_commit"], str) or not _GIT_OID.fullmatch(value["reviewed_commit"]):
+            raise ValueError("reviewed_commit must be a full lowercase Git object id")
