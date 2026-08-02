@@ -1132,6 +1132,11 @@ def claim(
     timeout_minutes: int,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
+    if _runtime_schema_version(conn, schema) == 3:
+        return _claim_schema3(
+            conn, schema, worker=worker, timeout_minutes=timeout_minutes,
+            provenance=provenance,
+        )
     runner_auth_token = secrets.token_urlsafe(32)
     with conn.transaction():
         candidate_ids = conn.execute(
@@ -1259,6 +1264,60 @@ def claim(
     if selected is not None and selected_immutable_grant is not None:
         result["immutable_runtime_grant"] = selected_immutable_grant
     return result
+
+
+def _runtime_schema_version(conn, schema: str) -> int | None:
+    row = conn.execute(
+        f"SELECT max(version) AS version FROM {qname(schema, 'schema_migrations')} "
+        "WHERE domain = 'execution'"
+    ).fetchone()
+    if row is None or row["version"] is None:
+        return None
+    return int(row["version"])
+
+
+def _claim_schema3(
+    conn,
+    schema: str,
+    *,
+    worker: str,
+    timeout_minutes: int,
+    provenance: dict[str, Any] | None,
+) -> dict:
+    """Run the released v3 claim algorithm without touching v4+ objects."""
+
+    with conn.transaction():
+        row = conn.execute(
+            f"""
+            UPDATE {qname(schema, "actions")}
+            SET status = 'claimed', claimed_at = now(), claimed_by = %s,
+                claim_deadline = now() + (%s * interval '1 minute'),
+                claim_receipt = %s
+            WHERE id = (
+                SELECT id FROM {qname(schema, "actions")}
+                WHERE status = 'pending'
+                ORDER BY priority ASC, created_at ASC
+                FOR UPDATE SKIP LOCKED LIMIT 1
+            )
+            RETURNING *
+            """,
+            (worker, timeout_minutes, str(uuid.uuid4())),
+        ).fetchone()
+        if row is None:
+            raise NoActionAvailable("no pending actions")
+        insert_event(
+            conn, schema, action_id=row["id"], event_type="action_claimed",
+            actor=worker,
+            payload=event_payload_with_provenance(
+                {
+                    "claimed_by": worker,
+                    "claim_deadline": json_default(row["claim_deadline"]),
+                    "claim_receipt_digest": receipt_digest(row["claim_receipt"]),
+                },
+                provenance,
+            ),
+        )
+    return dict(row)
 
 
 def _renewal_rejection_reason(current: dict[str, Any] | None, worker: str, claim_receipt: str) -> str | None:
@@ -1402,6 +1461,10 @@ def _transition_terminal(
     provenance: dict[str, Any] | None = None,
 ) -> dict:
     allowed_sql = ", ".join(f"'{status}'" for status in allowed_statuses)
+    runner_auth_clear = (
+        "" if _runtime_schema_version(conn, schema) == 3
+        else ", runner_auth_digest = NULL"
+    )
     with conn.transaction():
         row = conn.execute(
             f"""
@@ -1411,8 +1474,8 @@ def _transition_terminal(
                 result_ref = COALESCE(%s, result_ref),
                 failure_reason = COALESCE(%s, failure_reason),
                 claimed_at = NULL, claimed_by = NULL, claim_deadline = NULL,
-                claim_receipt = NULL,
-                runner_auth_digest = NULL
+                claim_receipt = NULL
+                {runner_auth_clear}
             WHERE id = %s
               AND status IN ({allowed_sql})
               AND claimed_by = %s
@@ -1526,6 +1589,27 @@ def cancel(
     *,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
+    if _runtime_schema_version(conn, schema) == 3:
+        with conn.transaction():
+            updated = conn.execute(
+                f"""UPDATE {qname(schema, 'actions')}
+                    SET status='cancelled', completed_at=now(), failure_reason=%s,
+                        claimed_at=NULL, claimed_by=NULL, claim_deadline=NULL,
+                        claim_receipt=NULL
+                    WHERE id=%s AND status IN ('pending', 'claimed')
+                    RETURNING *""",
+                (reason, action_id),
+            ).fetchone()
+            if updated is None:
+                raise ActionQError(f"Action #{action_id} cannot be cancelled")
+            insert_event(
+                conn, schema, action_id=action_id, event_type="action_cancelled",
+                actor=actor,
+                payload=event_payload_with_provenance(
+                    {"reason": reason, "cancelled_by": actor}, provenance
+                ),
+            )
+        return dict(updated)
     with conn.transaction():
         row = conn.execute(
             f"SELECT * FROM {qname(schema, 'actions')} WHERE id = %s FOR UPDATE", (action_id,)
@@ -1565,6 +1649,10 @@ def acknowledge_cancellation(
     former_claim_receipt: str, runner_auth_token: str, authenticated_runner: str,
 ) -> dict:
     """Idempotently finalize a fenced cancellation after supervisor stop confirmation."""
+    if _runtime_schema_version(conn, schema) == 3:
+        raise ActionQError(
+            "cancellation acknowledgement requires execution schema 4 or newer"
+        )
     with conn.transaction():
         proof = receipt_digest(former_claim_receipt)
         auth_proof = receipt_digest(runner_auth_token)
@@ -1597,6 +1685,8 @@ def acknowledge_cancellation(
 
 
 def reap_cancellations(conn, schema: str, *, actor: str = "actionctl:cancel-reaper") -> list[dict]:
+    if _runtime_schema_version(conn, schema) == 3:
+        return []
     with conn.transaction():
         rows = conn.execute(
             f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
@@ -1621,6 +1711,10 @@ def sweep(
     actor: str = "actionctl:sweep",
     provenance: dict[str, Any] | None = None,
 ) -> list[dict]:
+    runner_auth_clear = (
+        "" if _runtime_schema_version(conn, schema) == 3
+        else ", runner_auth_digest = NULL"
+    )
     with conn.transaction():
         rows = conn.execute(
             f"""
@@ -1640,7 +1734,7 @@ def sweep(
                     claimed_by = NULL,
                     claim_deadline = NULL
                     , claim_receipt = NULL
-                    , runner_auth_digest = NULL
+                    {runner_auth_clear}
                 WHERE id = %s
                 RETURNING *
                 """,

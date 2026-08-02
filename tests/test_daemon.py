@@ -186,6 +186,30 @@ def test_cancel_ack_keeps_private_proofs_out_of_process_arguments(monkeypatch):
     }
 
 
+def test_actionctl_client_refuses_schema3_before_claim_or_runner_proof(monkeypatch):
+    client = ActionctlClient("actionctl", runner_private_key_path=Path("unused"))
+    calls = []
+
+    def run(*args, **_kwargs):
+        calls.append(args)
+        return {
+            "state": "compatible",
+            "observed_schema_version": 3,
+        }
+
+    monkeypatch.setattr(client, "_run", run)
+    monkeypatch.setattr(
+        client,
+        "_proof",
+        lambda **_kwargs: pytest.fail("runner proof minted before schema circuit"),
+    )
+
+    with pytest.raises(RuntimeError, match="maintenance-adapter-only"):
+        client.claim("runner:test", 30)
+
+    assert calls == [("check-compatibility",)]
+
+
 def test_pause_file_prevents_claim(tmp_path: Path):
     pause_file = tmp_path / "PAUSED"
     pause_file.touch()
