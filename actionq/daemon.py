@@ -278,6 +278,7 @@ class ActionctlClient:
         configured_key = os.environ.get("ACTIONQ_RUNNER_PRIVATE_KEY")
         self.runner_private_key_path = runner_private_key_path or (Path(configured_key) if configured_key else None)
         self.runner_id: str | None = None
+        self._daemon_schema_checked = False
 
     def _run(self, *args: str, allow_empty: bool = False, input_text: str | None = None) -> dict[str, Any] | None:
         completed = subprocess.run(
@@ -304,6 +305,17 @@ class ActionctlClient:
         return json.loads(completed.stdout)
 
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None:
+        if not self._daemon_schema_checked:
+            compatibility = self._run("check-compatibility")
+            assert compatibility is not None
+            observed = compatibility.get("observed_schema_version")
+            if observed != 6:
+                raise RuntimeError(
+                    "actionq-daemon requires execution schema 6; schema 3 is "
+                    "maintenance-adapter-only because runner cancellation fencing "
+                    "is unavailable"
+                )
+            self._daemon_schema_checked = True
         self.runner_id = worker
         proof = self._proof(runner_id=worker, operation="execution.action.claim", resource="queue:next")
         return self._run("claim", "--proof-stdin", "--timeout", str(timeout_minutes),

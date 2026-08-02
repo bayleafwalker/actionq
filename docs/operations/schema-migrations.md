@@ -10,9 +10,10 @@ The current execution contract reports:
 
 - domain: `execution`;
 - API version: `v1`;
-- compatibility range: schema versions `1` through `2`;
-- required runtime target: the complete packaged migration ledger through
-  schema version `2`; and
+- supported runtime targets: the exact complete schema `3` ledger through the
+  bounded pre-migration bridge, or the complete packaged schema `6` ledger;
+- required steady-state runtime target: the complete packaged migration ledger
+  through schema version `6`; and
 - one SHA-256 checksum for every packaged migration.
 
 Schema version `2` adds the nullable `actions.claim_receipt` column. Every
@@ -20,12 +21,22 @@ successful claim mints an opaque receipt, and renewal plus terminal settlement
 require the receipt for the current claim incarnation. A reclaimed action has
 a new receipt, so a prior claimant cannot renew or settle it.
 
-`actionctl check-compatibility` reports the supported range for release
-selection, but a running service requires the complete, checksum-matching
-packaged ledger and the v2 queue shape. A ledger containing only version `1`
-is therefore `incomplete`, not runtime-compatible; run the migration role to
-apply version `2` before starting runtime traffic. The migrator can adopt the
-known pre-ledger v1 shape and then apply v2, but it refuses other schema drift.
+`actionctl check-compatibility` reports the broad release-selection range, but
+runtime accepts only two exact, checksum-matching shapes: released schema 3
+for the temporary pre-migration bridge and complete schema 6 for steady state.
+The bridge performs SELECT-only compatibility checks and the schema-3 queue
+path never references schema-4 cancellation fencing, schema-5 groups, or
+schema-6 immutable candidate objects. Missing versions, ledger holes, modified
+checksums, mixed schema-3/post-schema-3 objects, or shape drift fail closed.
+Normal runtime commands never create or alter objects. The migrator can adopt
+the known pre-ledger v1 shape and then apply every packaged migration, but it
+refuses other schema drift.
+
+The schema-3 bridge is for the served maintenance adapter only. Keep
+`actionq-daemon` and every producer capable of starting worker sessions stopped
+until schema 6 is complete: schema 3 has no durable runner-auth digest or
+cancellation acknowledgement fence. The packaged daemon checks compatibility
+before its first claim and refuses schema 3 without mutating queue state.
 
 `actionctl check-compatibility` performs only `SELECT` statements and exits
 with status `3` for an incompatible schema. Its JSON object is the Actionq

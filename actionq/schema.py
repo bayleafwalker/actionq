@@ -21,6 +21,7 @@ DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
 MAX_SCHEMA_VERSION = 6
+PRE_MIGRATION_BRIDGE_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
 _COLUMN_SHAPE = {
@@ -910,6 +911,58 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
     ]
 
 
+def _schema3_bridge_shape_issues(conn, schema: str) -> tuple[str, ...]:
+    """Validate the exact released v3 shape without accepting v4+ fragments."""
+
+    all_issues = list(_shape_issues(conn, schema))
+    issues = _unversioned_v1_shape_issues(all_issues)
+    # Unlike legacy-v1 adoption, v3 requires the v2 claim receipt column.
+    if "column-missing:actions.claim_receipt" in all_issues:
+        issues.append("column-missing:actions.claim_receipt")
+    if (
+        "constraint-invalid:actions.status" in issues
+        and _has_legacy_v1_status_constraint(conn, schema)
+    ):
+        issues.remove("constraint-invalid:actions.status")
+
+    later_action_columns = (
+        "cancel_request_id",
+        "cancel_stop_deadline",
+        "stop_acknowledged",
+        "runner_auth_digest",
+        "cancel_former_claimed_by",
+        "cancel_former_receipt_digest",
+        "cancel_runner_auth_digest",
+        "cancel_terminal_kind",
+    )
+    later_tables = (
+        "execution_groups",
+        "execution_group_members",
+        "immutable_action_specs",
+        "immutable_action_requests",
+        "immutable_action_runtime_grants",
+    )
+    rows = conn.execute(
+        """
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND (
+              (table_name = 'actions' AND column_name = ANY(%s))
+              OR table_name = ANY(%s)
+          )
+        ORDER BY table_name, ordinal_position
+        """,
+        (schema, list(later_action_columns), list(later_tables)),
+    ).fetchall()
+    issues.extend(
+        f"post-v3-object-present:{_row_value(row, 'table_name')}."
+        f"{_row_value(row, 'column_name', 1)}"
+        for row in rows
+    )
+    return tuple(sorted(set(issues)))
+
+
 def _has_legacy_v1_status_constraint(conn, schema: str) -> bool:
     row = conn.execute(
         """SELECT pg_get_expr(c.conbin, c.conrelid, true) AS expression
@@ -970,28 +1023,39 @@ def check_compatibility(
             f"schema version {observed} is below supported minimum "
             f"{MIN_SCHEMA_VERSION}"
         )
-    elif set(applied) != set(expected):
+    elif any(
+        version not in expected or applied[version] != expected[version]
+        for version in applied
+    ):
+        state = "checksum-mismatch"
+        detail = "an applied migration checksum does not match the packaged asset"
+    elif set(applied) not in (set(expected), set(range(1, PRE_MIGRATION_BRIDGE_VERSION + 1))):
         state = "incomplete"
         detail = (
             f"applied migration versions {sorted(applied)} do not match "
             f"expected versions {sorted(expected)}"
         )
-    elif any(applied[version] != checksum for version, checksum in expected.items()):
-        state = "checksum-mismatch"
-        detail = "an applied migration checksum does not match the packaged asset"
     elif require_runtime_principal and (
         principal_issue := _runtime_principal_issue(conn, schema)
     ):
         state = "role-mismatch"
         detail = principal_issue
     else:
-        shape_issues = _shape_issues(conn, schema)
+        shape_issues = (
+            _schema3_bridge_shape_issues(conn, schema)
+            if set(applied) == set(range(1, PRE_MIGRATION_BRIDGE_VERSION + 1))
+            else _shape_issues(conn, schema)
+        )
         if shape_issues:
             state = "shape-mismatch"
             detail = "required queue shape is invalid: " + ",".join(shape_issues)
         else:
             state = "compatible"
-            detail = "schema is compatible with the packaged execution adapter"
+            detail = (
+                "schema 3 is compatible through the read-only pre-migration bridge"
+                if observed == PRE_MIGRATION_BRIDGE_VERSION
+                else "schema is compatible with the packaged execution adapter"
+            )
 
     return Compatibility(
         domain=DOMAIN,

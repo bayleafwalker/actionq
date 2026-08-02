@@ -42,6 +42,229 @@ def _install_legacy_v1(conn, schema: str) -> None:
     conn.commit()
 
 
+def _install_exact_v3(schema: str) -> None:
+    """Install the released 1..3 ledger and its least-privilege runtime grants."""
+    conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    conn.execute(f'CREATE SCHEMA "{schema}"')
+    conn.execute(
+        f'''CREATE TABLE "{schema}".schema_migrations (
+            domain TEXT NOT NULL, version INTEGER NOT NULL CHECK (version > 0),
+            name TEXT NOT NULL, checksum TEXT NOT NULL,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (domain, version))'''
+    )
+    for migration in schema_contract.load_migrations()[:3]:
+        for statement in schema_contract._statements(
+            schema_contract._render(migration, schema)
+        ):
+            conn.execute(statement)
+        conn.execute(
+            f'INSERT INTO "{schema}".schema_migrations '
+            "(domain, version, name, checksum) VALUES (%s, %s, %s, %s)",
+            (schema_contract.DOMAIN, migration.version, migration.name, migration.checksum),
+        )
+    conn.execute(f'REVOKE CREATE ON SCHEMA "{schema}" FROM PUBLIC')
+    conn.execute(f'REVOKE CREATE ON SCHEMA "{schema}" FROM {RUNTIME_ROLE}')
+    conn.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO {RUNTIME_ROLE}')
+    conn.execute(
+        f'GRANT SELECT, INSERT, UPDATE, DELETE ON "{schema}".actions, '
+        f'"{schema}".events TO {RUNTIME_ROLE}'
+    )
+    conn.execute(
+        f'GRANT SELECT, INSERT ON "{schema}".dispatch_requests TO {RUNTIME_ROLE}'
+    )
+    conn.execute(
+        f'GRANT SELECT ON "{schema}".schema_migrations TO {RUNTIME_ROLE}'
+    )
+    conn.execute(
+        f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "{schema}" TO {RUNTIME_ROLE}'
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v6(
+    runner_env, signed_runner_proof
+):
+    runner, schema = runner_env
+    _install_exact_v3(schema)
+
+    compatibility = _invoke_json(runner, ["check-compatibility"])
+    assert compatibility["state"] == "compatible"
+    assert compatibility["observed_schema_version"] == 3
+    assert "pre-migration bridge" in compatibility["detail"]
+
+    action = _invoke_json(
+        runner,
+        ["add", "--type", "scope-iterate", "--created-by", "human:test"],
+    )
+    claimed = _invoke_json(
+        runner,
+        ["claim", "--proof-stdin"],
+        input=json.dumps(
+            signed_runner_proof("worker:test", "execution.action.claim", "queue:next")
+        ),
+    )
+    assert claimed["id"] == action["id"]
+    renewed = _invoke_json(
+        runner,
+        ["renew", str(action["id"]), "--timeout", "45", "--proof-stdin"],
+        input=json.dumps(
+            {
+                "claim_receipt": claimed["claim_receipt"],
+                "runner_proof": signed_runner_proof(
+                    "worker:test", "execution.action.renew", f"action:{action['id']}"
+                ),
+            }
+        ),
+    )
+    assert renewed["status"] == "claimed"
+    completed = _invoke_json(
+        runner,
+        ["complete", str(action["id"]), "--result", "bridge:v3", "--proof-stdin"],
+        input=json.dumps(
+            {
+                "claim_receipt": claimed["claim_receipt"],
+                "runner_proof": signed_runner_proof(
+                    "worker:test", "execution.action.complete", f"action:{action['id']}"
+                ),
+            }
+        ),
+    )
+    assert completed["status"] == "completed"
+
+    for command, expected in (("fail", "failed"), ("reject", "rejected")):
+        candidate = _invoke_json(
+            runner,
+            ["add", "--type", f"bridge-{command}", "--created-by", "human:test"],
+        )
+        candidate_claim = _invoke_json(
+            runner,
+            ["claim", "--proof-stdin"],
+            input=json.dumps(
+                signed_runner_proof("worker:test", "execution.action.claim", "queue:next")
+            ),
+        )
+        assert candidate_claim["id"] == candidate["id"]
+        args = [command, str(candidate["id"]), "--reason", f"bridge:{command}"]
+        if command == "reject":
+            args.extend(["--validator", "validator:test"])
+        args.append("--proof-stdin")
+        terminal = _invoke_json(
+            runner,
+            args,
+            input=json.dumps(
+                {
+                    "claim_receipt": candidate_claim["claim_receipt"],
+                    "runner_proof": signed_runner_proof(
+                        "worker:test",
+                        f"execution.action.{command}",
+                        f"action:{candidate['id']}",
+                    ),
+                }
+            ),
+        )
+        assert terminal["status"] == expected
+
+    pending_cancel = _invoke_json(
+        runner,
+        ["add", "--type", "bridge-cancel", "--created-by", "human:test"],
+    )
+    cancelled = _invoke_json(
+        runner,
+        ["cancel", str(pending_cancel["id"]), "--reason", "bridge:cancel"],
+    )
+    assert cancelled["status"] == "cancelled"
+
+    retry = _invoke_json(
+        runner,
+        ["add", "--type", "bridge-retry", "--created-by", "human:test"],
+    )
+    first_claim = _invoke_json(
+        runner,
+        ["claim", "--proof-stdin"],
+        input=json.dumps(
+            signed_runner_proof("worker:test", "execution.action.claim", "queue:next")
+        ),
+    )
+    assert first_claim["id"] == retry["id"]
+    migration_conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    migration_conn.execute(
+        f'UPDATE "{schema}".actions SET claim_deadline=now() - interval \'1 second\' '
+        "WHERE id=%s",
+        (retry["id"],),
+    )
+    migration_conn.commit()
+    migration_conn.close()
+    swept = _invoke_json(runner, ["sweep"])
+    assert [row["id"] for row in swept["reclaimed"]] == [retry["id"]]
+    assert swept["cancelled"] == []
+    replacement = _invoke_json(
+        runner,
+        ["claim", "--proof-stdin"],
+        input=json.dumps(
+            signed_runner_proof("worker:test", "execution.action.claim", "queue:next")
+        ),
+    )
+    assert replacement["id"] == retry["id"]
+    assert replacement["claim_receipt"] != first_claim["claim_receipt"]
+
+    migration = runner.invoke(cli, ["migrate", "--json-output"])
+    assert migration.exit_code == 0, migration.output
+    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6]
+    final = _invoke_json(runner, ["check-compatibility"])
+    assert final["observed_schema_version"] == 6
+    assert final["state"] == "compatible"
+
+
+def test_v3_bridge_fails_closed_on_partial_checksum_and_post_v3_shape(runner_env):
+    runner, schema = runner_env
+    _install_exact_v3(schema)
+    migration_conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+
+    migration_conn.execute(
+        f'UPDATE "{schema}".schema_migrations SET checksum=%s '
+        "WHERE domain=%s AND version=3",
+        ("0" * 64, schema_contract.DOMAIN),
+    )
+    migration_conn.commit()
+    mismatch = runner.invoke(cli, ["check-compatibility"])
+    assert mismatch.exit_code == 3
+    assert json.loads(mismatch.output)["state"] == "checksum-mismatch"
+
+    migration_conn.execute(
+        f'UPDATE "{schema}".schema_migrations SET checksum=%s '
+        "WHERE domain=%s AND version=3",
+        (schema_contract.load_migrations()[2].checksum, schema_contract.DOMAIN),
+    )
+    migration_conn.execute(
+        f'ALTER TABLE "{schema}".actions ADD COLUMN cancel_request_id UUID'
+    )
+    migration_conn.commit()
+    drift = runner.invoke(cli, ["check-compatibility"])
+    assert drift.exit_code == 3
+    record = json.loads(drift.output)
+    assert record["state"] == "shape-mismatch"
+    assert "post-v3-object-present:actions.cancel_request_id" in record["detail"]
+    migration_conn.close()
+
+
+def test_v3_bridge_rejects_incomplete_prefix(runner_env):
+    runner, schema = runner_env
+    _install_exact_v3(schema)
+    conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    conn.execute(
+        f'DELETE FROM "{schema}".schema_migrations WHERE domain=%s AND version=3',
+        (schema_contract.DOMAIN,),
+    )
+    conn.commit()
+    conn.close()
+
+    result = runner.invoke(cli, ["check-compatibility"])
+    assert result.exit_code == 3
+    assert json.loads(result.output)["state"] == "incomplete"
+
+
 def test_lifecycle_claim_complete_show(runner_env, signed_runner_proof):
     runner, _schema = runner_env
     result = runner.invoke(cli, ["migrate"])
