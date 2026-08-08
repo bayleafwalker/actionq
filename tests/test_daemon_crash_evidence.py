@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -95,6 +96,28 @@ def test_recovery_leaves_git_null_when_no_worktree_was_ever_recorded(tmp_path: P
 
     assert daemon.run_once() is False
     assert client.events[0][3]["git"] is None
+
+
+def test_recovery_retains_named_catalog_workaround_without_ephemeral_details(tmp_path: Path):
+    client = FakeClient()
+    daemon = _daemon(tmp_path, client)
+    record = _stale_record("aqs:catalog-workaround", 43, worktree=None, base_commit=None)
+    record.harness = "codex"
+    record.provider = "codex"
+    record.model = "gpt-5.6-luna"
+    record.requested_selector = "fast-build"
+    record.routing_source = "same-provider-fallback"
+    record.catalog_workaround = "luna-v1-to-v2"
+    daemon._write_state(record)
+
+    assert daemon.run_once() is False
+
+    routing = client.events[0][3]["routing"]
+    assert routing["catalog_workaround"] == "luna-v1-to-v2"
+    assert routing["resolved_model"] == "gpt-5.6-luna"
+    serialized = json.dumps(routing, sort_keys=True)
+    assert "model_catalog_json" not in serialized
+    assert "actionq-codex-models-" not in serialized
 
 
 def test_run_action_records_worktree_and_base_commit_for_configured_project(tmp_path: Path):
