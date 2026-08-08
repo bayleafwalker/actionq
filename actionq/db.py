@@ -699,6 +699,40 @@ def enqueue(
     return dict(action)
 
 
+def prune_dispatch_observation_events(
+    conn,
+    schema: str,
+    *,
+    action_id: int,
+    through_event_id: int,
+) -> int:
+    """Prune a v2 observer stream while atomically advancing its recovery floor."""
+    if through_event_id < 0:
+        raise ActionQError("through_event_id must be non-negative")
+    with conn.transaction():
+        watermark = conn.execute(
+            f"SELECT last_observed_event_id FROM {qname(schema, 'dispatch_observation_watermarks')} WHERE action_id=%s FOR UPDATE",
+            (action_id,),
+        ).fetchone()
+        if watermark is None:
+            raise ActionQError("dispatch observation watermark not found")
+        deleted = conn.execute(
+            f"DELETE FROM {qname(schema, 'events')} WHERE action_id=%s AND id<=%s RETURNING id",
+            (action_id, through_event_id),
+        ).fetchall()
+        retained = conn.execute(
+            f"SELECT MIN(id) AS first_id, COALESCE(MAX(id), 0) AS last_id FROM {qname(schema, 'events')} WHERE action_id=%s",
+            (action_id,),
+        ).fetchone()
+        last_observed = max(int(watermark["last_observed_event_id"]), int(retained["last_id"]))
+        first_retained = int(retained["first_id"]) if retained["first_id"] is not None else last_observed + 1
+        conn.execute(
+            f"UPDATE {qname(schema, 'dispatch_observation_watermarks')} SET first_retained_event_id=%s, last_observed_event_id=%s, watermark_updated_at=now() WHERE action_id=%s",
+            (first_retained, last_observed, action_id),
+        )
+        return len(deleted)
+
+
 def list_actions(
     conn,
     schema: str,

@@ -117,26 +117,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        action_match = re.fullmatch(r"/v2/dispatch/actions/(\d+)", parsed.path)
-        changes_match = re.fullmatch(r"/v2/dispatch/actions/(\d+)/changes", parsed.path)
-        request_match = re.fullmatch(r"/v2/dispatch/requests/(req:[A-Za-z0-9_-]+)", parsed.path)
-        if action_match or changes_match or request_match:
-            try:
-                provenance = _request_provenance(self.headers)
-                params = parse_qs(parsed.query or "")
-                if changes_match:
-                    body = ActionQApplication(schema=_schema(), authorizer=_served_authorizer).dispatch_action_changes(int(changes_match.group(1)), cursor=params.get("cursor", [None])[0], wait_seconds=min(int(params.get("wait_seconds", ["0"])[0]), 30), provenance=provenance)
-                elif request_match:
-                    body = ActionQApplication(schema=_schema(), authorizer=_served_authorizer).resolve_dispatch_request(request_match.group(1), provenance=provenance)
-                else:
-                    body = ActionQApplication(schema=_schema(), authorizer=_served_authorizer).dispatch_action_snapshot(int(action_match.group(1)), provenance=provenance)
-                self._send_json(200, body)
-            except (ValueError, _db.ActionQError) as exc:
-                self._send_json(400, {"error": str(exc)})
-            except Exception as exc:
-                print(f"dispatch v2 read error: {exc}", file=sys.stderr, flush=True)
-                self._send_json(500, {"error": "internal server error"})
-        elif parsed.path == "/health":
+        if parsed.path == "/health":
             self._send_json(200, {"ok": True})
         elif parsed.path == "/compatibility":
             try:

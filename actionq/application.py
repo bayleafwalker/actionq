@@ -985,35 +985,39 @@ class ActionQApplication:
                     return {"action_id": prior["action_id"], "status": "pending", "request_ref": prior["request_ref"], "request_sha256": prior["request_sha256"]}
                 created_by = provenance.actor
                 action = db.enqueue(conn, self.schema, action_type="scope-iterate", project=normalized["repo_id"], target_ref=normalized["work_item_id"], source_refs=normalized["refs"], priority=50 if normalized["priority"] == "high" else 100, parent_id=None, created_by=created_by, provenance=provenance.as_event_payload(operation="execution.dispatch.enqueue"))
+                first_event = conn.execute(
+                    f"SELECT MIN(id) AS id FROM {db.qname(self.schema, 'events')} WHERE action_id=%s",
+                    (action["id"],),
+                ).fetchone()["id"]
+                if first_event is None:
+                    raise db.ActionQError("dispatch root is missing its enqueue event")
                 request_ref = "req:" + uuid.uuid4().hex
                 conn.execute(
                     f"INSERT INTO {db.qname(self.schema, 'dispatch_requests')} (action_id, request_ref, normalized_snapshot, schema_version, canonicalization_version, request_sha256, identity, environment, operation, idempotency_key) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (action["id"], request_ref, raw, "v2", CANONICALIZATION_VERSION, digest, provenance.actor, provenance.environment, "execution.dispatch.enqueue", provenance.idempotency_key),
                 )
-                db.insert_event(conn, self.schema, action_id=action["id"], event_type="dispatch.v2.enqueued", actor=created_by, payload={"request_ref": request_ref, "request_sha256": digest, "schema_version": "v2", "canonicalization_version": CANONICALIZATION_VERSION, "enqueue_decision": "accepted", "provenance": provenance.as_event_payload(operation="execution.dispatch.enqueue")})
+                event = db.insert_event(conn, self.schema, action_id=action["id"], event_type="dispatch.v2.enqueued", actor=created_by, payload={"request_ref": request_ref, "request_sha256": digest, "schema_version": "v2", "canonicalization_version": CANONICALIZATION_VERSION, "enqueue_decision": "accepted", "provenance": provenance.as_event_payload(operation="execution.dispatch.enqueue")})
+                conn.execute(
+                    f"INSERT INTO {db.qname(self.schema, 'dispatch_observation_watermarks')} (action_id, first_retained_event_id, last_observed_event_id) VALUES (%s, %s, %s)",
+                    (action["id"], first_event, event["id"]),
+                )
                 return {"action_id": action["id"], "status": "pending", "request_ref": request_ref, "request_sha256": digest}
 
     def dispatch_action_snapshot(self, action_id: int, *, provenance: InvocationProvenance) -> dict[str, Any]:
         def read(conn):
-            row = conn.execute(f"SELECT a.*, r.request_ref, r.request_sha256, r.schema_version, r.canonicalization_version FROM {db.qname(self.schema, 'actions')} a JOIN {db.qname(self.schema, 'dispatch_requests')} r ON r.action_id=a.id WHERE a.id=%s", (action_id,)).fetchone()
-            if not row: raise db.ActionQError("dispatch action not found")
-            self._authorize(provenance, f"execution.dispatch.repo:{row['project']}", "read")
-            item = dict(row); item.pop("claim_receipt", None)
-            return {"action": item, "cursor": f"event:{self._latest_event_id(conn, action_id)}"}
-        return self._read(read)
-
-    def resolve_dispatch_request(self, request_ref: str, *, provenance: InvocationProvenance) -> dict[str, Any]:
-        """Resolve an opaque request reference after repository-scoped authorization."""
-        if not request_ref or not isinstance(request_ref, str):
-            raise db.ActionQError("request_ref is required")
-        def read(conn):
-            row = conn.execute(f"SELECT r.*, a.project FROM {db.qname(self.schema, 'dispatch_requests')} r JOIN {db.qname(self.schema, 'actions')} a ON a.id=r.action_id WHERE r.request_ref=%s", (request_ref,)).fetchone()
-            if not row: raise db.ActionQError("dispatch request not found")
-            self._authorize(provenance, f"execution.dispatch.repo:{row['project']}", "read")
-            raw = bytes(row["normalized_snapshot"])
-            if hashlib.sha256(raw).hexdigest() != row["request_sha256"]:
-                raise db.ActionQError("immutable dispatch snapshot digest mismatch")
-            return {"action_id": row["action_id"], "request_ref": row["request_ref"], "request_sha256": row["request_sha256"], "schema_version": row["schema_version"], "canonicalization_version": row["canonicalization_version"], "normalized_request": json.loads(raw.decode("utf-8"))}
+            with conn.transaction():
+                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                row = conn.execute(
+                    f"SELECT a.id, a.project, a.status, a.action_type, r.request_ref, r.request_sha256, GREATEST(w.last_observed_event_id, COALESCE((SELECT MAX(id) FROM {db.qname(self.schema, 'events')} WHERE action_id=a.id), 0)) AS cursor FROM {db.qname(self.schema, 'actions')} a JOIN {db.qname(self.schema, 'dispatch_requests')} r ON r.action_id=a.id JOIN {db.qname(self.schema, 'dispatch_observation_watermarks')} w ON w.action_id=a.id WHERE a.id=%s",
+                    (action_id,),
+                ).fetchone()
+                if not row:
+                    raise db.ActionQError("resource-not-found")
+                try:
+                    self._authorize(provenance, f"execution.dispatch.repo:{row['project']}", "read")
+                except db.ActionQError:
+                    raise db.ActionQError("resource-not-found") from None
+                return {"action_id": row["id"], "status": row["status"], "action_type": row["action_type"], "request_ref": row["request_ref"], "request_sha256": row["request_sha256"], "cursor": f"actionq:event:{row['cursor']}"}
         return self._read(read)
 
     def _latest_event_id(self, conn, action_id: int) -> int:
@@ -1022,20 +1026,30 @@ class ActionQApplication:
 
     def dispatch_action_changes(self, action_id: int, *, cursor: str | None, wait_seconds: int, provenance: InvocationProvenance) -> dict[str, Any]:
         if wait_seconds < 0 or wait_seconds > 30: raise db.ActionQError("wait_seconds must be between 0 and 30")
-        after = 0 if cursor is None else int(cursor.removeprefix("event:")) if cursor.startswith("event:") and cursor[6:].isdigit() else (_ for _ in ()).throw(db.ActionQError("invalid event cursor"))
+        prefix = "actionq:event:"
+        after = 0 if cursor is None else int(cursor.removeprefix(prefix)) if cursor.startswith(prefix) and cursor[len(prefix):].isdigit() else (_ for _ in ()).throw(db.ActionQError("resource-not-found"))
         deadline = time.monotonic() + wait_seconds
         while True:
             def read(conn):
-                exists = conn.execute(f"SELECT 1 FROM {db.qname(self.schema, 'dispatch_requests')} WHERE action_id=%s", (action_id,)).fetchone()
-                if not exists: raise db.ActionQError("dispatch action not found")
-                project = conn.execute(f"SELECT project FROM {db.qname(self.schema, 'actions')} WHERE id=%s", (action_id,)).fetchone()["project"]
-                self._authorize(provenance, f"execution.dispatch.repo:{project}", "read")
-                oldest = conn.execute(f"SELECT MIN(id) AS id FROM {db.qname(self.schema, 'events')} WHERE action_id=%s", (action_id,)).fetchone()["id"]
-                if cursor is not None and oldest is not None and after < int(oldest) - 1:
-                    return {"status": "cursor_expired", "snapshot_required": True, "events": [], "cursor": f"event:{self._latest_event_id(conn, action_id)}"}
-                rows = conn.execute(f"SELECT * FROM {db.qname(self.schema, 'events')} WHERE action_id=%s AND id>%s ORDER BY id ASC", (action_id, after)).fetchall()
-                latest = self._latest_event_id(conn, action_id)
-                return {"status": "ok", "snapshot_required": False, "events": [dict(row) for row in rows], "cursor": f"event:{latest}"}
+                with conn.transaction():
+                    conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    owner = conn.execute(f"SELECT a.project, w.first_retained_event_id, GREATEST(w.last_observed_event_id, COALESCE((SELECT MAX(id) FROM {db.qname(self.schema, 'events')} WHERE action_id=a.id), 0)) AS cursor FROM {db.qname(self.schema, 'actions')} a JOIN {db.qname(self.schema, 'dispatch_requests')} r ON r.action_id=a.id JOIN {db.qname(self.schema, 'dispatch_observation_watermarks')} w ON w.action_id=a.id WHERE a.id=%s", (action_id,)).fetchone()
+                    if not owner:
+                        raise db.ActionQError("resource-not-found")
+                    try:
+                        self._authorize(provenance, f"execution.dispatch.repo:{owner['project']}", "read")
+                    except db.ActionQError:
+                        raise db.ActionQError("resource-not-found") from None
+                    latest = int(owner["cursor"])
+                    if cursor is not None and (
+                        after < int(owner["first_retained_event_id"]) - 1
+                        or after > latest
+                    ):
+                        return {"status": "cursor_expired", "snapshot_required": True, "events": [], "cursor": f"actionq:event:{latest}"}
+                    rows = conn.execute(f"SELECT id, event_type FROM {db.qname(self.schema, 'events')} WHERE action_id=%s AND id>%s ORDER BY id ASC", (action_id, after)).fetchall()
+                    terminal = {"action.completed", "action.failed", "action.rejected", "action.cancelled"}
+                    events = [{"id": f"actionq:event:{row['id']}", "type": "lifecycle", "terminal": row["event_type"] in terminal, "data": {}} for row in rows]
+                    return {"status": "ok", "snapshot_required": False, "events": events, "cursor": f"actionq:event:{latest}"}
             result = self._read(read)
             if result["events"] or wait_seconds == 0 or time.monotonic() >= deadline: return result
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))

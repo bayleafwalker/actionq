@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 6
+MAX_SCHEMA_VERSION = 7
 PRE_MIGRATION_BRIDGE_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
@@ -73,6 +73,12 @@ _COLUMN_SHAPE = {
         "operation": ("text", "NO", None),
         "idempotency_key": ("text", "NO", None),
         "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "dispatch_observation_watermarks": {
+        "action_id": ("bigint", "NO", None),
+        "first_retained_event_id": ("bigint", "NO", None),
+        "last_observed_event_id": ("bigint", "NO", None),
+        "watermark_updated_at": ("timestamp with time zone", "NO", "now()"),
     },
     "execution_groups": {
         "id": ("uuid", "NO", None),
@@ -131,6 +137,7 @@ _REQUIRED_CONSTRAINT_COUNTS = {
     "actions": {"p": 1, "f": 1, "c": 1},
     "events": {"p": 1, "f": 1},
     "dispatch_requests": {"p": 1, "f": 1, "u": 2, "c": 3},
+    "dispatch_observation_watermarks": {"p": 1, "f": 1, "c": 2},
     "execution_groups": {"p": 1, "u": 2, "c": 3},
     "execution_group_members": {"p": 1, "f": 2, "u": 2, "c": 1},
     "immutable_action_specs": {"p": 1, "u": 1, "c": 3},
@@ -645,6 +652,18 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
             "dispatch-requests-idempotency-binding-unique",
             has_constraint("dispatch_requests", "u", ("identity", "environment", "operation", "idempotency_key")),
         ),
+        ("dispatch-observation-watermarks-primary-key", has_constraint("dispatch_observation_watermarks", "p", ("action_id",))),
+        (
+            "dispatch-observation-watermarks-action-foreign-key",
+            has_constraint(
+                "dispatch_observation_watermarks", "f", ("action_id",),
+                foreign_namespace=schema,
+                foreign_table="actions",
+                foreign_oid=table_oids.get("actions"),
+                foreign_columns=("id",),
+                delete_action="r",
+            ),
+        ),
         ("execution-groups-primary-key", has_constraint("execution_groups", "p", ("id",))),
         ("execution-groups-plan-ref-unique", has_constraint("execution_groups", "u", ("plan_ref",))),
         ("execution-groups-spec-sha256-unique", has_constraint("execution_groups", "u", ("spec_sha256",))),
@@ -762,6 +781,25 @@ def _shape_issues(conn, schema: str) -> tuple[str, ...]:
             or actual[0][1] is not True
         ):
             issues.append(f"constraint-missing-or-invalid:dispatch_requests.{column}")
+
+    required_watermark_checks = {
+        "first_retained_event_id": "first_retained_event_id >= 0",
+        "last_observed_event_id": "last_observed_event_id >= 0",
+    }
+    for column, expected_expression in required_watermark_checks.items():
+        actual = [
+            (_without_redundant_outer_parentheses(constraint["expression"]), constraint["is_validated"])
+            for constraint in constraints
+            if constraint["table"] == "dispatch_observation_watermarks"
+            and constraint["type"] == "c"
+            and constraint["columns"] == (column,)
+        ]
+        if (
+            len(actual) != 1
+            or actual[0][0] != _without_redundant_outer_parentheses(expected_expression)
+            or actual[0][1] is not True
+        ):
+            issues.append(f"constraint-missing-or-invalid:dispatch_observation_watermarks.{column}")
 
     required_group_checks = {
         ("execution_groups", "max_parallel"): "max_parallel >= 1 AND max_parallel <= 32",
@@ -888,8 +926,11 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
         "column-missing:actions.cancel_runner_auth_digest",
         "column-missing:actions.cancel_terminal_kind",
         "column-missing:dispatch_requests.",
+        "column-missing:dispatch_observation_watermarks.",
         "constraint-missing-or-invalid:dispatch-requests-",
         "constraint-missing-or-invalid:dispatch_requests.",
+        "constraint-missing-or-invalid:dispatch-observation-watermarks-",
+        "constraint-missing-or-invalid:dispatch_observation_watermarks.",
         "index-missing-or-invalid:dispatch-requests.created",
         "column-missing:execution_groups.",
         "column-missing:execution_group_members.",
@@ -941,6 +982,7 @@ def _schema3_bridge_shape_issues(conn, schema: str) -> tuple[str, ...]:
         "immutable_action_specs",
         "immutable_action_requests",
         "immutable_action_runtime_grants",
+        "dispatch_observation_watermarks",
     )
     rows = conn.execute(
         """
@@ -1133,6 +1175,13 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
     conn.execute(
         sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
             schema_identifier, sql.Identifier("dispatch_requests"), role_identifier
+        )
+    )
+    conn.execute(
+        sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
+            schema_identifier,
+            sql.Identifier("dispatch_observation_watermarks"),
+            role_identifier,
         )
     )
     conn.execute(

@@ -55,9 +55,12 @@ class FakeSchemaConnection:
         foreign_validated: bool = True,
         index_overrides: dict[str, dict] | None = None,
         dispatch_relation: bool = True,
+        watermark_relation: bool = True,
         dispatch_binding_constraints: bool = True,
         dispatch_check_overrides: dict[str, str] | None = None,
         dispatch_check_validated: dict[str, bool] | None = None,
+        watermark_check_overrides: dict[str, str] | None = None,
+        watermark_check_validated: dict[str, bool] | None = None,
     ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
@@ -81,9 +84,12 @@ class FakeSchemaConnection:
         self.foreign_validated = foreign_validated
         self.index_overrides = index_overrides or {}
         self.dispatch_relation = dispatch_relation
+        self.watermark_relation = watermark_relation
         self.dispatch_binding_constraints = dispatch_binding_constraints
         self.dispatch_check_overrides = dispatch_check_overrides or {}
         self.dispatch_check_validated = dispatch_check_validated or {}
+        self.watermark_check_overrides = watermark_check_overrides or {}
+        self.watermark_check_validated = watermark_check_validated or {}
         self.executed: list[tuple[str, object]] = []
         self.closed = False
         self.rollbacks = 0
@@ -141,8 +147,17 @@ class FakeSchemaConnection:
             rows = []
             if self.tables_exist:
                 query_schema = params[0]
+                if len(params) == 3:
+                    post_v3_tables = set(params[2])
+                    return _Rows(
+                        {"table_name": table, "column_name": "present"}
+                        for table in post_v3_tables
+                        if not (set(self.applied) == {1, 2, 3})
+                    )
                 for table, columns in schema._COLUMN_SHAPE.items():
                     if table == "dispatch_requests" and not self.dispatch_relation:
+                        continue
+                    if table == "dispatch_observation_watermarks" and not self.watermark_relation:
                         continue
                     rows.extend(
                         {
@@ -287,6 +302,17 @@ class FakeSchemaConnection:
                         dispatch_constraint("c", ["request_sha256"], expression=self.dispatch_check_overrides.get("request_sha256", "request_sha256 ~ '^[a-f0-9]{64}$'::text"), validated=self.dispatch_check_validated.get("request_sha256", True)),
                         dispatch_constraint("c", ["operation"], expression=self.dispatch_check_overrides.get("operation", "operation = 'execution.dispatch.enqueue'::text"), validated=self.dispatch_check_validated.get("operation", True)),
                     ])
+                    if self.watermark_relation:
+                        rows.extend([
+                            dispatch_constraint("p", ["action_id"]),
+                            dispatch_constraint("f", ["action_id"], foreign=True),
+                            dispatch_constraint("c", ["first_retained_event_id"], expression=self.watermark_check_overrides.get("first_retained_event_id", "first_retained_event_id >= 0"), validated=self.watermark_check_validated.get("first_retained_event_id", True)),
+                            dispatch_constraint("c", ["last_observed_event_id"], expression=self.watermark_check_overrides.get("last_observed_event_id", "last_observed_event_id >= 0"), validated=self.watermark_check_validated.get("last_observed_event_id", True)),
+                        ])
+                        for constraint in rows[-4:]:
+                            constraint["table_name"] = "dispatch_observation_watermarks"
+                            constraint["relation_oid"] = 108
+                        rows[-3]["delete_action"] = "r"
                 def group_constraint(
                     table,
                     relation_oid,
@@ -422,7 +448,7 @@ def _packaged_checksums() -> dict[int, str]:
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     migrations = schema.load_migrations()
 
-    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5, 6]
+    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5, 6, 7]
     rendered = schema._render(migrations[0], "aq")
     assert "{{schema}}" not in rendered
     assert '"aq".actions' in rendered
@@ -462,8 +488,8 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "domain": "execution",
         "api_version": "v1",
         "minimum_schema_version": 1,
-        "maximum_schema_version": 6,
-        "observed_schema_version": 6,
+        "maximum_schema_version": 7,
+        "observed_schema_version": 7,
         "state": "compatible",
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
@@ -566,8 +592,10 @@ def test_unversioned_v1_adoption_allows_only_expected_later_relation_absence():
         [
             "column-missing:actions.claim_receipt",
             "column-missing:dispatch_requests.request_ref",
+            "column-missing:dispatch_observation_watermarks.last_observed_event_id",
             "constraint-missing-or-invalid:dispatch-requests-request-ref-unique",
             "constraint-missing-or-invalid:dispatch_requests.operation",
+            "constraint-missing-or-invalid:dispatch_observation_watermarks.last_observed_event_id",
             "index-missing-or-invalid:dispatch-requests.created",
             "column-type:actions.priority",
             "column-unexpected:dispatch_requests.forged",
@@ -578,6 +606,40 @@ def test_unversioned_v1_adoption_allows_only_expected_later_relation_absence():
         "column-type:actions.priority",
         "column-unexpected:dispatch_requests.forged",
     ]
+
+
+def test_schema3_bridge_accepts_absent_post_v3_watermark_relation():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied={version: checksum for version, checksum in _packaged_checksums().items() if version <= 3},
+        watermark_relation=False,
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is True
+    assert result.observed_schema_version == 3
+
+
+@pytest.mark.parametrize(
+    ("column", "expression", "validated"),
+    [
+        ("first_retained_event_id", "first_retained_event_id >= 0 OR true", True),
+        ("last_observed_event_id", "last_observed_event_id >= 0", False),
+    ],
+)
+def test_compatibility_rejects_permissive_or_unvalidated_watermark_checks(column, expression, validated):
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied=_packaged_checksums(),
+        watermark_check_overrides={column: expression},
+        watermark_check_validated={column: validated},
+    )
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is False
+    assert f"constraint-missing-or-invalid:dispatch_observation_watermarks.{column}" in result.detail
 
 
 def test_compatibility_rejects_valid_ledger_when_queue_shape_is_missing():
@@ -745,7 +807,7 @@ def test_sql_canonicalization_preserves_semantic_tokens():
                 },
                 "checksum-mismatch",
             ),
-            ({**_packaged_checksums(), 7: "future"}, "too-new"),
+            ({**_packaged_checksums(), 8: "future"}, "too-new"),
     ],
 )
 def test_compatibility_rejects_unsupported_schema(applied, state):
@@ -763,7 +825,7 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
     first = schema.migrate(conn, "aq")
     second = schema.migrate(conn, "aq")
 
-    assert first["applied_versions"] == [1, 2, 3, 4, 5, 6]
+    assert first["applied_versions"] == [1, 2, 3, 4, 5, 6, 7]
     assert second["applied_versions"] == []
     assert second["compatibility"]["compatible"] is True
     locks = [

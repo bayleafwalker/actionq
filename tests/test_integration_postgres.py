@@ -83,7 +83,7 @@ def _install_exact_v3(schema: str) -> None:
     conn.close()
 
 
-def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v6(
+def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v7(
     runner_env, signed_runner_proof
 ):
     runner, schema = runner_env
@@ -211,9 +211,9 @@ def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v6(
 
     migration = runner.invoke(cli, ["migrate", "--json-output"])
     assert migration.exit_code == 0, migration.output
-    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6]
+    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7]
     final = _invoke_json(runner, ["check-compatibility"])
-    assert final["observed_schema_version"] == 6
+    assert final["observed_schema_version"] == 7
     assert final["state"] == "compatible"
 
 
