@@ -975,6 +975,13 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
         admin_conn.execute(
             sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
                 schema_identifier,
+                sql.Identifier("dispatch_observation_watermarks"),
+                runtime_identifier,
+            )
+        )
+        admin_conn.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
+                schema_identifier,
                 sql.Identifier("execution_groups"),
                 runtime_identifier,
             )
@@ -1024,7 +1031,7 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
             WHERE namespace_record.nspname = %s
             GROUP BY owner_role.rolname
             """,
-            (["actions", "events", "dispatch_requests", "schema_migrations"], schema),
+            (["actions", "events", "dispatch_requests", "dispatch_observation_watermarks", "schema_migrations"], schema),
         ).fetchone()
         admin_conn.rollback()
         assert topology["schema_owner"] != MIGRATION_ROLE

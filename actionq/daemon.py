@@ -31,6 +31,7 @@ from actionq_contracts import (
 )
 
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
+from .schema import MAX_SCHEMA_VERSION
 from .harnesses import HarnessInvocation, get_adapter
 from .harnesses.codex_catalog import LUNA_V2_CATALOG_WORKAROUND
 from .harness_profiles import validate_harness_profile
@@ -328,9 +329,9 @@ class ActionctlClient:
             compatibility = self._run("check-compatibility")
             assert compatibility is not None
             observed = compatibility.get("observed_schema_version")
-            if observed != 6:
+            if observed != MAX_SCHEMA_VERSION:
                 raise RuntimeError(
-                    "actionq-daemon requires execution schema 6; schema 3 is "
+                    f"actionq-daemon requires execution schema {MAX_SCHEMA_VERSION}; schema 3 is "
                     "maintenance-adapter-only because runner cancellation fencing "
                     "is unavailable"
                 )
