@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from psycopg import sql
+from psycopg import errors as pg_errors, sql
 
 from actionq.cli import cli
 from actionq import db, schema as schema_contract, server
@@ -83,7 +83,31 @@ def _install_exact_v3(schema: str) -> None:
     conn.close()
 
 
-def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v7(
+def _install_exact_v7(conn, schema: str) -> None:
+    """Install the released v1..v7 ledger without running v8."""
+
+    conn.execute(f'CREATE SCHEMA "{schema}"')
+    conn.execute(
+        f'''CREATE TABLE "{schema}".schema_migrations (
+            domain TEXT NOT NULL, version INTEGER NOT NULL CHECK (version > 0),
+            name TEXT NOT NULL, checksum TEXT NOT NULL,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (domain, version))'''
+    )
+    for migration in schema_contract.load_migrations()[:7]:
+        for statement in schema_contract._statements(
+            schema_contract._render(migration, schema)
+        ):
+            conn.execute(statement)
+        conn.execute(
+            f'INSERT INTO "{schema}".schema_migrations '
+            "(domain, version, name, checksum) VALUES (%s, %s, %s, %s)",
+            (schema_contract.DOMAIN, migration.version, migration.name, migration.checksum),
+        )
+    conn.commit()
+
+
+def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v8(
     runner_env, signed_runner_proof
 ):
     runner, schema = runner_env
@@ -211,10 +235,76 @@ def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v7(
 
     migration = runner.invoke(cli, ["migrate", "--json-output"])
     assert migration.exit_code == 0, migration.output
-    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7]
+    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7, 8]
     final = _invoke_json(runner, ["check-compatibility"])
-    assert final["observed_schema_version"] == 7
+    assert final["observed_schema_version"] == 8
     assert final["state"] == "compatible"
+
+
+def test_schema8_rendered_guard_executes_against_postgres(runner_env):
+    _runner, schema = runner_env
+    conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    _install_exact_v7(conn, schema)
+
+    report = schema_contract.migrate(conn, schema, runtime_role=RUNTIME_ROLE)
+
+    assert report["applied_versions"] == [8]
+    assert conn.execute(
+        f'SELECT MAX(version) AS version FROM "{schema}".schema_migrations WHERE domain=%s',
+        (schema_contract.DOMAIN,),
+    ).fetchone()["version"] == 8
+    conn.close()
+
+
+def test_schema8_root_gate_lock_blocks_concurrent_dispatch_request_insert(runner_env):
+    _runner, schema = runner_env
+    migrator = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    _install_exact_v7(migrator, schema)
+    action_id = migrator.execute(
+        f'INSERT INTO "{schema}".actions (action_type, created_by) VALUES (%s, %s) RETURNING id',
+        ("scope-iterate", "test:migrator"),
+    ).fetchone()["id"]
+    migrator.commit()
+    writer = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
+    writer_errors: list[Exception] = []
+
+    def concurrent_insert() -> None:
+        try:
+            writer.execute("SET lock_timeout = '250ms'")
+            writer.execute(
+                f'''INSERT INTO "{schema}".dispatch_requests
+                    (action_id, request_ref, normalized_snapshot, schema_version,
+                     canonicalization_version, request_sha256, identity,
+                     environment, operation, idempotency_key)
+                    VALUES (%s, %s, %s, 'v2', 'test', %s, 'test:writer',
+                            'test', 'execution.dispatch.enqueue', 'test-key')''',
+                (action_id, "req:" + uuid.uuid4().hex, b"{}", "a" * 64),
+            )
+            writer.commit()
+        except Exception as exc:  # asserted after the lock-holder observes it
+            writer_errors.append(exc)
+            writer.rollback()
+
+    with migrator.transaction():
+        schema_contract._lock_schema8_dispatch_roots(migrator, schema)
+        thread = threading.Thread(target=concurrent_insert)
+        thread.start()
+        schema_contract._require_schema8_dispatch_root_quiescence(migrator, schema)
+        migration = schema_contract.load_migrations()[7]
+        for statement in schema_contract._statements(
+            schema_contract._render(migration, schema)
+        ):
+            migrator.execute(statement)
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert len(writer_errors) == 1
+        assert isinstance(writer_errors[0], pg_errors.LockNotAvailable)
+
+    assert migrator.execute(
+        f'SELECT COUNT(*) AS count FROM "{schema}".dispatch_requests'
+    ).fetchone()["count"] == 0
+    writer.close()
+    migrator.close()
 
 
 def test_v3_bridge_fails_closed_on_partial_checksum_and_post_v3_shape(runner_env):

@@ -1,11 +1,15 @@
 import hashlib
 import io
+import json
+import socket
+import threading
+from http.server import HTTPServer
 from types import SimpleNamespace
 
 import pytest
 
 from actionq import db
-from actionq.application import ActionQApplication
+from actionq.application import ActionQApplication, InvocationProvenance
 from actionq import server
 from actionq.vuoro import build_operations, catalog_metadata
 
@@ -101,6 +105,41 @@ def test_v2_requested_by_must_match_authenticated_provenance_before_persistence(
         app.enqueue_dispatch_v2({**_request(), "requested_by": "caller:forged"}, provenance=provenance)
 
 
+def test_v2_enqueue_sets_its_floor_from_the_explicit_root_event_not_minimum_history(monkeypatch):
+    class Connection:
+        def __init__(self):
+            self.executed = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return _Transaction()
+
+        def execute(self, statement, params=None):
+            text = " ".join(str(statement).split())
+            self.executed.append((text, params))
+            assert "MIN(" not in text
+            if text.startswith("SELECT action_id"):
+                return _Rows()
+            return _Rows()
+
+    conn = Connection()
+    provenance = InvocationProvenance(actor="compiler:test", environment="dev", request_id="r", catalog_revision="c", idempotency_key="k", authorized_repositories=("actionq",))
+    app = ActionQApplication(schema="aq", authorizer=lambda *_args: True)
+    app.connection = lambda: conn
+    monkeypatch.setattr(db, "enqueue", lambda *_args, **_kwargs: {"id": 7})
+    monkeypatch.setattr(db, "insert_event", lambda *_args, **_kwargs: {"id": 44})
+
+    app.enqueue_dispatch_v2(_request(), provenance=provenance)
+
+    watermark = next(params for statement, params in conn.executed if "INSERT INTO \"aq\".\"dispatch_observation_watermarks\"" in statement)
+    assert watermark == (7, 44, 44)
+
+
 def test_http_identity_is_fail_closed_and_never_uses_spoofed_actor_headers(monkeypatch):
     headers = {"x-actionq-actor": "attacker", "x-actionq-environment": "prod", "idempotency-key": "key"}
     monkeypatch.setattr(server, "_served_authenticator", server._no_authenticator)
@@ -187,12 +226,12 @@ def test_observation_prune_preserves_highwater_when_all_events_are_removed():
 
         def execute(self, statement, params=None):
             text = " ".join(str(statement).split())
-            if text.startswith("SELECT last_observed"):
-                return _Rows([{"last_observed_event_id": 44}])
+            if text.startswith("SELECT status"):
+                return _Rows([{"status": "pending"}])
+            if text.startswith("SELECT first_retained_event_id"):
+                return _Rows([{"first_retained_event_id": 43, "last_observed_event_id": 44}])
             if text.startswith("DELETE FROM"):
                 return _Rows([{"id": 43}, {"id": 44}])
-            if text.startswith("SELECT MIN"):
-                return _Rows([{"first_id": None, "last_id": 0}])
             if text.startswith("UPDATE"):
                 self.update_params = params
                 return _Rows()
@@ -203,34 +242,85 @@ def test_observation_prune_preserves_highwater_when_all_events_are_removed():
     assert conn.update_params == (45, 44, 7)
 
 
+def test_observation_prune_preserves_terminal_history_and_never_uses_minimum_event_id():
+    class TerminalConnection:
+        def transaction(self):
+            return _Transaction()
+
+        def execute(self, statement, params=None):
+            text = " ".join(str(statement).split())
+            assert "MIN(" not in text
+            if text.startswith("SELECT status"):
+                return _Rows([{"status": "completed"}])
+            pytest.fail(f"terminal history must not be queried or deleted: {text}")
+
+    with pytest.raises(db.ActionQError, match="terminal dispatch histories cannot be pruned"):
+        db.prune_dispatch_observation_events(TerminalConnection(), "aq", action_id=7, through_event_id=44)
+
+
 @pytest.mark.parametrize("path", [
+    "/v2/dispatch",
     "/v2/dispatch/actions/1",
     "/v2/dispatch/actions/1/changes?cursor=actionq:event:1",
     "/v2/dispatch/requests/req:" + "a" * 32,
     "/v2/dispatch/actions/nope",
     "/v2/dispatch/requests/req:" + "a" * 32 + "/suffix",
 ])
-def test_retired_v2_read_routes_return_404_without_authentication_or_application(path, monkeypatch):
+def test_quarantined_v2_routes_are_byte_identical_and_skip_authentication_application_and_database(path, monkeypatch):
     handler = object.__new__(server._Handler)
     handler.path = path
     seen = []
     handler._send_json = lambda status, body: seen.append((status, body))
-    monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("retired route must not authenticate"))
-    monkeypatch.setattr(server, "ActionQApplication", lambda **_kwargs: pytest.fail("retired route must not instantiate application"))
+    monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("quarantined route must not authenticate"))
+    monkeypatch.setattr(server, "ActionQApplication", lambda **_kwargs: pytest.fail("quarantined route must not instantiate application"))
     handler.do_GET()
-    assert seen == [(404, {"error": "not found"})]
+    assert seen == [(server.V2_DISPATCH_QUARANTINE_STATUS, server.V2_DISPATCH_QUARANTINE_BODY)]
 
 
-def test_retired_v2_post_subroutes_are_404_but_enqueue_root_remains_active(monkeypatch):
+@pytest.mark.parametrize("path", ["/v2/dispatch", "/v2/dispatch/actions/1"])
+def test_quarantined_v2_post_routes_return_frozen_generic_response_before_body_auth_or_app(path, monkeypatch):
     handler = object.__new__(server._Handler)
-    handler.path = "/v2/dispatch/actions/1"
+    handler.path = path
     handler._send_json = lambda status, body: setattr(handler, "response", (status, body))
+    handler.headers = {"Content-Length": "not-an-integer"}
+    handler.rfile = io.BytesIO(b"{bad-json")
+    monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("quarantined route must not authenticate"))
+    monkeypatch.setattr(server, "_dispatch_v2", lambda *_args: pytest.fail("quarantined route must not call application"))
     handler.do_POST()
-    assert handler.response == (404, {"error": "not found"})
+    assert handler.response == (server.V2_DISPATCH_QUARANTINE_STATUS, server.V2_DISPATCH_QUARANTINE_BODY)
 
-    handler.path = "/v2/dispatch"
-    handler.headers = {"Content-Length": "2"}
-    handler.rfile = io.BytesIO(b"{}")
-    monkeypatch.setattr(server, "_dispatch_v2", lambda payload, headers: {"action_id": 1})
-    handler.do_POST()
-    assert handler.response == (200, {"action_id": 1})
+
+def test_quarantined_v2_wire_response_is_identical_for_every_http_method(monkeypatch):
+    monkeypatch.setattr(server._Handler, "log_message", lambda *_args: None)
+    httpd = HTTPServer(("127.0.0.1", 0), server._Handler)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+
+    def request(method: str) -> tuple[bytes, bytes]:
+        payload = b"{invalid-json"
+        raw = (
+            f"{method} /v2/dispatch/actions/1 HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode() + payload
+        with socket.create_connection(httpd.server_address, timeout=2) as connection:
+            connection.sendall(raw)
+            response = bytearray()
+            while chunk := connection.recv(65536):
+                response.extend(chunk)
+        return tuple(bytes(part) for part in bytes(response).split(b"\r\n\r\n", 1))
+
+    try:
+        responses = [request(method) for method in ("GET", "POST", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")]
+    finally:
+        httpd.shutdown()
+        worker.join(timeout=2)
+        httpd.server_close()
+
+    expected = json.dumps(server.V2_DISPATCH_QUARANTINE_BODY).encode()
+    headers, bodies = zip(*responses, strict=True)
+    assert all(b" 410 Gone\r\n" in header for header in headers)
+    assert all(b"Content-Type: application/json\r\n" in header for header in headers)
+    assert all(f"Content-Length: {len(expected)}".encode() in header for header in headers)
+    assert bodies == (expected,) * len(bodies)

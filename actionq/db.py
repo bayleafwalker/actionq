@@ -706,12 +706,26 @@ def prune_dispatch_observation_events(
     action_id: int,
     through_event_id: int,
 ) -> int:
-    """Prune a v2 observer stream while atomically advancing its recovery floor."""
+    """Prune a non-terminal v2 observer stream without inferring history.
+
+    Terminal action histories are immutable evidence and are never pruned by
+    this helper.  For active roots the recovery floor advances only from IDs
+    this call actually deleted under the same lock; it never uses retained-row
+    aggregates such as ``MIN(events.id)``.
+    """
     if through_event_id < 0:
         raise ActionQError("through_event_id must be non-negative")
     with conn.transaction():
+        action = conn.execute(
+            f"SELECT status FROM {qname(schema, 'actions')} WHERE id=%s FOR UPDATE",
+            (action_id,),
+        ).fetchone()
+        if action is None:
+            raise ActionQError("dispatch action not found")
+        if action["status"] in {"completed", "failed", "rejected", "cancelled"}:
+            raise ActionQError("terminal dispatch histories cannot be pruned")
         watermark = conn.execute(
-            f"SELECT last_observed_event_id FROM {qname(schema, 'dispatch_observation_watermarks')} WHERE action_id=%s FOR UPDATE",
+            f"SELECT first_retained_event_id, last_observed_event_id FROM {qname(schema, 'dispatch_observation_watermarks')} WHERE action_id=%s FOR UPDATE",
             (action_id,),
         ).fetchone()
         if watermark is None:
@@ -720,12 +734,13 @@ def prune_dispatch_observation_events(
             f"DELETE FROM {qname(schema, 'events')} WHERE action_id=%s AND id<=%s RETURNING id",
             (action_id, through_event_id),
         ).fetchall()
-        retained = conn.execute(
-            f"SELECT MIN(id) AS first_id, COALESCE(MAX(id), 0) AS last_id FROM {qname(schema, 'events')} WHERE action_id=%s",
-            (action_id,),
-        ).fetchone()
-        last_observed = max(int(watermark["last_observed_event_id"]), int(retained["last_id"]))
-        first_retained = int(retained["first_id"]) if retained["first_id"] is not None else last_observed + 1
+        deleted_ids = [int(row["id"]) for row in deleted]
+        highest_deleted = max(deleted_ids, default=0)
+        first_retained = int(watermark["first_retained_event_id"])
+        last_observed = int(watermark["last_observed_event_id"])
+        if highest_deleted:
+            first_retained = max(first_retained, highest_deleted + 1)
+            last_observed = max(last_observed, highest_deleted)
         conn.execute(
             f"UPDATE {qname(schema, 'dispatch_observation_watermarks')} SET first_retained_event_id=%s, last_observed_event_id=%s, watermark_updated_at=now() WHERE action_id=%s",
             (first_retained, last_observed, action_id),

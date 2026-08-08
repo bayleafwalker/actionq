@@ -985,21 +985,18 @@ class ActionQApplication:
                     return {"action_id": prior["action_id"], "status": "pending", "request_ref": prior["request_ref"], "request_sha256": prior["request_sha256"]}
                 created_by = provenance.actor
                 action = db.enqueue(conn, self.schema, action_type="scope-iterate", project=normalized["repo_id"], target_ref=normalized["work_item_id"], source_refs=normalized["refs"], priority=50 if normalized["priority"] == "high" else 100, parent_id=None, created_by=created_by, provenance=provenance.as_event_payload(operation="execution.dispatch.enqueue"))
-                first_event = conn.execute(
-                    f"SELECT MIN(id) AS id FROM {db.qname(self.schema, 'events')} WHERE action_id=%s",
-                    (action["id"],),
-                ).fetchone()["id"]
-                if first_event is None:
-                    raise db.ActionQError("dispatch root is missing its enqueue event")
                 request_ref = "req:" + uuid.uuid4().hex
                 conn.execute(
                     f"INSERT INTO {db.qname(self.schema, 'dispatch_requests')} (action_id, request_ref, normalized_snapshot, schema_version, canonicalization_version, request_sha256, identity, environment, operation, idempotency_key) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (action["id"], request_ref, raw, "v2", CANONICALIZATION_VERSION, digest, provenance.actor, provenance.environment, "execution.dispatch.enqueue", provenance.idempotency_key),
                 )
                 event = db.insert_event(conn, self.schema, action_id=action["id"], event_type="dispatch.v2.enqueued", actor=created_by, payload={"request_ref": request_ref, "request_sha256": digest, "schema_version": "v2", "canonicalization_version": CANONICALIZATION_VERSION, "enqueue_decision": "accepted", "provenance": provenance.as_event_payload(operation="execution.dispatch.enqueue")})
+                # The observation contract begins at this explicit root event.
+                # Do not infer a recovery floor from retained event rows: the
+                # older v7 MIN(events.id) fallback was unsafe after pruning.
                 conn.execute(
                     f"INSERT INTO {db.qname(self.schema, 'dispatch_observation_watermarks')} (action_id, first_retained_event_id, last_observed_event_id) VALUES (%s, %s, %s)",
-                    (action["id"], first_event, event["id"]),
+                    (action["id"], event["id"], event["id"]),
                 )
                 return {"action_id": action["id"], "status": "pending", "request_ref": request_ref, "request_sha256": digest}
 

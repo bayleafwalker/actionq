@@ -11,9 +11,9 @@ The current execution contract reports:
 - domain: `execution`;
 - API version: `v1`;
 - supported runtime targets: the exact complete schema `3` ledger through the
-  bounded pre-migration bridge, or the complete packaged schema `6` ledger;
+  bounded pre-migration bridge, or the complete packaged schema `8` ledger;
 - required steady-state runtime target: the complete packaged migration ledger
-  through schema version `6`; and
+  through schema version `8`; and
 - one SHA-256 checksum for every packaged migration.
 
 Schema version `2` adds the nullable `actions.claim_receipt` column. Every
@@ -23,7 +23,7 @@ a new receipt, so a prior claimant cannot renew or settle it.
 
 `actionctl check-compatibility` reports the broad release-selection range, but
 runtime accepts only two exact, checksum-matching shapes: released schema 3
-for the temporary pre-migration bridge and complete schema 6 for steady state.
+for the temporary pre-migration bridge and complete schema 8 for steady state.
 The bridge performs SELECT-only compatibility checks and the schema-3 queue
 path never references schema-4 cancellation fencing, schema-5 groups, or
 schema-6 immutable candidate objects. Missing versions, ledger holes, modified
@@ -34,9 +34,24 @@ refuses other schema drift.
 
 The schema-3 bridge is for the served maintenance adapter only. Keep
 `actionq-daemon` and every producer capable of starting worker sessions stopped
-until schema 6 is complete: schema 3 has no durable runner-auth digest or
+until schema 8 is complete: schema 3 has no durable runner-auth digest or
 cancellation acknowledgement fence. The packaged daemon checks compatibility
 before its first claim and refuses schema 3 without mutating queue state.
+
+## Schema 8 dispatch-root gate
+
+Schema 7 derived observation recovery floors from retained event rows. That
+derivation is not safe after pruning, so released migration `007` remains
+append-only and schema 8 never attempts a rewrite. Before applying schema 8,
+the deployment preflight must prove `dispatch_requests` is empty. It may
+retain completed, failed, rejected, or cancelled actions and their event
+history; those are not dispatch roots and must not be deleted to satisfy the
+gate. The migrator repeats the zero-root check transactionally and refuses the
+ledger write if any root remains.
+
+Schema 8 also permanently quarantines every `/v2/dispatch` path. The HTTP
+facade returns one generic, versioned response before reading a request body,
+authenticating, constructing the application, or connecting to the database.
 
 `actionctl check-compatibility` performs only `SELECT` statements and exits
 with status `3` for an incompatible schema. Its JSON object is the Actionq

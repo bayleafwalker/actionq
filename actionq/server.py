@@ -18,6 +18,19 @@ from .application import ActionQApplication, InvocationProvenance
 
 CONTRACT_VERSION = "v1"
 V2_CONTRACT_VERSION = "v2"
+# This is a permanent quarantine contract, not a compatibility redirect.
+# Every v2 dispatch path returns these exact values before authentication,
+# request parsing, application construction, or database access.
+V2_DISPATCH_QUARANTINE_STATUS = 410
+V2_DISPATCH_QUARANTINE_BODY = {
+    "error": "dispatch unavailable",
+    "reference": "actionq.dispatch.v2.quarantined",
+    "revision": "v1",
+}
+
+
+def _is_v2_dispatch_path(path: str) -> bool:
+    return path == "/v2/dispatch" or path.startswith("/v2/dispatch/")
 
 
 class AuthenticatedDispatchIdentity:
@@ -115,8 +128,32 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _quarantine_v2_dispatch(self) -> bool:
+        if not _is_v2_dispatch_path(urlparse(self.path).path):
+            return False
+        # Do not leave an unread hostile request body on a keep-alive socket.
+        # This response is emitted from parse_request before any route, auth,
+        # application, or database path can run.
+        self.close_connection = True
+        self._send_json(V2_DISPATCH_QUARANTINE_STATUS, V2_DISPATCH_QUARANTINE_BODY)
+        return True
+
+    def parse_request(self) -> bool:
+        """Centralize the v2 quarantine for every HTTP method.
+
+        BaseHTTPRequestHandler calls this after parsing only the request line
+        and headers, before dispatching to ``do_*`` or reading a body. Returning
+        false also covers methods for which it has no built-in ``do_*`` method.
+        """
+
+        if not super().parse_request():
+            return False
+        return not self._quarantine_v2_dispatch()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if self._quarantine_v2_dispatch():
+            return
         if parsed.path == "/health":
             self._send_json(200, {"ok": True})
         elif parsed.path == "/compatibility":
@@ -156,12 +193,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path not in {"/dispatch", "/v2/dispatch"}:
+        if self._quarantine_v2_dispatch():
+            return
+        if parsed.path != "/dispatch":
             self._send_json(404, {"error": "not found"})
             return
 
         contract_header = self.headers.get("x-actionq-dispatch-contract", "")
-        expected_contract = V2_CONTRACT_VERSION if parsed.path == "/v2/dispatch" else CONTRACT_VERSION
+        expected_contract = CONTRACT_VERSION
         if contract_header and contract_header != expected_contract:
             self._send_json(400, {"error": f"unsupported dispatch contract: {contract_header!r}"})
             return
@@ -175,7 +214,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            action = _dispatch_v2(payload, self.headers) if parsed.path == "/v2/dispatch" else _dispatch(payload)
+            action = _dispatch(payload)
         except _schema_contract.SchemaCompatibilityError as exc:
             print(f"dispatch refused: {exc}", file=sys.stderr, flush=True)
             self._send_json(503, {"error": "schema incompatible"})
@@ -189,6 +228,26 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         self._send_json(200, action)
+
+    def _unsupported_method(self) -> None:
+        if self._quarantine_v2_dispatch():
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._unsupported_method()
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._unsupported_method()
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._unsupported_method()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._unsupported_method()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self._unsupported_method()
 
 
 def main() -> None:
