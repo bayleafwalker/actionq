@@ -32,6 +32,7 @@ from actionq_contracts import (
 
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
 from .harnesses import HarnessInvocation, get_adapter
+from .harnesses.codex_catalog import LUNA_V2_CATALOG_WORKAROUND
 from .harness_profiles import validate_harness_profile
 from .routing import (
     HarnessRoute,
@@ -203,6 +204,24 @@ class SessionRecord:
     fallback_model: str | None = None
     fallback_reason: str | None = None
     caller_harness: str | None = None
+    catalog_workaround: str | None = None
+
+    def routing_provenance(self) -> dict[str, str | None] | None:
+        if self.harness is None:
+            return None
+        return {
+            "requested_selector": self.requested_selector,
+            "trusted_caller_harness": self.caller_harness,
+            "resolved_harness": self.harness,
+            "resolved_provider": self.provider,
+            "resolved_model": self.model,
+            "transport": self.transport,
+            "surface": self.surface,
+            "routing_source": self.routing_source,
+            "fallback_model": self.fallback_model,
+            "fallback_reason": self.fallback_reason,
+            "catalog_workaround": self.catalog_workaround,
+        }
 
 
 class CoordinatorClient(Protocol):
@@ -602,16 +621,26 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
     audit_raw = global_raw.get("audit", {})
     context_raw = global_raw.get("context", {})
     routing_raw = global_raw.get("routing") or raw.get("routing") or {}
-    harnesses = {
-        name: HarnessRoute(
+    harnesses: dict[str, HarnessRoute] = {}
+    for name, value in raw.get("harnesses", {}).items():
+        catalog_workaround = (
+            str(value["catalog_workaround"])
+            if "catalog_workaround" in value else None
+        )
+        if catalog_workaround is not None and (
+            name != "codex" or catalog_workaround != LUNA_V2_CATALOG_WORKAROUND
+        ):
+            raise ValueError(
+                f"unsupported catalog_workaround for harness {name!r}: {catalog_workaround!r}"
+            )
+        harnesses[name] = HarnessRoute(
             name=name,
             bin=(str(value["bin"]) if value.get("bin") else None),
             provider=(str(value["provider"]) if value.get("provider") else None),
             transport=(str(value["transport"]) if value.get("transport") else None),
             surface=(str(value["surface"]) if value.get("surface") else None),
+            catalog_workaround=catalog_workaround,
         )
-        for name, value in raw.get("harnesses", {}).items()
-    }
     config = DaemonConfig(
         poll_interval_seconds=float(global_raw.get("poll_interval_seconds", 30)),
         heartbeat_interval_seconds=float(global_raw.get("heartbeat_interval_seconds", 60)),
@@ -847,6 +876,7 @@ class Daemon:
                 "git": git_evidence,
                 "publication_reconciled": publication_reconciled,
                 "publication_resumed": publication_resumed,
+                "routing": record.routing_provenance(),
             },
         )
         self._write_state(None)
@@ -1345,6 +1375,7 @@ class Daemon:
             fallback_model=routing.fallback_model if routing else None,
             fallback_reason=routing.fallback_reason if routing else None,
             caller_harness=routing.caller_harness if routing else None,
+            catalog_workaround=routing.catalog_workaround if routing else None,
         )
         output_path = (
             self._output_path(session_id)
@@ -1851,10 +1882,14 @@ class Daemon:
             if project is None or routing is None or prompt is None:
                 raise RuntimeError(f"runner {action.runner!r} requires project, routing, and prompt")
             harness_route = (self.config.routing.harnesses or {}).get(routing.harness)
-            adapter = get_adapter(
-                routing.harness,
-                bin_path=harness_route.bin if harness_route else None,
-            )
+            adapter_options: dict[str, Any] = {
+                "bin_path": harness_route.bin if harness_route else None,
+            }
+            if routing.harness == "codex":
+                adapter_options["catalog_workaround"] = (
+                    harness_route.catalog_workaround if harness_route else None
+                )
+            adapter = get_adapter(routing.harness, **adapter_options)
             invocation = HarnessInvocation(
                 prompt=prompt,
                 worktree=project.path,

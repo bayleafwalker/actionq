@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from actionq.daemon import ActionConfig, Daemon, DaemonConfig, ProjectConfig, load_config
 from actionq.routing import HarnessRoute, RoutingContext, RoutingResult
 
@@ -40,10 +42,20 @@ def _fake_codex(tmp_path: Path, *, exit_code: int = 0, output: str = "ok") -> Pa
     path.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
+        "if sys.argv[1:] == ['debug', 'models']:\n"
+        "    print(json.dumps({'models':[\n"
+        "        {'slug':'gpt-5.6-sol','multi_agent_version':'v2'},\n"
+        "        {'slug':'gpt-5.6-luna','multi_agent_version':'v1'},\n"
+        "    ]}))\n"
+        "    raise SystemExit(0)\n"
         "capture = os.environ.get('CAPTURE_PATH')\n"
         "if capture:\n"
         "    with open(capture, 'w', encoding='utf-8') as handle:\n"
-        "        json.dump({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}, handle)\n"
+        "        argv = sys.argv[1:]\n"
+        "        catalog_path = json.loads(argv[1].split('=', 1)[1]) if argv[:1] == ['-c'] else None\n"
+        "        catalog = json.load(open(catalog_path, encoding='utf-8')) if catalog_path else None\n"
+        "        json.dump({'argv': argv, 'stdin': sys.stdin.read(), 'catalog_path': catalog_path,\n"
+        "                   'catalog': catalog}, handle)\n"
         f"print({output!r})\n"
         f"raise SystemExit({exit_code})\n",
         encoding="utf-8",
@@ -58,6 +70,7 @@ def _daemon(
     binary: Path,
     *,
     trusted_caller_harness: str | None = "codex",
+    catalog_workaround: str | None = None,
 ) -> Daemon:
     routing = RoutingContext(
         policy_path=_policy(tmp_path),
@@ -73,6 +86,7 @@ def _daemon(
                 provider="codex",
                 transport="chatgpt",
                 surface="codex-cli",
+                catalog_workaround=catalog_workaround,
             ),
         },
     )
@@ -125,6 +139,34 @@ def test_harness_runner_resolves_caller_and_records_lifecycle_provenance(tmp_pat
         assert payload["routing"]["resolved_model"] == "gpt-spark"
         assert payload["routing"]["routing_source"] == "caller-inheritance"
     assert client.completed and not client.failed
+
+
+def test_harness_runner_applies_catalog_workaround_and_records_only_named_provenance(tmp_path: Path):
+    client = FakeClient({"id": 43, "action_type": "scope-iterate", "project": "demo"})
+    daemon = _daemon(
+        tmp_path,
+        client,
+        _fake_codex(tmp_path),
+        catalog_workaround="luna-v1-to-v2",
+    )
+
+    assert daemon.run_once() is True
+
+    capture = json.loads((tmp_path / "capture.json").read_text(encoding="utf-8"))
+    assert capture["argv"][0] == "-c"
+    assert capture["catalog"]["models"][1]["multi_agent_version"] == "v2"
+    assert not Path(capture["catalog_path"]).exists()
+    lifecycle = [
+        payload
+        for event_type, _action_id, _actor, payload in client.events
+        if event_type in {"session.dispatch", "session.started", "session.exited"}
+    ]
+    assert lifecycle
+    for payload in lifecycle:
+        assert payload["routing"]["catalog_workaround"] == "luna-v1-to-v2"
+        serialized = json.dumps(payload["routing"], sort_keys=True)
+        assert "model_catalog_json" not in serialized
+        assert "actionq-codex-models-" not in serialized
 
 
 def test_routing_error_rejects_before_any_child_or_lifecycle_event(tmp_path: Path):
@@ -181,6 +223,7 @@ def test_load_config_reads_trusted_routing_harness_and_action_fields(tmp_path: P
         "provider = 'codex'\n"
         "transport = 'chatgpt'\n"
         "surface = 'codex-cli'\n"
+        "catalog_workaround = 'luna-v1-to-v2'\n"
         "[projects.demo]\n"
         f"path = {str(tmp_path)!r}\n"
         "default_harness = 'caller'\n"
@@ -200,11 +243,36 @@ def test_load_config_reads_trusted_routing_harness_and_action_fields(tmp_path: P
     assert config.routing.policy_path == policy
     assert config.routing.trusted_caller_harness == "codex"
     assert config.routing.harnesses["codex"].bin == "/opt/bin/codex"
+    assert config.routing.harnesses["codex"].catalog_workaround == "luna-v1-to-v2"
     assert actions["scope-iterate"] == ActionConfig(
         runner="harness", harness="caller", model="fast-build", worker_user="agentworker",
         harness_profile="opencode-nixpkgs-devbox-1.18.4", prompt="Run tests."
     )
     assert projects["demo"].default_model == "fast-build"
+
+
+@pytest.mark.parametrize(
+    ("harness", "workaround"),
+    [
+        ("codex", "unknown-catalog-edit"),
+        ("codex", ""),
+        ("claude", "luna-v1-to-v2"),
+    ],
+)
+def test_load_config_rejects_unapproved_catalog_workarounds(
+    tmp_path: Path,
+    harness: str,
+    workaround: str,
+):
+    config_path = tmp_path / "actionq.toml"
+    config_path.write_text(
+        f"[harnesses.{harness}]\n"
+        f"catalog_workaround = {workaround!r}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported catalog_workaround"):
+        load_config(config_path)
 
 
 def test_scope_iterate_worker_runs_through_contained_identity(tmp_path: Path, monkeypatch):
