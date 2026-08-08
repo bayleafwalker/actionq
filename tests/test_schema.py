@@ -61,6 +61,7 @@ class FakeSchemaConnection:
         dispatch_check_validated: dict[str, bool] | None = None,
         watermark_check_overrides: dict[str, str] | None = None,
         watermark_check_validated: dict[str, bool] | None = None,
+        dispatch_root_count: int = 0,
     ):
         self.ledger_exists = ledger_exists
         self.applied = dict(applied or {})
@@ -90,6 +91,7 @@ class FakeSchemaConnection:
         self.dispatch_check_validated = dispatch_check_validated or {}
         self.watermark_check_overrides = watermark_check_overrides or {}
         self.watermark_check_validated = watermark_check_validated or {}
+        self.dispatch_root_count = dispatch_root_count
         self.executed: list[tuple[str, object]] = []
         self.closed = False
         self.rollbacks = 0
@@ -125,6 +127,8 @@ class FakeSchemaConnection:
                 {"version": version, "checksum": checksum}
                 for version, checksum in sorted(self.applied.items())
             )
+        if normalized.startswith("SELECT COUNT(*) AS dispatch_roots"):
+            return _Rows([{"dispatch_roots": self.dispatch_root_count}])
         if normalized.startswith("SELECT current_user AS principal"):
             return _Rows(
                 [
@@ -448,7 +452,7 @@ def _packaged_checksums() -> dict[int, str]:
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     migrations = schema.load_migrations()
 
-    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5, 6, 7]
+    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5, 6, 7, 8]
     rendered = schema._render(migrations[0], "aq")
     assert "{{schema}}" not in rendered
     assert '"aq".actions' in rendered
@@ -488,8 +492,8 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "domain": "execution",
         "api_version": "v1",
         "minimum_schema_version": 1,
-        "maximum_schema_version": 7,
-        "observed_schema_version": 7,
+        "maximum_schema_version": 8,
+        "observed_schema_version": 8,
         "state": "compatible",
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
@@ -807,7 +811,7 @@ def test_sql_canonicalization_preserves_semantic_tokens():
                 },
                 "checksum-mismatch",
             ),
-            ({**_packaged_checksums(), 8: "future"}, "too-new"),
+            ({**_packaged_checksums(), 9: "future"}, "too-new"),
     ],
 )
 def test_compatibility_rejects_unsupported_schema(applied, state):
@@ -825,7 +829,7 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
     first = schema.migrate(conn, "aq")
     second = schema.migrate(conn, "aq")
 
-    assert first["applied_versions"] == [1, 2, 3, 4, 5, 6, 7]
+    assert first["applied_versions"] == [1, 2, 3, 4, 5, 6, 7, 8]
     assert second["applied_versions"] == []
     assert second["compatibility"]["compatible"] is True
     locks = [
@@ -837,6 +841,22 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
         ("actionq:aq:schema-migration",),
         ("actionq:aq:schema-migration",),
     ]
+
+
+def test_schema8_migration_refuses_dispatch_roots_without_touching_terminal_history():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied={version: checksum for version, checksum in _packaged_checksums().items() if version < 8},
+        dispatch_root_count=1,
+    )
+
+    with pytest.raises(schema.SchemaMigrationError, match="zero pre-v7 dispatch roots; found 1"):
+        schema.migrate(conn, "aq")
+
+    assert 8 not in conn.applied
+    # The guard is only about dispatch roots. It neither queries nor deletes
+    # terminal action/event records, which remain deployment evidence.
+    assert not any(statement.startswith("DELETE FROM") for statement, _ in conn.executed)
 
 
 def test_check_compatibility_cli_uses_read_only_contract(monkeypatch):

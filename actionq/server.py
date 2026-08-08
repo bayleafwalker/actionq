@@ -18,6 +18,19 @@ from .application import ActionQApplication, InvocationProvenance
 
 CONTRACT_VERSION = "v1"
 V2_CONTRACT_VERSION = "v2"
+# This is a permanent quarantine contract, not a compatibility redirect.
+# Every v2 dispatch path returns these exact values before authentication,
+# request parsing, application construction, or database access.
+V2_DISPATCH_QUARANTINE_STATUS = 410
+V2_DISPATCH_QUARANTINE_BODY = {
+    "error": "dispatch unavailable",
+    "reference": "actionq.dispatch.v2.quarantined",
+    "revision": "v1",
+}
+
+
+def _is_v2_dispatch_path(path: str) -> bool:
+    return path == "/v2/dispatch" or path.startswith("/v2/dispatch/")
 
 
 class AuthenticatedDispatchIdentity:
@@ -117,7 +130,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/health":
+        if _is_v2_dispatch_path(parsed.path):
+            self._send_json(V2_DISPATCH_QUARANTINE_STATUS, V2_DISPATCH_QUARANTINE_BODY)
+        elif parsed.path == "/health":
             self._send_json(200, {"ok": True})
         elif parsed.path == "/compatibility":
             try:
@@ -156,12 +171,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path not in {"/dispatch", "/v2/dispatch"}:
+        if _is_v2_dispatch_path(parsed.path):
+            self._send_json(V2_DISPATCH_QUARANTINE_STATUS, V2_DISPATCH_QUARANTINE_BODY)
+            return
+        if parsed.path != "/dispatch":
             self._send_json(404, {"error": "not found"})
             return
 
         contract_header = self.headers.get("x-actionq-dispatch-contract", "")
-        expected_contract = V2_CONTRACT_VERSION if parsed.path == "/v2/dispatch" else CONTRACT_VERSION
+        expected_contract = CONTRACT_VERSION
         if contract_header and contract_header != expected_contract:
             self._send_json(400, {"error": f"unsupported dispatch contract: {contract_header!r}"})
             return
@@ -175,7 +193,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            action = _dispatch_v2(payload, self.headers) if parsed.path == "/v2/dispatch" else _dispatch(payload)
+            action = _dispatch(payload)
         except _schema_contract.SchemaCompatibilityError as exc:
             print(f"dispatch refused: {exc}", file=sys.stderr, flush=True)
             self._send_json(503, {"error": "schema incompatible"})

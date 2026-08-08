@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 7
+MAX_SCHEMA_VERSION = 8
 PRE_MIGRATION_BRIDGE_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
@@ -282,6 +282,27 @@ def _applied_migrations(conn, schema: str) -> dict[int, str]:
         int(_row_value(row, "version")): str(_row_value(row, "checksum", 1))
         for row in rows
     }
+
+
+def _require_schema8_dispatch_root_quiescence(conn, schema: str) -> None:
+    """Refuse v8 while a v7-era observer root still exists.
+
+    Version 7 backfilled observer floors from retained events.  Once events
+    have been pruned, no subsequent migration can prove the earlier floor, so
+    v8 intentionally does not rewrite those rows.  The deployment preflight
+    must retire every dispatch root first; ordinary terminal action/event
+    history is not a root and remains untouched.
+    """
+
+    row = conn.execute(
+        f"SELECT COUNT(*) AS dispatch_roots FROM {db.qname(schema, 'dispatch_requests')}"
+    ).fetchone()
+    count = int(_row_value(row, "dispatch_roots")) if row is not None else 0
+    if count:
+        raise SchemaMigrationError(
+            "schema 8 requires zero pre-v7 dispatch roots; "
+            f"found {count} row(s) in dispatch_requests"
+        )
 
 
 def _data_tables_exist(conn, schema: str) -> bool:
@@ -1285,6 +1306,8 @@ def migrate(
         for migration in migrations:
             if migration.version in applied:
                 continue
+            if migration.version == 8:
+                _require_schema8_dispatch_root_quiescence(conn, schema)
             if migration.version == 1 and data_tables_existed:
                 shape_issues = _shape_issues(conn, schema)
                 # A genuine v1 schema predates the claim-receipt column
