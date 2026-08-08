@@ -305,6 +305,20 @@ def _require_schema8_dispatch_root_quiescence(conn, schema: str) -> None:
         )
 
 
+def _lock_schema8_dispatch_roots(conn, schema: str) -> None:
+    """Fence writes to v7 dispatch roots for the v8 quiescence check.
+
+    ``SHARE ROW EXCLUSIVE`` conflicts with the ``ROW EXCLUSIVE`` lock taken by
+    INSERT.  The migrator holds it from the root count through the v8 ledger
+    write, so an enqueue cannot slip between the zero-root observation and the
+    migration. Deployment preflight still owns draining already-open clients.
+    """
+
+    conn.execute(
+        f"LOCK TABLE {db.qname(schema, 'dispatch_requests')} IN SHARE ROW EXCLUSIVE MODE"
+    )
+
+
 def _data_tables_exist(conn, schema: str) -> bool:
     rows = conn.execute(
         "SELECT to_regclass(%s) AS actions, to_regclass(%s) AS events",
@@ -1307,6 +1321,7 @@ def migrate(
             if migration.version in applied:
                 continue
             if migration.version == 8:
+                _lock_schema8_dispatch_roots(conn, schema)
                 _require_schema8_dispatch_root_quiescence(conn, schema)
             if migration.version == 1 and data_tables_existed:
                 shape_issues = _shape_issues(conn, schema)

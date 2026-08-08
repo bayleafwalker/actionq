@@ -471,6 +471,15 @@ def test_v3_migration_comment_is_attached_to_valid_sql_statement():
     assert all("jsonb is intentionally" not in statement for statement in statements)
 
 
+def test_v8_rendered_migration_is_one_executable_statement():
+    migration = next(item for item in schema.load_migrations() if item.version == 8)
+    statements = schema._statements(schema._render(migration, "aq"))
+
+    assert len(statements) == 1
+    assert statements[0].startswith("-- #2027 Stage B")
+    assert 'FROM "aq".dispatch_requests' in statements[0]
+
+
 def test_compatibility_is_read_only_and_fails_closed_without_ledger():
     conn = FakeSchemaConnection()
 
@@ -841,6 +850,17 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
         ("actionq:aq:schema-migration",),
         ("actionq:aq:schema-migration",),
     ]
+    schema8_lock = next(
+        index
+        for index, (statement, _params) in enumerate(conn.executed)
+        if statement.startswith('LOCK TABLE "aq"."dispatch_requests" IN SHARE ROW EXCLUSIVE MODE')
+    )
+    schema8_count = next(
+        index
+        for index, (statement, _params) in enumerate(conn.executed)
+        if statement.startswith("SELECT COUNT(*) AS dispatch_roots")
+    )
+    assert schema8_lock < schema8_count
 
 
 def test_schema8_migration_refuses_dispatch_roots_without_touching_terminal_history():

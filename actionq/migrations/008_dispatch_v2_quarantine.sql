@@ -4,7 +4,7 @@
 -- already have lost the event history needed to prove a recovery floor, so a
 -- migration must not manufacture one from MIN(events.id) (or any other
 -- retained-row heuristic).  Operators first drain/remove every v2 dispatch
--- root under the deployment preflight; terminal action/event history is not
+-- root under the deployment preflight. Terminal action/event history is not
 -- a dispatch root and is intentionally retained.
 --
 -- The Python migration entrypoint performs the same check with a diagnostic

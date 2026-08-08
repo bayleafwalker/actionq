@@ -1,5 +1,9 @@
 import hashlib
 import io
+import json
+import socket
+import threading
+from http.server import HTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -284,3 +288,39 @@ def test_quarantined_v2_post_routes_return_frozen_generic_response_before_body_a
     monkeypatch.setattr(server, "_dispatch_v2", lambda *_args: pytest.fail("quarantined route must not call application"))
     handler.do_POST()
     assert handler.response == (server.V2_DISPATCH_QUARANTINE_STATUS, server.V2_DISPATCH_QUARANTINE_BODY)
+
+
+def test_quarantined_v2_wire_response_is_identical_for_every_http_method(monkeypatch):
+    monkeypatch.setattr(server._Handler, "log_message", lambda *_args: None)
+    httpd = HTTPServer(("127.0.0.1", 0), server._Handler)
+    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+    worker.start()
+
+    def request(method: str) -> tuple[bytes, bytes]:
+        payload = b"{invalid-json"
+        raw = (
+            f"{method} /v2/dispatch/actions/1 HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode() + payload
+        with socket.create_connection(httpd.server_address, timeout=2) as connection:
+            connection.sendall(raw)
+            response = bytearray()
+            while chunk := connection.recv(65536):
+                response.extend(chunk)
+        return tuple(bytes(part) for part in bytes(response).split(b"\r\n\r\n", 1))
+
+    try:
+        responses = [request(method) for method in ("GET", "POST", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")]
+    finally:
+        httpd.shutdown()
+        worker.join(timeout=2)
+        httpd.server_close()
+
+    expected = json.dumps(server.V2_DISPATCH_QUARANTINE_BODY).encode()
+    headers, bodies = zip(*responses, strict=True)
+    assert all(b" 410 Gone\r\n" in header for header in headers)
+    assert all(b"Content-Type: application/json\r\n" in header for header in headers)
+    assert all(f"Content-Length: {len(expected)}".encode() in header for header in headers)
+    assert bodies == (expected,) * len(bodies)
