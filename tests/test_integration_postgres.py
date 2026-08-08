@@ -83,7 +83,7 @@ def _install_exact_v3(schema: str) -> None:
     conn.close()
 
 
-def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v6(
+def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v7(
     runner_env, signed_runner_proof
 ):
     runner, schema = runner_env
@@ -211,9 +211,9 @@ def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v6(
 
     migration = runner.invoke(cli, ["migrate", "--json-output"])
     assert migration.exit_code == 0, migration.output
-    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6]
+    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7]
     final = _invoke_json(runner, ["check-compatibility"])
-    assert final["observed_schema_version"] == 6
+    assert final["observed_schema_version"] == 7
     assert final["state"] == "compatible"
 
 
@@ -975,6 +975,13 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
         admin_conn.execute(
             sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
                 schema_identifier,
+                sql.Identifier("dispatch_observation_watermarks"),
+                runtime_identifier,
+            )
+        )
+        admin_conn.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
+                schema_identifier,
                 sql.Identifier("execution_groups"),
                 runtime_identifier,
             )
@@ -1024,7 +1031,7 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
             WHERE namespace_record.nspname = %s
             GROUP BY owner_role.rolname
             """,
-            (["actions", "events", "dispatch_requests", "schema_migrations"], schema),
+            (["actions", "events", "dispatch_requests", "dispatch_observation_watermarks", "schema_migrations"], schema),
         ).fetchone()
         admin_conn.rollback()
         assert topology["schema_owner"] != MIGRATION_ROLE

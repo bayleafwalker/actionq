@@ -22,6 +22,7 @@ class HarnessRoute:
     provider: str | None = None
     transport: str | None = None
     surface: str | None = None
+    catalog_workaround: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class RoutingResult:
     routing_source: str
     fallback_model: str | None = None
     fallback_reason: str | None = None
+    catalog_workaround: str | None = None
 
     def provenance(self) -> dict[str, str | None]:
         return {
@@ -71,6 +73,7 @@ class RoutingResult:
             "routing_source": self.routing_source,
             "fallback_model": self.fallback_model,
             "fallback_reason": self.fallback_reason,
+            "catalog_workaround": self.catalog_workaround,
         }
 
 
@@ -154,6 +157,7 @@ def resolve_routing(request: RoutingRequest, context: RoutingContext) -> Routing
             selector, context.trusted_caller_harness, harness, provider, selector,
             harness_route.transport if harness_route else None,
             harness_route.surface if harness_route else None, source,
+            catalog_workaround=(harness_route.catalog_workaround if harness_route else None),
         )
     if not provider:
         raise RoutingError(f"harness {harness!r} requires an explicit provider mapping for alias {selector!r}")
@@ -186,11 +190,13 @@ def resolve_routing(request: RoutingRequest, context: RoutingContext) -> Routing
             selector, context.trusted_caller_harness, harness, provider, fallback,
             actual_transport, actual_surface, source,
             fallback_reason="transport-incompatible",
+            catalog_workaround=(harness_route.catalog_workaround if harness_route else None),
         )
     return RoutingResult(
         selector, context.trusted_caller_harness, harness, provider, branch["model"],
         required_transport or actual_transport, actual_surface, source,
         fallback_model=branch.get("fallback"),
+        catalog_workaround=(harness_route.catalog_workaround if harness_route else None),
     )
 
 
@@ -210,4 +216,5 @@ def same_provider_fallback(result: RoutingResult, *, reason: str) -> RoutingResu
         surface=result.surface,
         routing_source="same-provider-fallback",
         fallback_reason=reason,
+        catalog_workaround=result.catalog_workaround,
     )

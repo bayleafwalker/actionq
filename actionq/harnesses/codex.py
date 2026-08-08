@@ -12,7 +12,11 @@ disposable worktree that might not itself be the invocation cwd's git root;
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 from .base import HarnessAdapter, HarnessInvocation
+from .codex_catalog import LUNA_V2_CATALOG_WORKAROUND
 
 _SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
@@ -20,15 +24,23 @@ _SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 class CodexAdapter(HarnessAdapter):
     name = "codex"
 
-    def __init__(self, bin_path: str | None = None, *, sandbox: str = "workspace-write"):
+    def __init__(
+        self,
+        bin_path: str | None = None,
+        *,
+        sandbox: str = "workspace-write",
+        catalog_workaround: str | None = None,
+    ):
         super().__init__(bin_path or "codex")
         if sandbox not in _SANDBOX_MODES:
             raise ValueError(f"sandbox must be one of {_SANDBOX_MODES}, got {sandbox!r}")
+        if catalog_workaround not in {None, LUNA_V2_CATALOG_WORKAROUND}:
+            raise ValueError(f"unsupported Codex catalog workaround: {catalog_workaround!r}")
         self.sandbox = sandbox
+        self.catalog_workaround = catalog_workaround
 
     def build_command(self, invocation: HarnessInvocation) -> list[str]:
-        command = [
-            self.bin_path,
+        codex_argv = [
             "exec",
             "--skip-git-repo-check",
             "--json",
@@ -38,9 +50,20 @@ class CodexAdapter(HarnessAdapter):
             str(invocation.worktree),
         ]
         if invocation.model:
-            command.extend(["--model", invocation.model])
+            codex_argv.extend(["--model", invocation.model])
         # Explicit "-" (rather than relying on the no-argument default) so
         # the command is unambiguous even if a future codex version changes
         # its no-argument behavior.
-        command.append("-")
-        return command
+        codex_argv.append("-")
+        if self.catalog_workaround is None:
+            return [self.bin_path, *codex_argv]
+        return [
+            sys.executable,
+            str(Path(__file__).with_name("codex_catalog.py")),
+            "--codex-bin",
+            self.bin_path,
+            "--workaround",
+            self.catalog_workaround,
+            "--",
+            *codex_argv,
+        ]

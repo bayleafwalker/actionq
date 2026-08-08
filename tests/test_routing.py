@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -114,9 +115,16 @@ def test_spark_transport_falls_back_to_luna_without_changing_provider(tmp_path):
 
 
 def test_spark_limit_handoff_route_is_luna_on_codex(tmp_path):
-    primary = resolve_routing(
-        RoutingRequest("fast-build", project_harness="caller"), _context(tmp_path, "codex")
+    context = _context(tmp_path, "codex")
+    context = replace(
+        context,
+        harnesses={
+            "claude": HarnessRoute("claude"),
+            "codex": HarnessRoute("codex", catalog_workaround="luna-v1-to-v2"),
+        },
     )
+    primary = resolve_routing(RoutingRequest("fast-build", project_harness="caller"), context)
     fallback = same_provider_fallback(primary, reason="confirmed Spark usage limit")
     assert (fallback.harness, fallback.provider, fallback.model) == ("codex", "codex", "gpt-luna")
     assert fallback.routing_source == "same-provider-fallback"
+    assert fallback.catalog_workaround == "luna-v1-to-v2"

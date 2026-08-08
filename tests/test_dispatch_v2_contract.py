@@ -1,4 +1,5 @@
 import hashlib
+import io
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,49 @@ from actionq import db
 from actionq.application import ActionQApplication
 from actionq import server
 from actionq.vuoro import build_operations, catalog_metadata
+
+
+class _Rows:
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return self.rows
+
+
+class _Transaction:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _ObservationConnection:
+    def __init__(self, *, snapshot=None, owner=None, events=()):
+        self.snapshot = snapshot
+        self.owner = owner
+        self.events = events
+        self.executed = []
+
+    def transaction(self):
+        return _Transaction()
+
+    def execute(self, statement, params=None):
+        text = " ".join(str(statement).split())
+        self.executed.append((text, params))
+        if text.startswith("SET TRANSACTION"):
+            return _Rows()
+        if text.startswith("SELECT a.id"):
+            return _Rows([self.snapshot] if self.snapshot else [])
+        if text.startswith("SELECT a.project"):
+            return _Rows([self.owner] if self.owner else [])
+        if text.startswith("SELECT id, event_type"):
+            return _Rows(self.events)
+        raise AssertionError(f"unexpected query: {text}")
 
 
 def _request():
@@ -75,3 +119,118 @@ def test_vuoro_context_carries_only_trusted_repository_authorization():
     # The handler will fail closed without the injected application authorizer;
     # this proves the public catalog does not admit caller requested_by instead.
     assert "requested_by" not in operation.definition["input_schema"]["properties"]
+
+
+def test_v2_snapshot_and_changes_are_allowlisted_and_recover_from_all_pruned_history():
+    provenance = SimpleNamespace(actor="compiler:test", environment="dev", request_id="r", catalog_revision="c", idempotency_key="k", basis_revision=None, authorized_repositories=("actionq",))
+    app = ActionQApplication(schema="aq", authorizer=lambda *_args: True)
+    snapshot_conn = _ObservationConnection(snapshot={
+        "id": 7, "project": "actionq", "status": "completed", "action_type": "scope-iterate",
+        "request_ref": "req:" + "a" * 32, "request_sha256": "b" * 64, "cursor": 44,
+        "claim_receipt": "must-not-leak",
+    })
+    app._read = lambda reader: reader(snapshot_conn)
+    snapshot = app.dispatch_action_snapshot(7, provenance=provenance)
+    assert snapshot == {
+        "action_id": 7, "status": "completed", "action_type": "scope-iterate",
+        "request_ref": "req:" + "a" * 32, "request_sha256": "b" * 64,
+        "cursor": "actionq:event:44",
+    }
+
+    changes_conn = _ObservationConnection(
+        owner={"project": "actionq", "first_retained_event_id": 45, "cursor": 44},
+    )
+    app._read = lambda reader: reader(changes_conn)
+    changes = app.dispatch_action_changes(7, cursor="actionq:event:44", wait_seconds=0, provenance=provenance)
+    assert changes == {"status": "ok", "snapshot_required": False, "events": [], "cursor": "actionq:event:44"}
+
+    migrated_all_pruned = _ObservationConnection(
+        owner={"project": "actionq", "first_retained_event_id": 1, "cursor": 0},
+    )
+    app._read = lambda reader: reader(migrated_all_pruned)
+    expired = app.dispatch_action_changes(7, cursor="actionq:event:44", wait_seconds=0, provenance=provenance)
+    assert expired == {"status": "cursor_expired", "snapshot_required": True, "events": [], "cursor": "actionq:event:0"}
+
+
+@pytest.mark.parametrize("cursor", ["event:4", "actionq:event:-1", "actionq:event:1x", "other:event:4"])
+def test_v2_changes_rejects_noncanonical_cursor_without_database_access(cursor):
+    app = ActionQApplication(schema="aq", authorizer=lambda *_args: True)
+    app._read = lambda _reader: pytest.fail("invalid cursor must not query the database")
+    with pytest.raises(db.ActionQError, match="resource-not-found"):
+        app.dispatch_action_changes(7, cursor=cursor, wait_seconds=0, provenance=SimpleNamespace())
+
+
+def test_v2_changes_redacts_event_payload_and_non_enumerates_denied_access():
+    provenance = SimpleNamespace(actor="compiler:test", environment="dev", request_id="r", catalog_revision="c", idempotency_key="k", basis_revision=None, authorized_repositories=("actionq",))
+    app = ActionQApplication(schema="aq", authorizer=lambda *_args: True)
+    conn = _ObservationConnection(
+        owner={"project": "actionq", "first_retained_event_id": 3, "cursor": 4},
+        events=[{"id": 4, "event_type": "action.completed", "payload": {"claim_receipt": "secret"}}],
+    )
+    app._read = lambda reader: reader(conn)
+    result = app.dispatch_action_changes(7, cursor="actionq:event:3", wait_seconds=0, provenance=provenance)
+    assert result["events"] == [{"id": "actionq:event:4", "type": "lifecycle", "terminal": True, "data": {}}]
+
+    denied = ActionQApplication(schema="aq", authorizer=lambda *_args: False)
+    denied._read = lambda reader: reader(_ObservationConnection(owner={"project": "actionq", "first_retained_event_id": 3, "cursor": 4}))
+    with pytest.raises(db.ActionQError, match="^resource-not-found$"):
+        denied.dispatch_action_changes(7, cursor=None, wait_seconds=0, provenance=provenance)
+
+
+def test_observation_prune_preserves_highwater_when_all_events_are_removed():
+    class PruneConnection:
+        def __init__(self):
+            self.update_params = None
+
+        def transaction(self):
+            return _Transaction()
+
+        def execute(self, statement, params=None):
+            text = " ".join(str(statement).split())
+            if text.startswith("SELECT last_observed"):
+                return _Rows([{"last_observed_event_id": 44}])
+            if text.startswith("DELETE FROM"):
+                return _Rows([{"id": 43}, {"id": 44}])
+            if text.startswith("SELECT MIN"):
+                return _Rows([{"first_id": None, "last_id": 0}])
+            if text.startswith("UPDATE"):
+                self.update_params = params
+                return _Rows()
+            raise AssertionError(text)
+
+    conn = PruneConnection()
+    assert db.prune_dispatch_observation_events(conn, "aq", action_id=7, through_event_id=44) == 2
+    assert conn.update_params == (45, 44, 7)
+
+
+@pytest.mark.parametrize("path", [
+    "/v2/dispatch/actions/1",
+    "/v2/dispatch/actions/1/changes?cursor=actionq:event:1",
+    "/v2/dispatch/requests/req:" + "a" * 32,
+    "/v2/dispatch/actions/nope",
+    "/v2/dispatch/requests/req:" + "a" * 32 + "/suffix",
+])
+def test_retired_v2_read_routes_return_404_without_authentication_or_application(path, monkeypatch):
+    handler = object.__new__(server._Handler)
+    handler.path = path
+    seen = []
+    handler._send_json = lambda status, body: seen.append((status, body))
+    monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("retired route must not authenticate"))
+    monkeypatch.setattr(server, "ActionQApplication", lambda **_kwargs: pytest.fail("retired route must not instantiate application"))
+    handler.do_GET()
+    assert seen == [(404, {"error": "not found"})]
+
+
+def test_retired_v2_post_subroutes_are_404_but_enqueue_root_remains_active(monkeypatch):
+    handler = object.__new__(server._Handler)
+    handler.path = "/v2/dispatch/actions/1"
+    handler._send_json = lambda status, body: setattr(handler, "response", (status, body))
+    handler.do_POST()
+    assert handler.response == (404, {"error": "not found"})
+
+    handler.path = "/v2/dispatch"
+    handler.headers = {"Content-Length": "2"}
+    handler.rfile = io.BytesIO(b"{}")
+    monkeypatch.setattr(server, "_dispatch_v2", lambda payload, headers: {"action_id": 1})
+    handler.do_POST()
+    assert handler.response == (200, {"action_id": 1})

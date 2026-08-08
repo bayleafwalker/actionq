@@ -168,6 +168,11 @@ reloads configuration between child sessions. The daemon checks the legacy
 `~/.config/actionq-dispatcher/config.toml` only when no explicit `--config` is
 provided, so existing operators retain a visible migration path.
 
+Codex harnesses can opt into the temporary
+[Luna V2 catalog workaround](docs/operations/codex-luna-catalog-workaround.md).
+It is fail-closed, creates a fresh per-launch catalog, and automatically
+bypasses its override once Codex reports Luna as natively V2.
+
 All state-changing commands return JSON records that are designed to be machine-consumable.
 
 ## Data Model

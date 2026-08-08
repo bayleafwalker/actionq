@@ -21,6 +21,12 @@ actionctl_bin = "actionctl"
 # limit = 5
 # auto_claim = true
 
+# Temporary and default-off. See
+# docs/operations/codex-luna-catalog-workaround.md before enabling.
+# [harnesses.codex]
+# bin = "codex"
+# catalog_workaround = "luna-v1-to-v2"
+
 # Disposable smoke only. Production scope-iterate configuration must select
 # runner = "scope-iterate", enable exact-target context claims, configure a
 # harness/model route, and supply every explicit policy key documented by
