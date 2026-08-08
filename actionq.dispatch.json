@@ -18,6 +18,7 @@
     "template_root": "/projects/dev/agentops/templates/dispatch/skills",
     "selected": [
       "dispatch-plan",
+      "dispatch-wave",
       "dispatch-build",
       "dispatch-review",
       "code-change-verification",

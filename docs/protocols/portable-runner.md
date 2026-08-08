@@ -129,3 +129,50 @@ cancellation, or a group terminal result. Sprintctl remains authoritative for
 plan dependencies, readiness, and acceptance. Group reads expose member
 identity, status, and envelope digests, never frozen envelope bytes or claim
 credentials.
+
+## Dependent candidate actions
+
+Candidate verification, independent review, and integration are ordinary
+Actionq actions with immutable specs. They are not coordinator polling steps
+and they do not share a mutable worktree.
+
+The staged transition contract is:
+
+1. An eligible immutable candidate publication plus focused-verification result
+   creates exactly one `candidate-review` action under an idempotency key.
+2. An accepted immutable review creates either the frozen
+   `candidate-integration` action for its topology or one repository-full
+   verification action for an independent candidate.
+3. Replay after response loss returns the original action. Changed publication,
+   approval, plan, topology, or input bytes under the same logical key conflict
+   before enqueue.
+4. Rejection creates no integration action. Revocation and supersession are
+   explicit owner decisions; observers never infer them from missing work.
+
+Implementation belongs behind Actionq's owning API and transaction boundary.
+The existing immutable action contracts and runner functions are inputs, but
+their existence alone does not mean these automatic transitions have shipped.
+
+## Observable completion
+
+Action and group enqueue results should return opaque Actionq resource
+references. Snapshot/change observation owns terminality and exposes required
+immutable attachments: settlement/execution receipt, publication,
+verification, review, integration result, and bounded-output references as
+declared by action kind and terminal outcome.
+
+A coordinator performs one logical bounded wait until terminal. Transport
+renewal may use repeated long-polls internally, but observer code does not poll
+processes or reconstruct completion from logs. Missing required terminal
+attachments are an incomplete owner result and never trigger command rerun.
+
+Required failure histories before enabling automatic dependent actions:
+
+- publication commits but review enqueue response is lost;
+- identical transition replay returns one review action;
+- changed publication bytes under the same key conflict;
+- approval commits but integration enqueue response is lost;
+- duplicate approval creates one integration/full action;
+- rejection or revoked approval creates no integration action;
+- terminal snapshot survives output expiry and service restart; and
+- cursor expiry recovers through a snapshot with identical terminal attachments.
