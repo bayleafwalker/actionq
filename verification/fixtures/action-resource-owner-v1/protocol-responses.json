@@ -1,0 +1,24 @@
+{
+  "schema_version": "actionq-owner-response-goldens/v1",
+  "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "responses": {
+    "enqueue_success": {"status": 201, "body": {"schema_version": "resource-reference/v1", "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "revision": 1}},
+    "enqueue_original_retry": {"status": 200, "body": {"schema_version": "resource-reference/v1", "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "revision": 1}},
+    "enqueue_conflict": {"status": 409, "body": {"schema_version": "resource-reference/v1", "error": {"code": "idempotency_conflict", "message": "idempotency conflict"}}},
+    "snapshot": {"status": 200, "body": {"schema_version": "resource-snapshot/v1", "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "revision": 3, "cursor": "cursor_r3_scopeA", "recovery_floor": 0, "projection": {"resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "revision": 3, "state": "claimed", "terminal": false, "outcome": null, "created_at": "2026-08-09T10:00:00Z", "updated_at": "2026-08-09T10:02:00Z", "execution_sessions": [{"ordinal": 1, "state": "running", "started_at": "2026-08-09T10:01:00Z", "ended_at": null}]}}},
+    "changes": {"status": 200, "body": {"schema_version": "resource-changes/v1", "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "from_cursor": "cursor_r3_scopeA", "cursor": "cursor_r5_scopeA", "recovery_floor": 2, "changes": [{"revision": 4, "kind": "state_changed", "state": "claimed", "terminal": false, "outcome": null, "occurred_at": "2026-08-09T10:03:00Z"}, {"revision": 5, "kind": "state_changed", "state": "completed", "terminal": true, "outcome": "completed", "occurred_at": "2026-08-09T10:04:00Z"}]}},
+    "cursor_expired": {"status": 409, "body": {"schema_version": "resource-changes/v1", "error": {"code": "cursor_expired", "message": "fetch a fresh snapshot"}, "recovery_floor": 5}},
+    "wait_empty": {"status": 200, "body": {"schema_version": "resource-changes/v1", "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "from_cursor": "cursor_r3_scopeA", "cursor": "cursor_r3_scopeA", "recovery_floor": 0, "changes": []}},
+    "wait_early": {"status": 200, "body": {"schema_version": "resource-changes/v1", "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "from_cursor": "cursor_r3_scopeA", "cursor": "cursor_r4_scopeA", "recovery_floor": 0, "changes": [{"revision": 4, "kind": "state_changed", "state": "claimed", "terminal": false, "outcome": null, "occurred_at": "2026-08-09T10:03:00Z"}]}},
+    "wait_terminal": {"status": 200, "body": {"schema_version": "resource-changes/v1", "resource_ref": "aqr1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "from_cursor": "cursor_r4_scopeA", "cursor": "cursor_r5_scopeA", "recovery_floor": 0, "changes": [{"revision": 5, "kind": "state_changed", "state": "completed", "terminal": true, "outcome": "completed", "occurred_at": "2026-08-09T10:04:00Z"}]}},
+    "wait_invalid_negative": {"status": 400, "body": {"schema_version": "resource-changes/v1", "error": {"code": "invalid_wait", "message": "wait_seconds must be an integer from 0 through 30"}}},
+    "wait_invalid_fractional": {"status": 400, "body": {"schema_version": "resource-changes/v1", "error": {"code": "invalid_wait", "message": "wait_seconds must be an integer from 0 through 30"}}},
+    "wait_invalid_non_numeric": {"status": 400, "body": {"schema_version": "resource-changes/v1", "error": {"code": "invalid_wait", "message": "wait_seconds must be an integer from 0 through 30"}}},
+    "wait_invalid_over_max": {"status": 400, "body": {"schema_version": "resource-changes/v1", "error": {"code": "invalid_wait", "message": "wait_seconds must be an integer from 0 through 30"}}},
+    "cursor_wrong_resource": {"fixture_ref": "not-found.json#cases/absent"},
+    "cursor_wrong_principal_scope": {"fixture_ref": "not-found.json#cases/unauthorized"},
+    "cursor_tampered": {"fixture_ref": "not-found.json#cases/malformed"}
+  },
+  "enqueue_retry_equality": ["resource_ref", "revision"],
+  "cursor_binding": ["resource_ref", "principal_scope", "integrity"]
+}
