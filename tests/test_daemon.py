@@ -140,12 +140,17 @@ def test_cancellation_escalates_to_sigkill_and_leaves_no_worker(tmp_path: Path):
         ),
         {"command": ActionConfig(runner="command", command=(sys.executable, "-c", code))}, client,
     )
-    timer = threading.Timer(0.1, lambda: setattr(client, "current_status", "cancelling"))
+    def cancel_after_worker_start():
+        deadline = time.monotonic() + 5
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        setattr(client, "current_status", "cancelling")
+    timer = threading.Thread(target=cancel_after_worker_start)
     timer.start()
     try:
         assert daemon.run_once() is True
     finally:
-        timer.cancel()
+        timer.join(timeout=5)
     worker_pid = int(pid_file.read_text())
     for _ in range(100):
         try:

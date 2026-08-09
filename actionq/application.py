@@ -17,6 +17,7 @@ import time
 import uuid
 
 from . import db
+from .action_resource import ActionResourceOwner, ResourceNotFound, serialize_envelope
 from .runner_auth import VerifiedRunner, verify_runner_proof
 
 
@@ -66,6 +67,26 @@ class InvocationProvenance:
         }
 
 
+@dataclass(frozen=True)
+class AuthenticatedActionResourcePrincipal:
+    provenance: InvocationProvenance
+    principal_scope: str
+
+    @classmethod
+    def derive(cls, provenance: InvocationProvenance) -> "AuthenticatedActionResourcePrincipal":
+        if not provenance.actor or not provenance.environment:
+            raise db.ActionQError("authenticated action-resource provenance is incomplete")
+        material = f"action-resource/v1\x1f{provenance.environment}\x1f{provenance.actor}".encode()
+        return cls(provenance, "aqp1_" + hashlib.sha256(material).hexdigest())
+
+
+ACTION_RESOURCE_NOT_FOUND = (
+    404,
+    (("content-type", "application/json"), ("content-length", "112"), ("cache-control", "no-store")),
+    b'{"error":{"code":"resource_not_found","message":"resource not found"},"schema_version":"resource-reference/v1"}\n',
+)
+
+
 def _json_value(value: Any) -> Any:
     return json.loads(db.to_json(value))
 
@@ -90,10 +111,94 @@ class ActionQApplication:
         schema: str | None = None,
         connection_factory: Callable[[], Any] | None = None,
         authorizer: Callable[[InvocationProvenance, str, str], bool] | None = None,
+        resource_cursor_secret: bytes | None = None,
     ) -> None:
         self.schema = db.schema_name(schema)
         self._connection_factory = connection_factory
         self._authorizer = authorizer
+        self._resource_cursor_secret = resource_cursor_secret
+
+    def _project_owned_action(self, conn: Any, action_id: int, *, claim_receipt: str | None = None) -> None:
+        if self._resource_cursor_secret is not None:
+            self._action_resource_owner().project_state(
+                conn, action_id=action_id, expected_claim_receipt=claim_receipt,
+            )
+
+    def _transition_owned_action(self, conn: Any, action_id: int, transition: Callable[[], Any], *, claim_receipt: str | None = None) -> Any:
+        result = transition()
+        self._project_owned_action(conn, action_id, claim_receipt=claim_receipt)
+        return result
+
+    def _action_resource_owner(self) -> ActionResourceOwner:
+        if self._resource_cursor_secret is None:
+            raise db.ActionQError("action resource cursor secret is not configured")
+        return ActionResourceOwner(
+            schema=self.schema, connection=self.connection,
+            cursor_secret=self._resource_cursor_secret,
+        )
+
+    @staticmethod
+    def serialize_action_resource_envelope(value: dict[str, Any]) -> bytes:
+        return serialize_envelope(value)
+
+    def enqueue_action_resource(
+        self, *, principal: AuthenticatedActionResourcePrincipal, operation: str, idempotency_key: str,
+        request: dict[str, Any], action_type: str, project: str | None,
+        target_ref: str | None, source_refs: list[str], priority: int,
+        parent_id: int | None, created_by: str,
+    ) -> dict[str, Any]:
+        """Create one ActionQ-owned action root; no transport route is implied."""
+        self._authorize(principal.provenance, f"execution.action-resource.scope:{principal.principal_scope}", "enqueue")
+        owner = self._action_resource_owner()
+        result = owner.enqueue(
+            principal_scope=principal.principal_scope, operation=operation,
+            idempotency_key=idempotency_key, request=request,
+            create_action=lambda conn: db.enqueue(
+                conn, self.schema, action_type=action_type, project=project,
+                target_ref=target_ref, source_refs=source_refs, priority=priority,
+                parent_id=parent_id, created_by=created_by,
+            ),
+        )
+        return {
+            "schema_version": "resource-reference/v1",
+            "resource_ref": result.resource_ref,
+            "revision": result.revision,
+        }
+
+    def action_resource_snapshot(self, *, resource_ref: str, principal: AuthenticatedActionResourcePrincipal) -> dict[str, Any]:
+        self._authorize(principal.provenance, f"execution.action-resource.scope:{principal.principal_scope}", "read")
+        return self._action_resource_owner().snapshot(
+            resource_ref=resource_ref, principal_scope=principal.principal_scope,
+        )
+
+    def action_resource_snapshot_response(self, *, resource_ref: str, principal: AuthenticatedActionResourcePrincipal) -> tuple[int, tuple[tuple[str, str], ...], bytes]:
+        try:
+            value = self.action_resource_snapshot(resource_ref=resource_ref, principal=principal)
+        except (ResourceNotFound, db.ActionQError):
+            return ACTION_RESOURCE_NOT_FOUND
+        body = serialize_envelope(value)
+        return 200, (("content-type", "application/json"), ("content-length", str(len(body))), ("cache-control", "no-store")), body
+
+    def action_resource_changes(
+        self, *, resource_ref: str, principal: AuthenticatedActionResourcePrincipal, cursor: str,
+        wait_seconds: int = 0,
+        cancel_event: Any | None = None,
+    ) -> dict[str, Any]:
+        self._authorize(principal.provenance, f"execution.action-resource.scope:{principal.principal_scope}", "read")
+        return self._action_resource_owner().changes(
+            resource_ref=resource_ref, principal_scope=principal.principal_scope,
+            cursor=cursor, wait_seconds=wait_seconds, cancel_event=cancel_event,
+        )
+
+    def project_action_resource(
+        self, conn: Any, *, action_id: int, expected_claim_receipt: str | None = None,
+        kind: str = "state_changed",
+    ) -> int | None:
+        """Project authoritative state inside the caller's lifecycle transaction."""
+        return self._action_resource_owner().project_state(
+            conn, action_id=action_id, expected_claim_receipt=expected_claim_receipt,
+            kind=kind,
+        )
 
     def _authorize(self, provenance: InvocationProvenance, resource: str, verb: str) -> None:
         """Fail-closed resource-scoped hook for served dispatch resources."""
@@ -529,10 +634,13 @@ class ActionQApplication:
                         request_id=identity.request_id, operation=identity.operation,
                         resource="queue:next",
                     )
-                return db.claim(
+                claimed = db.claim(
                     conn, self.schema, worker=identity.runner_id,
                     timeout_minutes=timeout_minutes, provenance=event_provenance,
                 )
+                if claimed:
+                    self._project_owned_action(conn, claimed["id"], claim_receipt=claimed["claim_receipt"])
+                return claimed
         return self._mutate(
             operation="execution.action.claim",
             arguments={"worker": identity.runner_id, "runner_request_id": identity.request_id,
@@ -619,7 +727,7 @@ class ActionQApplication:
             actor=actor,
             arguments={"result_ref": result_ref, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
-            transition=lambda conn, event_provenance: db.complete(
+            transition=lambda conn, event_provenance: self._transition_owned_action(conn, action_id, lambda: db.complete(
                 conn,
                 self.schema,
                 action_id,
@@ -628,7 +736,7 @@ class ActionQApplication:
                 worker=actor,
                 claim_receipt=claim_receipt,
                 provenance=event_provenance,
-            ),
+            )),
         )
 
     def fail(
@@ -654,7 +762,7 @@ class ActionQApplication:
             actor=actor,
             arguments={"reason": reason, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
-            transition=lambda conn, event_provenance: db.fail(
+            transition=lambda conn, event_provenance: self._transition_owned_action(conn, action_id, lambda: db.fail(
                 conn,
                 self.schema,
                 action_id,
@@ -663,7 +771,7 @@ class ActionQApplication:
                 worker=actor,
                 claim_receipt=claim_receipt,
                 provenance=event_provenance,
-            ),
+            )),
         )
 
     def reject(
@@ -690,7 +798,7 @@ class ActionQApplication:
             actor=actor,
             arguments={"reason": reason, "validator": validator, "claim_receipt_digest": db.receipt_digest(claim_receipt)},
             provenance=provenance,
-            transition=lambda conn, event_provenance: db.reject(
+            transition=lambda conn, event_provenance: self._transition_owned_action(conn, action_id, lambda: db.reject(
                 conn,
                 self.schema,
                 action_id,
@@ -700,7 +808,7 @@ class ActionQApplication:
                 worker=actor,
                 claim_receipt=claim_receipt,
                 provenance=event_provenance,
-            ),
+            )),
         )
 
     def cancel(

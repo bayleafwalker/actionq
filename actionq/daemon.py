@@ -31,6 +31,7 @@ from actionq_contracts import (
 )
 
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
+from .completion_outbox import CompletionOutbox, DEFAULT_OUTBOX_PATH
 from .schema import MAX_SCHEMA_VERSION
 from .harnesses import HarnessInvocation, get_adapter
 from .harnesses.codex_catalog import LUNA_V2_CATALOG_WORKAROUND
@@ -115,6 +116,7 @@ class DaemonConfig:
     session_state_path: Path = Path("~/.local/state/actionq/sessions.json")
     pause_file: Path = Path("~/.local/state/actionq/PAUSED")
     handoff_dir: Path = Path("~/.local/state/actionq/handoff")
+    completion_outbox_path: Path = DEFAULT_OUTBOX_PATH
     actionctl_bin: str = "actionctl"
     runnerctl_bin: str = "actionq-runner"
     runner_private_key_path: Path = Path("~/.local/state/actionq/runner-identity.pem")
@@ -651,6 +653,9 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
         session_state_path=state_path,
         pause_file=pause_file,
         handoff_dir=handoff_dir,
+        completion_outbox_path=Path(
+            global_raw.get("completion_outbox_path", DEFAULT_OUTBOX_PATH)
+        ).expanduser(),
         actionctl_bin=str(global_raw.get("actionctl_bin", "actionctl")),
         runnerctl_bin=str(global_raw.get("runnerctl_bin", "actionq-runner")),
         runner_private_key_path=Path(global_raw.get(
@@ -772,6 +777,11 @@ class Daemon:
         self._reload_requested = False
         self._reload_config = reload_config
         self._child: subprocess.Popen[str] | None = None
+        self._completion_outbox_path = (
+            config.session_state_path.parent / "completion-outbox.sqlite3"
+            if config.completion_outbox_path == DEFAULT_OUTBOX_PATH
+            else config.completion_outbox_path
+        )
 
     def request_shutdown(self, *_: object) -> None:
         self._shutdown = True
@@ -798,6 +808,90 @@ class Daemon:
             # Preserve malformed state for operator inspection; it must not
             # cause a daemon restart loop or authorize another claim.
             return None
+
+    def _record_session_completion(
+        self,
+        record: SessionRecord,
+        *,
+        outcome: str,
+        exit_code: int | None,
+        usage_limited: bool = False,
+    ) -> bool:
+        """Record one owner completion fact; never changes coordinator outcome."""
+
+        logical_id = f"daemon:{record.session_id}"
+        try:
+            outbox = CompletionOutbox(self._completion_outbox_path)
+        except Exception as exc:
+            print(
+                f"actionq.daemon: failed to open session completion outbox: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return False
+        completed_at = record.updated_at
+        started_at = record.started_at or record.updated_at
+        if outcome == "end-inferred":
+            terminal = ("end-inferred", None, "crash-inferred", False)
+        elif outcome == "start-failed":
+            terminal = ("failed", None, "start-failed", False)
+        elif usage_limited:
+            terminal = ("usage-limited", None, "usage-limit", False)
+        elif outcome == "cancelled":
+            terminal = ("cancelled", None, "cancelled", False)
+        elif outcome == "timed-out":
+            terminal = ("timed-out", None, "timeout", False)
+        elif outcome == "completed":
+            terminal = ("succeeded", 0, "completed", False)
+        else:
+            terminal = ("failed", exit_code or 1, "process-exit", False)
+        try:
+            start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+            duration_ms = max(0, int((end - start).total_seconds() * 1000))
+        except ValueError:
+            duration_ms = None
+        fields = {
+            "runtime_session_id": record.runtime_session_id,
+            "attempt_id": record.session_id,
+            "action_id": str(record.action_id),
+            "repo": {"project": record.project or "unknown"},
+            "harness": record.harness or record.runner,
+            "model": {"name": record.model} if record.model else None,
+            "terminal": {
+                "kind": terminal[0],
+                "exit_code": terminal[1],
+                "reason_code": terminal[2],
+                "retryable": terminal[3],
+            },
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "observed_at": completed_at,
+            "duration_ms": duration_ms,
+            "refs": [],
+            "evidence": {
+                "dirty": False,
+                "commit_count": 0,
+                "verification": {"pass": 0, "fail": 0, "error": 0},
+            },
+            "privacy": {
+                "prompt_absent": True,
+                "transcript_absent": True,
+                "raw_output_absent": True,
+                "environment_absent": True,
+                "credentials_absent": True,
+                "absolute_paths_absent": True,
+                "claim_proofs_absent": True,
+            },
+        }
+        try:
+            outbox.record(logical_id, fields)
+        except Exception as exc:
+            print(
+                f"actionq.daemon: failed to record session completion: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return False
+        return True
 
     @staticmethod
     def _pid_alive(pid: int | None) -> bool:
@@ -855,6 +949,11 @@ class Daemon:
         )
         publication_reconciled = self._reconcile_terminal_publication(
             record.action_id, record.action_type,
+        )
+        record.updated_at = _now()
+        self._write_state(record)
+        self._record_session_completion(
+            record, outcome="end-inferred", exit_code=None
         )
         self.client.emit(
             "session.end-inferred",
@@ -1401,17 +1500,23 @@ class Daemon:
             payload={"session_id": session_id, "contract": envelope.as_dict(), "digest": sha256_digest(envelope)},
         )
         try:
-            self._child = self._start_child(
-                action_config,
-                project=evidence_project,
-                routing=routing,
-                prompt=(
-                    prepared_scope.prompt if prepared_scope is not None
-                    else (str(action["prompt"]) if action.get("prompt") else action_config.prompt)
-                ),
-                output_path=output_path,
-                envelope=envelope,
-            )
+            try:
+                self._child = self._start_child(
+                    action_config,
+                    project=evidence_project,
+                    routing=routing,
+                    prompt=(
+                        prepared_scope.prompt if prepared_scope is not None
+                        else (str(action["prompt"]) if action.get("prompt") else action_config.prompt)
+                    ),
+                    output_path=output_path,
+                    envelope=envelope,
+                )
+            except Exception:
+                self._record_session_completion(
+                    record, outcome="start-failed", exit_code=None
+                )
+                raise
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
             try:
                 takeup = self._takeup_take(project, session_id, record.pid)
@@ -1441,7 +1546,9 @@ class Daemon:
                 action_id, payload, record, claim_receipt, runner_auth_token, sprint_claim_lease,
                 project, audit_actor, audit_refs,
             )
+            record.updated_at = _now()
             usage_limit_reason: str | None = None
+            session_failure_reason: str | None = None
             if outcome == "failed":
                 usage_limit_reason = self._detect_and_handle_usage_limit(
                     action_id=action_id, action_type=action_type, action_config=action_config,
@@ -1453,7 +1560,13 @@ class Daemon:
                     scope_result = ScopeIterateKernel().verify(prepared_scope)
                 except Exception as exc:
                     outcome = "failed"
-                    usage_limit_reason = f"scope-iterate verification failed: {exc}"
+                    session_failure_reason = f"scope-iterate verification failed: {exc}"
+            self._record_session_completion(
+                record,
+                outcome=outcome,
+                exit_code=exit_code,
+                usage_limited=usage_limit_reason is not None,
+            )
             publication: dict[str, Any] | None = None
             if (outcome == "completed" and scope_result is not None
                     and action_config.publish_candidate):
@@ -1531,7 +1644,16 @@ class Daemon:
                         claim_receipt=claim_receipt,
                     )
             else:
-                self.client.fail(action_id, reason=usage_limit_reason or f"daemon session {outcome}", actor=self.config.runner_id, claim_receipt=claim_receipt)
+                self.client.fail(
+                    action_id,
+                    reason=(
+                        session_failure_reason
+                        or usage_limit_reason
+                        or f"daemon session {outcome}"
+                    ),
+                    actor=self.config.runner_id,
+                    claim_receipt=claim_receipt,
+                )
             if outcome not in {"claim-lost"} and settlement_error is None and hasattr(self.client, "reconcile_runner_spool"):
                 self.client.reconcile_runner_spool(action_id, attempt_id=session_id)
             if (outcome == "completed" and settlement_error is None and publication is not None
@@ -1804,10 +1926,16 @@ class Daemon:
         def portable(command: list[str], *, cwd: Path | None = None,
                      environment: dict[str, str] | None = None,
                      stdin_text: str | None = None) -> subprocess.Popen[str]:
-            blocked = ("ACTIONQ", "SPRINT", "KUBECONFIG", "SSH_", "GIT_", "AWS_", "TOKEN", "SECRET", "PASSWORD")
+            allowed_environment = {
+                "HOME", "LANG", "LC_ALL", "LC_CTYPE", "OPENCODE_CONFIG",
+                "PATH", "TERM", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+            }
             source = environment if environment is not None else os.environ
-            clean_env = {key: value for key, value in source.items()
-                         if not any(marker in key.upper() for marker in blocked)}
+            clean_env = {
+                key: value for key, value in source.items()
+                if key in allowed_environment
+            }
             packet = {
                 "envelope": envelope.as_dict(), "command": command,
                 "cwd": str(cwd) if cwd else None, "environment": clean_env,
@@ -2054,7 +2182,16 @@ class Daemon:
         assert self._child is not None
         next_heartbeat = time.monotonic() + self.config.heartbeat_interval_seconds
         next_cancel_poll = time.monotonic()
+        deadline = time.monotonic() + float(payload.get("ttl_seconds", 0))
         while self._child.poll() is None:
+            if time.monotonic() >= deadline:
+                os.killpg(self._child.pid, signal.SIGTERM)
+                try:
+                    self._child.wait(timeout=self.config.graceful_shutdown_seconds)
+                except subprocess.TimeoutExpired:
+                    os.killpg(self._child.pid, signal.SIGKILL)
+                    self._child.wait()
+                return "timed-out", int(self._child.returncode or 1)
             if self._shutdown:
                 audit_pause = self._publish_audit(
                     project, event_type="session.pause", actor=audit_actor or self.actor,

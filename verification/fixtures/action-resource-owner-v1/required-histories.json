@@ -1,0 +1,25 @@
+{
+  "schema_version": "actionq-required-histories/v1",
+  "backend": "disposable-postgresql",
+  "required_metadata": ["postgres_version", "isolation_level", "seed", "bounds", "faults", "minimized_counterexample"],
+  "histories": [
+    "retention-none-some-all-terminal-restart",
+    "snapshot-cursor-concurrent-terminal",
+    "non-disclosure-malformed-absent-foreign-unauthorized",
+    "recursive-redaction-canaries",
+    "enqueue-commit-response-loss-original-reference-revision",
+    "bounded-wait-zero-thirty-early-spurious-disconnect-restart",
+    "legacy-quarantine-pre-auth-app-body-db",
+    "stale-claim-session-fencing"
+  ],
+  "required_assertions": [
+    "recovery-floor-durable-non-null-in-every-pruning-state",
+    "terminal-in-snapshot-or-exactly-once-after-cursor",
+    "not-found-status-headers-body-byte-identical",
+    "no-forbidden-field-at-any-depth",
+    "retry-returns-transaction-original-reference-and-enqueue-revision",
+    "wait-never-exceeds-bound-plus-one-second-grace",
+    "legacy-404-before-auth-application-body-or-database",
+    "observation-does-not-weaken-fencing"
+  ]
+}

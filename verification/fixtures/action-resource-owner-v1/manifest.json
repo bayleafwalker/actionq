@@ -1,0 +1,23 @@
+{
+  "schema_version": "actionq-owner-fixtures/v1",
+  "contract_id": "actionq.action-resource-owner/v1",
+  "work_item": 2027,
+  "status": "frozen-awaiting-independent-go",
+  "authority_root": "action-root",
+  "session_role": "projection-only",
+  "reference_pattern": "^aqr1_[A-Za-z0-9_-]{43}$",
+  "recovery_floor": {"meaning": "smallest-resumable-cursor-position", "nullable": false, "initial": 0, "monotonic": true, "scope": "per-resource"},
+  "snapshot_handoff": {"allowed": ["one-statement", "repeatable-read"], "forbidden": "cursor-beyond-omitted-terminal-revision"},
+  "wait_seconds": {"minimum": 0, "maximum": 30, "default": 0, "grace_seconds": 1},
+  "projection_allowlist": ["resource_ref", "revision", "state", "terminal", "outcome", "created_at", "updated_at", "execution_sessions"],
+  "session_allowlist": ["ordinal", "state", "started_at", "ended_at"],
+  "event_allowlist": ["revision", "kind", "state", "terminal", "outcome", "occurred_at"],
+  "forbidden_classes": ["secret-like", "result-reference", "failure-detail", "claim", "provenance", "request-snapshot"],
+  "registered_files": {
+    "../../../docs/contracts/action-resource-owner-v1.md": {"sha256": "022c0b0f418f9b098148f0429df2b211b444aadf073249c36cfc7a17968fd140", "schema_version": null},
+    "legacy-quarantine.json": {"sha256": "ef3ec521a2b606c86d993e5ab644ac535ccff0124ba37d1015f6bef4a403d60e", "schema_version": "actionq-legacy-quarantine-golden/v1"},
+    "not-found.json": {"sha256": "621fcc98eb1c4eac971f996473fce6a1abe7596882ff313310c367a15c59440d", "schema_version": "actionq-http-golden/v1"},
+    "protocol-responses.json": {"sha256": "4e23f09c8296572671931004e451ce4649c8339865db3e7950b59d96b9e6eb6b", "schema_version": "actionq-owner-response-goldens/v1"},
+    "required-histories.json": {"sha256": "a704111e6a313ced46ae3e987926e70904e5776a51079a4623c127962c1ad31c", "schema_version": "actionq-required-histories/v1"}
+  }
+}

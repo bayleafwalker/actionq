@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from actionq.completion_outbox import CompletionOutbox
 from actionq.session_wrapper import (
     SessionIdentity,
     SessionWrapper,
@@ -92,6 +93,81 @@ def test_clean_end_history_records_nonzero_exit_and_verification(tmp_path: Path,
     assert capsule["end"]["exit_code"] == 3
     results = {entry["command"]: entry["result"] for entry in capsule["verification"]}
     assert list(results.values()) == ["pass", "fail"]
+
+
+def test_direct_timeout_records_one_timed_out_completion(
+    tmp_path: Path, git_repo: Path
+):
+    outbox_path = tmp_path / "completion.sqlite3"
+    wrapper = SessionWrapper(
+        _identity(harness="opencode"),
+        repo_path=git_repo,
+        capsule_dir=tmp_path / "capsules",
+        marker_dir=tmp_path / "markers",
+        outbox_path=outbox_path,
+    )
+    assert wrapper.run(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        timeout_seconds=0.05,
+    ) == 124
+    events = CompletionOutbox(outbox_path).pending()
+    assert len(events) == 1
+    assert events[0]["payload"]["terminal"]["kind"] == "timed-out"
+    assert len(events[0]["payload"]["refs"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "kind", "reason"),
+    [
+        ("cancel", "cancelled", "cancelled"),
+        ("start-fail", "failed", "start-failed"),
+        ("usage-limit", "usage-limited", "usage-limit"),
+    ],
+)
+def test_direct_terminal_special_cases_record_before_preserving_outcome(
+    tmp_path: Path,
+    git_repo: Path,
+    monkeypatch,
+    mode: str,
+    kind: str,
+    reason: str,
+):
+    outbox_path = tmp_path / "completion.sqlite3"
+    wrapper = SessionWrapper(
+        _identity(harness="opencode"),
+        repo_path=git_repo,
+        capsule_dir=tmp_path / "capsules",
+        marker_dir=tmp_path / "markers",
+        outbox_path=outbox_path,
+    )
+    if mode == "cancel":
+        original_run = subprocess.run
+
+        def interrupt_opencode(*args, **kwargs):
+            if args and args[0] == ["opencode"]:
+                raise KeyboardInterrupt()
+            return original_run(*args, **kwargs)
+
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            interrupt_opencode,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            wrapper.run(["opencode"])
+    elif mode == "start-fail":
+        with pytest.raises(OSError):
+            wrapper.run([str(tmp_path / "missing-opencode")])
+    else:
+        assert wrapper.run(
+            [sys.executable, "-c", "import sys; sys.exit(9)"],
+            usage_limited=True,
+        ) == 9
+    events = CompletionOutbox(outbox_path).pending()
+    assert len(events) == 1
+    assert events[0]["payload"]["terminal"]["kind"] == kind
+    assert events[0]["payload"]["terminal"]["reason_code"] == reason
+    assert wrapper.last_capsule_path is not None
 
 
 # -- crash / inferred-end history --------------------------------------------

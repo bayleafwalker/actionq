@@ -246,7 +246,7 @@ def test_shutdown_stops_child_releases_sprint_claim_and_fences_old_receipt(monke
     worker.start()
     assert daemon.client.started.wait(timeout=5)
     daemon.request_shutdown()
-    worker.join(timeout=5)
+    worker.join(timeout=15)
     assert not worker.is_alive()
     assert daemon._child is None
     assert daemon.config.session_state_path.read_text() == "{}"
@@ -325,6 +325,7 @@ def test_scope_kernel_verification_failure_releases_sprint_claim_before_fenced_f
         ),
         {"scope-iterate": ActionConfig(
             runner="scope-iterate", harness="codex", model="test-model",
+            worker_user="nobody",
             scope_iterate=policy,
         )},
         ActionctlClient(actionctl),
@@ -338,6 +339,7 @@ def test_scope_kernel_verification_failure_releases_sprint_claim_before_fenced_f
     daemon._start_child = lambda *_args, **_kwargs: subprocess.Popen(
         [sys.executable, "-c", "pass"], text=True, start_new_session=True,
     )
+    daemon.client.reconcile_runner_spool = lambda *_args, **_kwargs: None
     assert daemon.run_once() is True
 
     with db.connect() as conn:

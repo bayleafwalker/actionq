@@ -21,12 +21,12 @@ V2_CONTRACT_VERSION = "v2"
 # This is a permanent quarantine contract, not a compatibility redirect.
 # Every v2 dispatch path returns these exact values before authentication,
 # request parsing, application construction, or database access.
-V2_DISPATCH_QUARANTINE_STATUS = 410
+V2_DISPATCH_QUARANTINE_STATUS = 404
 V2_DISPATCH_QUARANTINE_BODY = {
-    "error": "dispatch unavailable",
-    "reference": "actionq.dispatch.v2.quarantined",
-    "revision": "v1",
+    "error": {"code": "legacy_route_not_found", "message": "route not found"},
+    "schema_version": "actionq-quarantine/v1",
 }
+V2_DISPATCH_QUARANTINE_BYTES = b'{"error":{"code":"legacy_route_not_found","message":"route not found"},"schema_version":"actionq-quarantine/v1"}\n'
 
 
 def _is_v2_dispatch_path(path: str) -> bool:
@@ -129,13 +129,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _quarantine_v2_dispatch(self) -> bool:
-        if not _is_v2_dispatch_path(urlparse(self.path).path):
+        # ``self.path`` retains the raw request-target spelling.  Classify its
+        # path octets before percent decoding or any path normalization.
+        if not _is_v2_dispatch_path(self.path.split("?", 1)[0]):
             return False
         # Do not leave an unread hostile request body on a keep-alive socket.
         # This response is emitted from parse_request before any route, auth,
         # application, or database path can run.
         self.close_connection = True
-        self._send_json(V2_DISPATCH_QUARANTINE_STATUS, V2_DISPATCH_QUARANTINE_BODY)
+        self.send_response(V2_DISPATCH_QUARANTINE_STATUS)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(V2_DISPATCH_QUARANTINE_BYTES)))
+        self.send_header("cache-control", "no-store")
+        self.end_headers()
+        self.wfile.write(V2_DISPATCH_QUARANTINE_BYTES)
         return True
 
     def parse_request(self) -> bool:
