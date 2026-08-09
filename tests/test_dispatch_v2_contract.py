@@ -269,25 +269,36 @@ def test_observation_prune_preserves_terminal_history_and_never_uses_minimum_eve
 def test_quarantined_v2_routes_are_byte_identical_and_skip_authentication_application_and_database(path, monkeypatch):
     handler = object.__new__(server._Handler)
     handler.path = path
-    seen = []
-    handler._send_json = lambda status, body: seen.append((status, body))
+    seen = io.BytesIO()
+    handler.requestline = "GET " + path + " HTTP/1.1"
+    handler.request_version = "HTTP/1.1"
+    handler.command = "GET"
+    handler.wfile = seen
+    handler.send_response = lambda status: setattr(handler, "status", status)
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
     monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("quarantined route must not authenticate"))
     monkeypatch.setattr(server, "ActionQApplication", lambda **_kwargs: pytest.fail("quarantined route must not instantiate application"))
     handler.do_GET()
-    assert seen == [(server.V2_DISPATCH_QUARANTINE_STATUS, server.V2_DISPATCH_QUARANTINE_BODY)]
+    assert handler.status == 404
+    assert seen.getvalue() == server.V2_DISPATCH_QUARANTINE_BYTES
 
 
 @pytest.mark.parametrize("path", ["/v2/dispatch", "/v2/dispatch/actions/1"])
 def test_quarantined_v2_post_routes_return_frozen_generic_response_before_body_auth_or_app(path, monkeypatch):
     handler = object.__new__(server._Handler)
     handler.path = path
-    handler._send_json = lambda status, body: setattr(handler, "response", (status, body))
+    handler.wfile = io.BytesIO()
+    handler.send_response = lambda status: setattr(handler, "status", status)
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
     handler.headers = {"Content-Length": "not-an-integer"}
     handler.rfile = io.BytesIO(b"{bad-json")
     monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("quarantined route must not authenticate"))
     monkeypatch.setattr(server, "_dispatch_v2", lambda *_args: pytest.fail("quarantined route must not call application"))
     handler.do_POST()
-    assert handler.response == (server.V2_DISPATCH_QUARANTINE_STATUS, server.V2_DISPATCH_QUARANTINE_BODY)
+    assert handler.status == 404
+    assert handler.wfile.getvalue() == server.V2_DISPATCH_QUARANTINE_BYTES
 
 
 def test_quarantined_v2_wire_response_is_identical_for_every_http_method(monkeypatch):
@@ -318,9 +329,10 @@ def test_quarantined_v2_wire_response_is_identical_for_every_http_method(monkeyp
         worker.join(timeout=2)
         httpd.server_close()
 
-    expected = json.dumps(server.V2_DISPATCH_QUARANTINE_BODY).encode()
+    expected = server.V2_DISPATCH_QUARANTINE_BYTES
     headers, bodies = zip(*responses, strict=True)
-    assert all(b" 410 Gone\r\n" in header for header in headers)
-    assert all(b"Content-Type: application/json\r\n" in header for header in headers)
-    assert all(f"Content-Length: {len(expected)}".encode() in header for header in headers)
+    assert all(b" 404 Not Found\r\n" in header for header in headers)
+    assert all(b"content-type: application/json\r\n" in header.lower() for header in headers)
+    assert all(f"content-length: {len(expected)}".encode() in header.lower() for header in headers)
+    assert all(b"cache-control: no-store" in header.lower() for header in headers)
     assert bodies == (expected,) * len(bodies)

@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 8
+MAX_SCHEMA_VERSION = 9
 PRE_MIGRATION_BRIDGE_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
@@ -80,6 +80,35 @@ _COLUMN_SHAPE = {
         "last_observed_event_id": ("bigint", "NO", None),
         "watermark_updated_at": ("timestamp with time zone", "NO", "now()"),
     },
+    "action_resources": {
+        "resource_ref": ("text", "NO", None),
+        "action_id": ("bigint", "NO", None),
+        "principal_scope": ("text", "NO", None),
+        "operation": ("text", "NO", None),
+        "idempotency_key": ("text", "NO", None),
+        "request_digest": ("text", "NO", None),
+        "request_snapshot": ("bytea", "NO", None),
+        "revision": ("bigint", "NO", None),
+        "enqueue_revision": ("bigint", "NO", None),
+        "recovery_floor": ("bigint", "NO", "0"),
+        "state": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+        "updated_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "action_resource_changes": {
+        "resource_ref": ("text", "NO", None),
+        "revision": ("bigint", "NO", None),
+        "kind": ("text", "NO", None),
+        "state": ("text", "NO", None),
+        "occurred_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "action_resource_sessions": {
+        "resource_ref": ("text", "NO", None),
+        "ordinal": ("integer", "NO", None),
+        "state": ("text", "NO", None),
+        "started_at": ("timestamp with time zone", "YES", None),
+        "ended_at": ("timestamp with time zone", "YES", None),
+    },
     "execution_groups": {
         "id": ("uuid", "NO", None),
         "plan_ref": ("text", "NO", None),
@@ -138,6 +167,9 @@ _REQUIRED_CONSTRAINT_COUNTS = {
     "events": {"p": 1, "f": 1},
     "dispatch_requests": {"p": 1, "f": 1, "u": 2, "c": 3},
     "dispatch_observation_watermarks": {"p": 1, "f": 1, "c": 2},
+    "action_resources": {"p": 1, "f": 1, "u": 3, "c": 5},
+    "action_resource_changes": {"p": 1, "f": 1, "c": 3},
+    "action_resource_sessions": {"p": 1, "f": 1, "c": 1},
     "execution_groups": {"p": 1, "u": 2, "c": 3},
     "execution_group_members": {"p": 1, "f": 2, "u": 2, "c": 1},
     "immutable_action_specs": {"p": 1, "u": 1, "c": 3},
@@ -166,6 +198,9 @@ _REQUIRED_INDEXES = {
     ),
     "dispatch-requests.created": (
         "dispatch_requests", (("created_at", False, False), ("action_id", False, False)), None,
+    ),
+    "action-resource-changes.lookup": (
+        "action_resource_changes", (("resource_ref", False, False), ("revision", False, False)), None,
     ),
     "execution-group-members.group": (
         "execution_group_members", (("group_id", False, False),), None,
@@ -980,6 +1015,12 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
         "constraint-missing-or-invalid:immutable-action-",
         "constraint-missing-or-invalid:immutable_action_",
         "index-missing-or-invalid:immutable-action-requests.",
+        "column-missing:action_resources.",
+        "column-missing:action_resource_changes.",
+        "column-missing:action_resource_sessions.",
+        "constraint-missing-or-invalid:action-resource-",
+        "constraint-missing-or-invalid:action_resource_",
+        "index-missing-or-invalid:action-resource-",
     )
     return [
         issue for issue in issues
@@ -1018,6 +1059,9 @@ def _schema3_bridge_shape_issues(conn, schema: str) -> tuple[str, ...]:
         "immutable_action_requests",
         "immutable_action_runtime_grants",
         "dispatch_observation_watermarks",
+        "action_resources",
+        "action_resource_changes",
+        "action_resource_sessions",
     )
     rows = conn.execute(
         """
@@ -1219,6 +1263,12 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
             role_identifier,
         )
     )
+    for table in ("action_resources", "action_resource_changes", "action_resource_sessions"):
+        conn.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {}.{} TO {}").format(
+                schema_identifier, sql.Identifier(table), role_identifier,
+            )
+        )
     conn.execute(
         sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
             schema_identifier, sql.Identifier("execution_groups"), role_identifier

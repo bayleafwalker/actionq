@@ -1,8 +1,10 @@
 import hashlib
 import json
 import os
+import socket
 import threading
 import uuid
+from http.server import HTTPServer
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,9 @@ from psycopg import errors as pg_errors, sql
 
 from actionq.cli import cli
 from actionq import db, schema as schema_contract, server
+from actionq.action_resource import ActionResourceOwner, CursorExpired, IdempotencyConflict
+import actionq.action_resource as action_resource_module
+from actionq.application import ActionQApplication, AuthenticatedActionResourcePrincipal, InvocationProvenance
 
 MIGRATION_ROLE = "actionq_migration"
 RUNTIME_ROLE = "actionq_runtime"
@@ -40,6 +45,314 @@ def _install_legacy_v1(conn, schema: str) -> None:
     for statement in schema_contract._statements(rendered):
         conn.execute(statement)
     conn.commit()
+
+
+def _run_action_resource_owner_history(owner_history):
+    """Disposable-PG falsifying history for the frozen owner contract."""
+    resource_schema = "aqresource_" + uuid.uuid4().hex
+    migration_conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
+    schema_contract.migrate(migration_conn, resource_schema)
+    migration_conn.close()
+
+    def connect():
+        return db.connect(os.environ["ACTIONQ_TEST_URL"])
+
+    def connect_runtime():
+        return db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"])
+
+    secret = b"owner-test-cursor-secret".ljust(32, b"!")
+    owner = ActionResourceOwner(schema=resource_schema, connection=connect, cursor_secret=secret)
+    application = ActionQApplication(schema=resource_schema, connection_factory=connect_runtime, resource_cursor_secret=secret, authorizer=lambda *_: True)
+    boundary_principal = AuthenticatedActionResourcePrincipal.derive(InvocationProvenance(actor="principal-boundary", environment="test", request_id="r", catalog_revision="c", idempotency_key="boundary-key"))
+
+    def create_action(conn):
+        return conn.execute(
+            f'INSERT INTO "{resource_schema}".actions '
+            "(action_type, project, created_by) VALUES ('scope-iterate','actionq','test') RETURNING id"
+        ).fetchone()
+
+    canary_request = {"repo": "actionq", "secret": "canary-secret", "result_ref": "canary-result", "failure_detail": "canary-failure", "claim": "canary-claim", "provenance": "canary-provenance", "request_snapshot": "canary-request"}
+    first = owner.enqueue(principal_scope="principal-a", operation="enqueue", idempotency_key="key-a",
+                          request=canary_request, create_action=create_action)
+    retry = owner.enqueue(principal_scope="principal-a", operation="enqueue", idempotency_key="key-a",
+                          request=dict(reversed(list(canary_request.items()))), create_action=create_action)
+    assert retry.original_retry and (retry.resource_ref, retry.revision) == (first.resource_ref, first.revision)
+    with pytest.raises(IdempotencyConflict):
+        owner.enqueue(principal_scope="principal-a", operation="enqueue", idempotency_key="key-a",
+                      request={"repo": "different"}, create_action=create_action)
+
+    boundary_first = application.enqueue_action_resource(
+        principal=boundary_principal, operation="execution.action.enqueue",
+        idempotency_key="boundary-key", request={"repo": "actionq"},
+        action_type="scope-iterate", project="actionq", target_ref=None,
+        source_refs=[], priority=100, parent_id=None, created_by="boundary-test",
+    )
+    boundary_retry = application.enqueue_action_resource(
+        principal=boundary_principal, operation="execution.action.enqueue",
+        idempotency_key="boundary-key", request={"repo": "actionq"},
+        action_type="scope-iterate", project="actionq", target_ref=None,
+        source_refs=[], priority=100, parent_id=None, created_by="boundary-test",
+    )
+    assert boundary_retry == boundary_first
+    assert json.loads(application.serialize_action_resource_envelope(boundary_first)) == boundary_first
+    if owner_history == "response-loss":
+        committed = {}
+        def commit_then_lose_response():
+            committed["value"] = application.enqueue_action_resource(
+                principal=boundary_principal, operation="execution.action.enqueue",
+                idempotency_key="lost-response-key", request={"repo": "actionq", "fault": "response-loss"},
+                action_type="scope-iterate", project="actionq", target_ref=None,
+                source_refs=[], priority=100, parent_id=None, created_by="boundary-test",
+            )
+            raise ConnectionError("post-commit pre-response fault")
+        with pytest.raises(ConnectionError, match="post-commit pre-response"):
+            commit_then_lose_response()
+        recovered = application.enqueue_action_resource(
+            principal=boundary_principal, operation="execution.action.enqueue",
+            idempotency_key="lost-response-key", request={"fault": "response-loss", "repo": "actionq"},
+            action_type="scope-iterate", project="actionq", target_ref=None,
+            source_refs=[], priority=100, parent_id=None, created_by="boundary-test",
+        )
+        assert recovered == committed["value"]
+
+    initial = owner.snapshot(resource_ref=first.resource_ref, principal_scope="principal-a")
+    assert initial["revision"] == 1 and initial["recovery_floor"] == 0
+    assert not any(value in json.dumps(initial) for key, value in canary_request.items() if key != "repo")
+    if owner_history == "redaction":
+        with connect() as conn:
+            stored = dict(conn.execute(f'SELECT * FROM "{resource_schema}".action_resources WHERE resource_ref=%s', (first.resource_ref,)).fetchone())
+            for field, value in canary_request.items():
+                if field == "repo":
+                    continue
+                with pytest.raises(db.ActionQError, match="unknown action resource owner field"):
+                    action_resource_module._projection({**stored, f"unknown_{field}": value}, [])
+        with pytest.raises(db.ActionQError, match="unknown action resource event field"):
+            action_resource_module._event({"revision": 9, "kind": "state_changed", "state": "failed", "occurred_at": stored["updated_at"], "unknown": "canary-unknown"})
+    action_id = None
+    with connect() as conn:
+        action_id = conn.execute(f'SELECT action_id FROM "{resource_schema}".action_resources WHERE resource_ref=%s', (first.resource_ref,)).fetchone()["action_id"]
+    if owner_history == "snapshot-race":
+        projection_read = threading.Event()
+        terminal_committed = threading.Event()
+        original_projection = action_resource_module._projection
+        captured = {}
+        def blocked_projection(row, sessions):
+            projection_read.set()
+            assert terminal_committed.wait(5)
+            return original_projection(row, sessions)
+        action_resource_module._projection = blocked_projection
+        thread = threading.Thread(target=lambda: captured.setdefault("snapshot", owner.snapshot(resource_ref=first.resource_ref, principal_scope="principal-a")))
+        try:
+            thread.start()
+            assert projection_read.wait(5)
+            with connect() as conn, conn.transaction():
+                conn.execute(f'UPDATE "{resource_schema}".actions SET status=\'claimed\', claim_receipt=\'race-receipt\' WHERE id=%s', (action_id,))
+                owner.project_state(conn, action_id=action_id, expected_claim_receipt="race-receipt")
+                conn.execute(f'UPDATE "{resource_schema}".actions SET status=\'completed\', completed_at=now() WHERE id=%s', (action_id,))
+                owner.project_state(conn, action_id=action_id)
+            terminal_committed.set()
+            thread.join(5)
+            assert not thread.is_alive()
+        finally:
+            terminal_committed.set()
+            action_resource_module._projection = original_projection
+        raced = captured["snapshot"]
+        assert raced["revision"] == 1 and raced["projection"]["terminal"] is False
+        raced_changes = owner.changes(resource_ref=first.resource_ref, principal_scope="principal-a", cursor=raced["cursor"])
+        assert [event["revision"] for event in raced_changes["changes"]] == [2, 3]
+        assert raced_changes["changes"][-1]["terminal"] is True
+    with connect() as conn, conn.transaction():
+        conn.execute(f'UPDATE "{resource_schema}".actions SET status=\'claimed\', claim_receipt=\'receipt-a\' WHERE id=%s', (action_id,))
+        with pytest.raises(db.ClaimRejected):
+            application.project_action_resource(conn, action_id=action_id, expected_claim_receipt="stale-receipt")
+        assert application.project_action_resource(conn, action_id=action_id, expected_claim_receipt="receipt-a") >= 2
+        if owner_history == "fencing":
+            conn.execute(f'UPDATE "{resource_schema}".actions SET claim_receipt=\'receipt-b\' WHERE id=%s', (action_id,))
+            with pytest.raises(db.ClaimRejected):
+                application.project_action_resource(conn, action_id=action_id, expected_claim_receipt="receipt-a")
+            application.project_action_resource(conn, action_id=action_id, expected_claim_receipt="receipt-b")
+        conn.execute(f'UPDATE "{resource_schema}".actions SET status=\'completed\', completed_at=now() WHERE id=%s', (action_id,))
+        assert application.project_action_resource(conn, action_id=action_id) >= 3
+    owner_principal = AuthenticatedActionResourcePrincipal.derive(InvocationProvenance(actor="principal-a", environment="test", request_id="r2", catalog_revision="c", idempotency_key="k"))
+    # The direct owner fixture uses its literal principal scope; retain that
+    # low-level proof while application-boundary roots use derived scopes.
+    changes = owner.changes(resource_ref=first.resource_ref, principal_scope="principal-a", cursor=initial["cursor"])
+    assert [event["revision"] for event in changes["changes"]] == list(range(2, changes["changes"][-1]["revision"] + 1))
+    assert changes["changes"][-1]["terminal"] is True
+    if owner_history == "fencing":
+        restarted_fencing = ActionQApplication(schema=resource_schema, connection_factory=connect_runtime, resource_cursor_secret=secret, authorizer=lambda *_: True)
+        with connect() as conn, conn.transaction(), pytest.raises(db.ClaimRejected):
+            restarted_fencing.project_action_resource(conn, action_id=action_id, expected_claim_receipt="receipt-a")
+        claim_a_provenance = InvocationProvenance(actor="runner:a", environment="test", request_id="claim-a", catalog_revision="c", idempotency_key="claim-a")
+        claim_a = application.claim(worker="runner:a", timeout_minutes=1, provenance=claim_a_provenance)["result"]
+        with connect() as conn, conn.transaction():
+            conn.execute(f'UPDATE "{resource_schema}".actions SET claim_deadline=now()-interval \'1 minute\' WHERE id=%s', (claim_a["id"],))
+        application.sweep()
+        restarted_lifecycle = ActionQApplication(schema=resource_schema, connection_factory=connect_runtime, resource_cursor_secret=secret, authorizer=lambda *_: True)
+        claim_b_provenance = InvocationProvenance(actor="runner:b", environment="test", request_id="claim-b", catalog_revision="c", idempotency_key="claim-b")
+        claim_b = restarted_lifecycle.claim(worker="runner:b", timeout_minutes=1, provenance=claim_b_provenance)["result"]
+        assert claim_b["id"] == claim_a["id"] and claim_b["claim_receipt"] != claim_a["claim_receipt"]
+        stale_decision = restarted_lifecycle.complete(action_id=claim_a["id"], result_ref="result:stale", actor="runner:a", claim_receipt=claim_a["claim_receipt"], provenance=InvocationProvenance(actor="runner:a", environment="test", request_id="stale", catalog_revision="c", idempotency_key="stale"))
+        assert stale_decision["decision"]["status"] == "rejected"
+        restarted_lifecycle.complete(action_id=claim_b["id"], result_ref="result:ok", actor="runner:b", claim_receipt=claim_b["claim_receipt"], provenance=InvocationProvenance(actor="runner:b", environment="test", request_id="complete", catalog_revision="c", idempotency_key="complete"))
+        terminal_boundary = restarted_lifecycle.action_resource_snapshot(resource_ref=boundary_first["resource_ref"], principal=boundary_principal)
+        assert terminal_boundary["projection"]["state"] == "completed"
+        for outcome in ("fail", "reject"):
+            root = restarted_lifecycle.enqueue_action_resource(principal=boundary_principal, operation="execution.action.enqueue", idempotency_key=f"{outcome}-root", request={"outcome": outcome}, action_type="scope-iterate", project="actionq", target_ref=None, source_refs=[], priority=100, parent_id=None, created_by="boundary-test")
+            actor = f"runner:{outcome}"
+            claimed = restarted_lifecycle.claim(worker=actor, timeout_minutes=1, provenance=InvocationProvenance(actor=actor, environment="test", request_id=f"claim-{outcome}", catalog_revision="c", idempotency_key=f"claim-{outcome}"))["result"]
+            terminal_provenance = InvocationProvenance(actor=actor, environment="test", request_id=outcome, catalog_revision="c", idempotency_key=outcome)
+            if outcome == "fail":
+                restarted_lifecycle.fail(action_id=claimed["id"], reason="bounded", actor=actor, claim_receipt=claimed["claim_receipt"], provenance=terminal_provenance)
+            else:
+                restarted_lifecycle.reject(action_id=claimed["id"], reason="bounded", validator="test", actor=actor, claim_receipt=claimed["claim_receipt"], provenance=terminal_provenance)
+            assert restarted_lifecycle.action_resource_snapshot(resource_ref=root["resource_ref"], principal=boundary_principal)["projection"]["state"] == ("failed" if outcome == "fail" else "rejected")
+
+    terminal_before_pruning = application.serialize_action_resource_envelope(owner.snapshot(resource_ref=first.resource_ref, principal_scope="principal-a")["projection"])
+    if owner_history == "pruning":
+        assert application.serialize_action_resource_envelope(owner.snapshot(resource_ref=first.resource_ref, principal_scope="principal-a")["projection"]) == terminal_before_pruning
+        assert owner.prune(resource_ref=first.resource_ref, through_revision=1) == 1
+        assert owner.snapshot(resource_ref=first.resource_ref, principal_scope="principal-a")["recovery_floor"] == 1
+        assert application.serialize_action_resource_envelope(owner.snapshot(resource_ref=first.resource_ref, principal_scope="principal-a")["projection"]) == terminal_before_pruning
+        owner.prune(resource_ref=first.resource_ref, through_revision=2)
+    owner.prune(resource_ref=first.resource_ref, through_revision=999)
+    restarted = ActionResourceOwner(schema=resource_schema, connection=connect, cursor_secret=secret)
+    terminal = restarted.snapshot(resource_ref=first.resource_ref, principal_scope="principal-a")
+    assert terminal["recovery_floor"] == terminal["revision"] and terminal["projection"]["outcome"] == "completed"
+    with pytest.raises(CursorExpired) as expired:
+        restarted.changes(resource_ref=first.resource_ref, principal_scope="principal-a", cursor=initial["cursor"])
+    assert expired.value.recovery_floor == terminal["revision"]
+    assert restarted.changes(resource_ref=first.resource_ref, principal_scope="principal-a", cursor=terminal["cursor"])["changes"] == []
+    terminal_started = __import__("time").monotonic()
+    assert restarted.changes(resource_ref=first.resource_ref, principal_scope="principal-a", cursor=terminal["cursor"], wait_seconds=30)["changes"] == []
+    assert __import__("time").monotonic() - terminal_started < 1
+    assert application.serialize_action_resource_envelope(terminal["projection"]) == terminal_before_pruning
+    assert application.serialize_action_resource_envelope(terminal).endswith(b"\n")
+    if owner_history == "non-disclosure":
+        foreign = AuthenticatedActionResourcePrincipal.derive(InvocationProvenance(actor="foreign", environment="test", request_id="f", catalog_revision="c", idempotency_key="f"))
+        cases = [
+            application.action_resource_snapshot_response(resource_ref="aqr1_bad", principal=boundary_principal),
+            application.action_resource_snapshot_response(resource_ref="aqr1_" + "A" * 43, principal=boundary_principal),
+            application.action_resource_snapshot_response(resource_ref=boundary_first["resource_ref"], principal=foreign),
+            ActionQApplication(schema=resource_schema, connection_factory=connect_runtime, resource_cursor_secret=secret, authorizer=lambda *_: False).action_resource_snapshot_response(resource_ref=boundary_first["resource_ref"], principal=boundary_principal),
+        ]
+        assert len(set(cases)) == 1
+        assert cases[0] == (404, (("content-type", "application/json"), ("content-length", "112"), ("cache-control", "no-store")), b'{"error":{"code":"resource_not_found","message":"resource not found"},"schema_version":"resource-reference/v1"}\n')
+    if owner_history == "bounded-wait":
+        pending = application.action_resource_snapshot(resource_ref=boundary_first["resource_ref"], principal=boundary_principal)
+        assert application.action_resource_changes(resource_ref=boundary_first["resource_ref"], principal=boundary_principal, cursor=pending["cursor"], wait_seconds=0)["changes"] == []
+        clock = [0.0]
+        original_monotonic, original_sleep = action_resource_module.time.monotonic, action_resource_module.time.sleep
+        action_resource_module.time.monotonic = lambda: clock[0]
+        action_resource_module.time.sleep = lambda duration: clock.__setitem__(0, clock[0] + duration)
+        try:
+            empty = application.action_resource_changes(resource_ref=boundary_first["resource_ref"], principal=boundary_principal, cursor=pending["cursor"], wait_seconds=30)
+        finally:
+            action_resource_module.time.monotonic, action_resource_module.time.sleep = original_monotonic, original_sleep
+        assert empty["changes"] == [] and 30 <= clock[0] <= 31
+        early = {}
+        waiter = threading.Thread(target=lambda: early.setdefault("value", application.action_resource_changes(resource_ref=boundary_first["resource_ref"], principal=boundary_principal, cursor=pending["cursor"], wait_seconds=30)))
+        waiter.start()
+        __import__("time").sleep(.2)
+        with connect() as conn, conn.transaction():
+            boundary_action_id = conn.execute(f'SELECT action_id FROM "{resource_schema}".action_resources WHERE resource_ref=%s', (boundary_first["resource_ref"],)).fetchone()["action_id"]
+            conn.execute(f'UPDATE "{resource_schema}".actions SET status=\'claimed\', claim_receipt=\'boundary-receipt\' WHERE id=%s', (boundary_action_id,))
+            owner.project_state(conn, action_id=boundary_action_id, expected_claim_receipt="boundary-receipt")
+        waiter.join(5)
+        assert not waiter.is_alive() and early["value"]["changes"][0]["revision"] == 2
+        cancel = threading.Event()
+        disconnected_result = {}
+        def cancelled_wait():
+            try:
+                application.action_resource_changes(resource_ref=boundary_first["resource_ref"], principal=boundary_principal, cursor=early["value"]["cursor"], wait_seconds=30, cancel_event=cancel)
+            except ConnectionError as exc:
+                disconnected_result["error"] = str(exc)
+        observer = threading.Thread(target=cancelled_wait)
+        observer.start()
+        __import__("time").sleep(.2)
+        cancel.set()
+        observer.join(2)
+        assert disconnected_result == {"error": "observer disconnected"}
+        restarted_application = ActionQApplication(schema=resource_schema, connection_factory=connect_runtime, resource_cursor_secret=secret, authorizer=lambda *_: True)
+        assert restarted_application.action_resource_snapshot(resource_ref=boundary_first["resource_ref"], principal=boundary_principal)["revision"] == 2
+    if owner_history == "legacy-quarantine":
+        fixture = json.loads((Path(__file__).parents[1] / "verification/fixtures/action-resource-owner-v1/legacy-quarantine.json").read_text())
+        counters = {"body_read": 0, "auth": 0, "application": 0, "db": 0}
+        original_auth, original_app, original_connect = server._served_authenticator, server.ActionQApplication, server._db.connect
+        server._served_authenticator = lambda _headers: counters.__setitem__("auth", counters["auth"] + 1)
+        server.ActionQApplication = lambda **_kwargs: counters.__setitem__("application", counters["application"] + 1)
+        server._db.connect = lambda *_a, **_k: counters.__setitem__("db", counters["db"] + 1)
+        class BodyReadSpy:
+            def __init__(self, wrapped): self.wrapped = wrapped
+            def read(self, *args, **kwargs): counters["body_read"] += 1; return self.wrapped.read(*args, **kwargs)
+            def __getattr__(self, name): return getattr(self.wrapped, name)
+        class HistoryHandler(server._Handler):
+            def setup(self):
+                super().setup(); self.rfile = BodyReadSpy(self.rfile)
+            def log_message(self, *_args): pass
+        httpd = HTTPServer(("127.0.0.1", 0), HistoryHandler)
+        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+        worker.start()
+        exercised = 0
+        try:
+            for method in fixture["methods"]:
+                for case in fixture["path_cases"]:
+                    payload = b"{invalid-json"
+                    raw = f"{method} {case['raw_target']} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload
+                    with socket.create_connection(httpd.server_address, timeout=2) as connection:
+                        connection.sendall(raw)
+                        response = b""
+                        while chunk := connection.recv(65536):
+                            response += chunk
+                    if case["quarantined"]:
+                        assert b" 404 Not Found\r\n" in response and response.endswith(server.V2_DISPATCH_QUARANTINE_BYTES)
+                    exercised += 1
+        finally:
+            httpd.shutdown(); worker.join(2); httpd.server_close()
+            server._served_authenticator, server.ActionQApplication, server._db.connect = original_auth, original_app, original_connect
+        assert exercised == fixture["cross_product_count"] == 64
+        assert counters == {"body_read": 0, "auth": 0, "application": 0, "db": 0}
+        assert server.V2_DISPATCH_QUARANTINE_BYTES.decode() == fixture["response"]["body_utf8"]
+
+    cleanup = connect()
+    cleanup.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(resource_schema)))
+    cleanup.commit()
+    cleanup.close()
+    assertion_id = f"action-resource-owner.{owner_history}.v1"
+    print(f"OWNER_ASSERTION {assertion_id}")
+    return {assertion_id}
+
+
+def test_action_resource_history_pruning_none_some_all_restart():
+    assert _run_action_resource_owner_history("pruning") == {"action-resource-owner.pruning.v1"}
+
+
+def test_action_resource_history_threaded_concurrent_terminal_handoff():
+    assert _run_action_resource_owner_history("snapshot-race") == {"action-resource-owner.snapshot-race.v1"}
+
+
+def test_action_resource_history_four_case_application_not_found_bytes():
+    assert _run_action_resource_owner_history("non-disclosure") == {"action-resource-owner.non-disclosure.v1"}
+
+
+def test_action_resource_history_recursive_six_class_redaction_canaries():
+    assert _run_action_resource_owner_history("redaction") == {"action-resource-owner.redaction.v1"}
+
+
+def test_action_resource_history_commit_response_loss_original_retry():
+    assert _run_action_resource_owner_history("response-loss") == {"action-resource-owner.response-loss.v1"}
+
+
+def test_action_resource_history_wait_zero_thirty_early_spurious_disconnect_restart():
+    assert _run_action_resource_owner_history("bounded-wait") == {"action-resource-owner.bounded-wait.v1"}
+
+
+def test_action_resource_history_legacy_raw_64_case_preaccess_quarantine():
+    assert _run_action_resource_owner_history("legacy-quarantine") == {"action-resource-owner.legacy-quarantine.v1"}
+
+
+def test_action_resource_history_two_incarnation_stale_session_fencing():
+    assert _run_action_resource_owner_history("fencing") == {"action-resource-owner.fencing.v1"}
 
 
 def _install_exact_v3(schema: str) -> None:
@@ -107,7 +420,7 @@ def _install_exact_v7(conn, schema: str) -> None:
     conn.commit()
 
 
-def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v8(
+def test_exact_v3_bridge_lifecycle_then_exact_migration_to_current(
     runner_env, signed_runner_proof
 ):
     runner, schema = runner_env
@@ -235,9 +548,9 @@ def test_exact_v3_bridge_lifecycle_then_exact_migration_to_v8(
 
     migration = runner.invoke(cli, ["migrate", "--json-output"])
     assert migration.exit_code == 0, migration.output
-    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7, 8]
+    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7, 8, 9]
     final = _invoke_json(runner, ["check-compatibility"])
-    assert final["observed_schema_version"] == 8
+    assert final["observed_schema_version"] == 9
     assert final["state"] == "compatible"
 
 
@@ -248,11 +561,11 @@ def test_schema8_rendered_guard_executes_against_postgres(runner_env):
 
     report = schema_contract.migrate(conn, schema, runtime_role=RUNTIME_ROLE)
 
-    assert report["applied_versions"] == [8]
+    assert report["applied_versions"] == [8, 9]
     assert conn.execute(
         f'SELECT MAX(version) AS version FROM "{schema}".schema_migrations WHERE domain=%s',
         (schema_contract.DOMAIN,),
-    ).fetchone()["version"] == 8
+    ).fetchone()["version"] == 9
     conn.close()
 
 
@@ -589,6 +902,14 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
                         "immutable_action_requests_request_digest_key",
                         "immutable_action_requests_plan_ref_topology_role_subject_key",
                         "idx_immutable_action_requests_created",
+                    }
+                )
+            if schema_contract.MAX_SCHEMA_VERSION >= 9:
+                expected_indexes.update(
+                    {
+                        "action_resources_action_id_key",
+                        "action_resources_principal_scope_operation_idempotency_key_key",
+                        "idx_action_resource_changes_lookup",
                     }
                 )
     assert before <= expected_indexes
@@ -1090,6 +1411,16 @@ def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revo
         ):
             admin_conn.execute(
                 sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+                    schema_identifier, sql.Identifier(table), runtime_identifier
+                )
+            )
+        for table in (
+            "action_resources",
+            "action_resource_changes",
+            "action_resource_sessions",
+        ):
+            admin_conn.execute(
+                sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {}.{} TO {}").format(
                     schema_identifier, sql.Identifier(table), runtime_identifier
                 )
             )
