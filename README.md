@@ -231,6 +231,11 @@ uses an ambient queue DSN.
 
 ## Operational Notes
 
+`actionq-session-wrap` is the supported direct entry point for OpenCode and
+other non-daemon sessions. It records the capsule and durable completion fact
+after the child exits. Harness adapters only construct child invocations; they
+never publish completion events and receive no completion-ingest credential.
+
 - The queue schema is created only by the deployment-owned `actionctl migrate`
   entrypoint. It uses a transaction-scoped advisory lock, a version ledger,
   packaged migration checksums, and idempotent retry behavior.

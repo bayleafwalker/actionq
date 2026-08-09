@@ -60,9 +60,9 @@ class CompletionOutbox:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA busy_timeout=30000")
         return connection
 
     def _initialize(self) -> None:
@@ -409,7 +409,35 @@ def completion_fields(
     """Project a placed capsule into the canonical privacy-minimal event."""
 
     exit_code = capsule["end"]["exit_code"]
-    if capsule["end"]["kind"] == "end-inferred":
+    if capsule["end"].get("reason") == "wrapped command interrupted":
+        terminal = {
+            "kind": "cancelled",
+            "exit_code": None,
+            "reason_code": "cancelled",
+            "retryable": False,
+        }
+    elif capsule["end"].get("reason") == "wrapped command usage limited":
+        terminal = {
+            "kind": "usage-limited",
+            "exit_code": None,
+            "reason_code": "usage-limit",
+            "retryable": False,
+        }
+    elif capsule["end"].get("reason") == "wrapped command failed to start":
+        terminal = {
+            "kind": "failed",
+            "exit_code": None,
+            "reason_code": "start-failed",
+            "retryable": False,
+        }
+    elif capsule["end"].get("reason") == "wrapped command timed out":
+        terminal = {
+            "kind": "timed-out",
+            "exit_code": None,
+            "reason_code": "timeout",
+            "retryable": False,
+        }
+    elif capsule["end"]["kind"] == "end-inferred":
         terminal = {
             "kind": "end-inferred",
             "exit_code": None,

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from actionq.completion_outbox import CompletionOutbox
+
 from actionq.daemon import ActionConfig, Daemon, DaemonConfig, ProjectConfig, load_config
 from actionq.routing import HarnessRoute, RoutingContext, RoutingResult
 
@@ -48,7 +50,7 @@ def _fake_codex(tmp_path: Path, *, exit_code: int = 0, output: str = "ok") -> Pa
         "        {'slug':'gpt-5.6-luna','multi_agent_version':'v1'},\n"
         "    ]}))\n"
         "    raise SystemExit(0)\n"
-        "capture = os.environ.get('CAPTURE_PATH')\n"
+        f"capture = {str(tmp_path / 'capture.json')!r}\n"
         "if capture:\n"
         "    with open(capture, 'w', encoding='utf-8') as handle:\n"
         "        argv = sys.argv[1:]\n"
@@ -108,7 +110,7 @@ def _daemon(
     projects = {
         "demo": ProjectConfig(
             path=tmp_path,
-            env={"CAPTURE_PATH": str(tmp_path / "capture.json")},
+            env={},
             default_harness="caller",
         )
     }
@@ -205,6 +207,10 @@ def test_spark_limit_writes_same_provider_luna_redispatch_handoff(tmp_path: Path
     assert "redispatch_provider: codex" in handoff
     assert "redispatch_model: gpt-luna" in handoff
     assert client.failed[0][1].startswith("usage-limit-paused:")
+    completion = CompletionOutbox(
+        daemon.config.session_state_path.parent / "completion-outbox.sqlite3"
+    ).pending()[0]["payload"]
+    assert completion["terminal"]["kind"] == "usage-limited"
 
 
 def test_load_config_reads_trusted_routing_harness_and_action_fields(tmp_path: Path):

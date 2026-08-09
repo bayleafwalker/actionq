@@ -716,6 +716,8 @@ class SessionWrapper:
         *,
         verification: Sequence[str | Sequence[str]] = (),
         cwd: Path | None = None,
+        timeout_seconds: float | None = None,
+        usage_limited: bool = False,
     ) -> int:
         """Spawn ``argv`` as the wrapped process, wait for it, then record.
 
@@ -727,11 +729,26 @@ class SessionWrapper:
         end_kind = "clean-end"
         reason: str | None = "wrapped command exited"
         try:
-            completed = subprocess.run(list(argv), cwd=cwd or self.repo_path)
+            completed = subprocess.run(
+                list(argv), cwd=cwd or self.repo_path, timeout=timeout_seconds
+            )
             exit_code = completed.returncode
+        except subprocess.TimeoutExpired:
+            exit_code = 124
+            reason = "wrapped command timed out"
+            self.finish(exit_code=None, end_kind="clean-end", reason=reason)
+            return exit_code
         except KeyboardInterrupt:
             exit_code = -signal.SIGINT
-            reason = "interrupted"
+            reason = "wrapped command interrupted"
+            self.finish(exit_code=None, end_kind="clean-end", reason=reason)
+            raise
+        except OSError:
+            self.finish(
+                exit_code=None,
+                end_kind="clean-end",
+                reason="wrapped command failed to start",
+            )
             raise
         except Exception as exc:
             exit_code = -1
@@ -744,7 +761,20 @@ class SessionWrapper:
                 item if isinstance(item, VerificationOutcome) else run_verification_command(item, cwd=cwd or self.repo_path)
                 for item in verification
             ]
-            self.finish(exit_code=exit_code, end_kind=end_kind, reason=reason, verification=outcomes)
+            if usage_limited and exit_code != 0:
+                self.finish(
+                    exit_code=None,
+                    end_kind=end_kind,
+                    reason="wrapped command usage limited",
+                    verification=outcomes,
+                )
+            else:
+                self.finish(
+                    exit_code=exit_code,
+                    end_kind=end_kind,
+                    reason=reason,
+                    verification=outcomes,
+                )
         return exit_code
 
 
@@ -904,6 +934,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-session-id", default=None)
     parser.add_argument("--capsule-dir", type=Path, default=None)
     parser.add_argument("--marker-dir", type=Path, default=None)
+    parser.add_argument("--timeout-seconds", type=float, default=None)
+    parser.add_argument("--usage-limited", action="store_true")
     parser.add_argument("--verify", action="append", default=[], help="Shell command to run after the wrapped command exits")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -926,7 +958,12 @@ def main(argv: list[str] | None = None) -> int:
         runtime_session_id=args.runtime_session_id,
     )
     wrapper = SessionWrapper(identity, repo_path=args.repo, capsule_dir=args.capsule_dir, marker_dir=args.marker_dir)
-    return wrapper.run(command, verification=list(args.verify))
+    return wrapper.run(
+        command,
+        verification=list(args.verify),
+        timeout_seconds=args.timeout_seconds,
+        usage_limited=args.usage_limited,
+    )
 
 
 if __name__ == "__main__":
