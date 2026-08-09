@@ -50,6 +50,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from actionq.completion_outbox import (
+    DEFAULT_OUTBOX_PATH,
+    CompletionOutbox,
+    completion_fields,
+    recover_capsules,
+)
+
 SCHEMA_VERSION = "session-capsule/v1"
 
 DEFAULT_CAPSULE_DIR = Path("~/.local/state/actionq/session-wrapper/capsules")
@@ -124,10 +131,16 @@ class SessionIdentity:
     target: SessionTarget | None = None
     claim: SessionClaim | None = None
     runtime_session_id: str | None = None
+    attempt_id: str | None = None
+    action_id: str | None = None
     starting_watermark_ingest_offset: int | str = 0
     starting_watermark_age_seconds: float = 0.0
 
     def __post_init__(self) -> None:
+        if (self.attempt_id is None) != (self.action_id is None):
+            raise SessionWrapperError(
+                "dispatched sessions require both attempt_id and action_id"
+            )
         if self.claim is not None and self.claim.acquired_automatically:
             if self.target is None or self.target.rank != "explicit":
                 raise SessionWrapperError(
@@ -554,19 +567,23 @@ class SessionWrapper:
         repo_path: Path,
         capsule_dir: Path | None = None,
         marker_dir: Path | None = None,
+        outbox_path: Path | None = None,
         on_recorder_error: Callable[[str, BaseException | None], None] = _default_error_reporter,
     ):
         self.identity = identity
         self.repo_path = Path(repo_path)
         self.capsule_dir = Path(capsule_dir or DEFAULT_CAPSULE_DIR).expanduser()
         self.marker_dir = Path(marker_dir or DEFAULT_MARKER_DIR).expanduser()
+        if outbox_path is None and capsule_dir is not None:
+            outbox_path = self.capsule_dir.parent / "completion-outbox.sqlite3"
+        self.outbox_path = Path(outbox_path or DEFAULT_OUTBOX_PATH).expanduser()
         self.on_recorder_error = on_recorder_error
 
         self.session_id = identity.runtime_session_id or f"aqs:{uuid.uuid4()}"
         self.capsule_id = str(uuid.uuid4())
-        # No durable outbox exists yet for Tier-0 wrapper output (out of
-        # scope for #1114); each capsule mints its own stream identity.
         self.origin_stream_id = str(uuid.uuid4())
+        self._outbox: CompletionOutbox | None = None
+        self._completion_recorded = False
 
         self._marker_path: Path | None = None
         self._base_commit: str | None = None
@@ -585,7 +602,23 @@ class SessionWrapper:
         in this marker directory before starting a new session, so crash
         evidence is never silently lost by piling up markers.
         """
-        recover_stale_markers(self.marker_dir, self.capsule_dir, on_recorder_error=self.on_recorder_error)
+        try:
+            self._outbox = CompletionOutbox(self.outbox_path)
+            self.origin_stream_id = self._outbox.stream_id
+        except Exception as exc:
+            self.on_recorder_error("failed to initialize completion outbox", exc)
+            self._outbox = None
+        recover_stale_markers(
+            self.marker_dir,
+            self.capsule_dir,
+            outbox=self._outbox,
+            on_recorder_error=self.on_recorder_error,
+        )
+        if self._outbox is not None:
+            try:
+                recover_capsules(self._outbox, self.capsule_dir)
+            except Exception as exc:
+                self.on_recorder_error("failed to recover completion outbox", exc)
 
         self._base_commit, self._branch = _git_state_at_start(self.repo_path)
         self._started_at = _now()
@@ -626,7 +659,7 @@ class SessionWrapper:
             self.on_recorder_error("failed to record session capsule", exc)
             return None
         finally:
-            if self._marker_path is not None:
+            if self._marker_path is not None and self._completion_recorded:
                 _clear_marker(self._marker_path)
 
     def _record(
@@ -660,6 +693,21 @@ class SessionWrapper:
         tmp.replace(path)
         self.last_capsule_path = path
         self.last_capsule = capsule
+        try:
+            if self._outbox is None:
+                raise RuntimeError("completion outbox is unavailable")
+            self._outbox.record(
+                self.capsule_id,
+                completion_fields(
+                    capsule,
+                    path,
+                    attempt_id=self.identity.attempt_id,
+                    action_id=self.identity.action_id,
+                ),
+            )
+            self._completion_recorded = True
+        except Exception as exc:
+            self.on_recorder_error("failed to record session completion", exc)
         return path
 
     def run(
@@ -718,6 +766,8 @@ def _identity_from_marker_dict(payload: dict[str, Any]) -> SessionIdentity:
         target=SessionTarget(**target) if target else None,
         claim=SessionClaim(**claim) if claim else None,
         runtime_session_id=payload.get("runtime_session_id"),
+        attempt_id=payload.get("attempt_id"),
+        action_id=payload.get("action_id"),
         starting_watermark_ingest_offset=payload.get("starting_watermark_ingest_offset", 0),
         starting_watermark_age_seconds=payload.get("starting_watermark_age_seconds", 0.0),
     )
@@ -727,6 +777,7 @@ def recover_stale_markers(
     marker_dir: Path,
     capsule_dir: Path,
     *,
+    outbox: CompletionOutbox | None = None,
     on_recorder_error: Callable[[str, BaseException | None], None] = _default_error_reporter,
 ) -> list[Path]:
     """Emit an ``end-inferred`` capsule for each marker whose pid is dead.
@@ -761,6 +812,23 @@ def recover_stale_markers(
         try:
             identity = _identity_from_marker_dict(marker.identity)
             repo_path = Path(marker.repo_path)
+            path = capsule_dir / f"{marker.capsule_id}.json"
+            if path.exists():
+                capsule = json.loads(path.read_text(encoding="utf-8"))
+                if outbox is None:
+                    raise RuntimeError("completion outbox is unavailable")
+                outbox.record(
+                    marker.capsule_id,
+                    completion_fields(
+                        capsule,
+                        path,
+                        attempt_id=identity.attempt_id,
+                        action_id=identity.action_id,
+                    ),
+                )
+                recorded.append(path)
+                _clear_marker(marker_path)
+                continue
             try:
                 git_state = _git_state_at_end(repo_path, marker.base_commit)
             except Exception:
@@ -797,10 +865,23 @@ def recover_stale_markers(
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(capsule, indent=2, sort_keys=True), encoding="utf-8")
             tmp.replace(path)
+            if outbox is None:
+                if identity.attempt_id is not None or identity.action_id is not None:
+                    raise RuntimeError("completion outbox is unavailable")
+            else:
+                outbox.record(
+                    marker.capsule_id,
+                    completion_fields(
+                        capsule,
+                        path,
+                        attempt_id=identity.attempt_id,
+                        action_id=identity.action_id,
+                    ),
+                )
             recorded.append(path)
         except Exception as exc:
             on_recorder_error(f"failed to recover stale session marker {marker_path}", exc)
-        finally:
+        else:
             _clear_marker(marker_path)
     return recorded
 
