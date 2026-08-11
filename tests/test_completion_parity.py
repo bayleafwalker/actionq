@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -186,10 +187,7 @@ def test_daemon_completion_validates_with_canonical_agentops_contract(
     target = tmp_path / "session-completions"
     target.mkdir()
     (target / "daemon.json").write_text(json.dumps(event), encoding="utf-8")
-    validator = Path(
-        "/projects/dev/_projects/vuoro-dispatch-ready/members/agentops/"
-        "templates/dispatch/scripts/validate_session_mechanization_artifacts.py"
-    )
+    validator = Path(os.environ["AGENTOPS_SESSION_ARTIFACT_VALIDATOR"])
     completed = subprocess.run(
         [sys.executable, str(validator), "--root", str(tmp_path)],
         text=True,

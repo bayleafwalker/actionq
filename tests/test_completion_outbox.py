@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import sqlite3
 import subprocess
 import sys
@@ -385,10 +386,7 @@ def test_generated_event_passes_canonical_agentops_validator(
     completion_dir.mkdir()
     (completion_dir / "event.json").write_text(json.dumps(event), encoding="utf-8")
 
-    validator = Path(
-        "/projects/dev/_projects/vuoro-dispatch-ready/members/agentops/"
-        "templates/dispatch/scripts/validate_session_mechanization_artifacts.py"
-    )
+    validator = Path(os.environ["AGENTOPS_SESSION_ARTIFACT_VALIDATOR"])
     completed = subprocess.run(
         [sys.executable, str(validator), "--root", str(tmp_path)],
         text=True,
