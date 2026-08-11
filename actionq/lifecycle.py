@@ -18,6 +18,7 @@ DEFAULT_WORK_SECONDS = 20 * 60
 DEFAULT_FINALIZATION_SECONDS = 2 * 60
 DEFAULT_TOTAL_SECONDS = 25 * 60
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+PINNED_EVENT_TYPES = frozenset({"step_start", "text", "step_finish"})
 
 NO_TOOLS_OPENCODE_CONFIG = json.dumps({
     "agent": {
@@ -96,7 +97,13 @@ class BoundedLifecycleProfile:
 
 
 def parse_json_events(text: str) -> list[dict[str, Any]]:
-    """Parse a bounded OpenCode JSON event stream without accepting prose."""
+    """Parse the pinned OpenCode 1.18.4 JSON event projection.
+
+    Provider qualification owns proof that this is the installed provider's
+    real shape.  ActionQ only consumes the frozen shape: accepting the older
+    ``properties.sessionID`` envelope here would turn a fixture into a false
+    runtime success.
+    """
     events: list[dict[str, Any]] = []
     for line_number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
@@ -107,6 +114,17 @@ def parse_json_events(text: str) -> list[dict[str, Any]]:
             raise LifecycleValidationError(f"OpenCode event line {line_number} is not JSON") from exc
         if not isinstance(value, dict) or not isinstance(value.get("type"), str):
             raise LifecycleValidationError(f"OpenCode event line {line_number} is not an event object")
+        if value["type"] not in PINNED_EVENT_TYPES:
+            raise LifecycleValidationError(f"OpenCode event line {line_number} has an unsupported type")
+        if "properties" in value:
+            raise LifecycleValidationError(f"OpenCode event line {line_number} uses an unsupported envelope")
+        if not isinstance(value.get("part"), dict):
+            raise LifecycleValidationError(f"OpenCode event line {line_number} has no part object")
+        if not isinstance(value.get("timestamp"), (int, float)) or isinstance(value.get("timestamp"), bool):
+            raise LifecycleValidationError(f"OpenCode event line {line_number} has no numeric timestamp")
+        session_id = value.get("sessionID")
+        if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
+            raise LifecycleValidationError(f"OpenCode event line {line_number} has no valid sessionID")
         if _error_event(value):
             raise LifecycleValidationError(f"OpenCode event line {line_number} reports an error")
         events.append(value)
@@ -119,17 +137,16 @@ def _error_event(event: dict[str, Any]) -> bool:
     event_type = str(event.get("type", "")).lower().replace("_", "-")
     if event_type == "error" or event_type.endswith(".error") or event_type.endswith("-error"):
         return True
-    properties = event.get("properties")
-    if not isinstance(properties, dict):
-        return False
-    if properties.get("error") or properties.get("errors"):
-        return True
-    for value in _walk_objects(properties):
+    for value in _walk_objects(event):
         for key in ("error", "errors"):
-            if value.get(key):
+            if key in value:
                 return True
         status = value.get("status")
         if isinstance(status, dict) and str(status.get("type", "")).lower() in {"error", "failed", "failure"}:
+            return True
+        if isinstance(status, str) and status.lower().replace("_", "-") in {
+            "error", "failed", "failure", "timed-out", "cancelled",
+        }:
             return True
     return False
 
@@ -137,12 +154,9 @@ def _error_event(event: dict[str, Any]) -> bool:
 def _session_ids(events: Iterable[dict[str, Any]]) -> set[str]:
     result: set[str] = set()
     for event in events:
-        properties = event.get("properties")
-        if not isinstance(properties, dict):
-            raise LifecycleValidationError("OpenCode event has no properties envelope")
-        session_id = properties.get("sessionID")
+        session_id = event.get("sessionID")
         if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id):
-            raise LifecycleValidationError("OpenCode event has no valid properties.sessionID")
+            raise LifecycleValidationError("OpenCode event has no valid sessionID")
         result.add(session_id)
     return result
 
@@ -159,12 +173,9 @@ def session_id_from_events(events: Iterable[dict[str, Any]], *, expected: str | 
 
 def _tool_event(event: dict[str, Any]) -> bool:
     event_type = str(event.get("type", "")).lower()
-    properties = event.get("properties")
-    if not isinstance(properties, dict):
-        return False
-    part = properties.get("part")
-    info = properties.get("info")
-    values = [event_type, str(properties.get("role", "")).lower()]
+    part = event.get("part")
+    info = event.get("info")
+    values = [event_type, str(event.get("role", "")).lower()]
     if isinstance(part, dict):
         values.append(str(part.get("type", "")).lower())
     if isinstance(info, dict):
@@ -175,6 +186,20 @@ def _tool_event(event: dict[str, Any]) -> bool:
 def assert_no_tool_events(events: Iterable[dict[str, Any]]) -> None:
     if any(_tool_event(event) for event in events):
         raise LifecycleValidationError("OpenCode finalizer emitted a tool event")
+
+
+def completion_indication(events: Iterable[dict[str, Any]]) -> str | None:
+    """Return the session bound to an explicit pinned ``step_finish`` event."""
+    event_list = list(events)
+    finished = [
+        event for event in event_list
+        if event.get("type") == "step_finish"
+        and isinstance(event.get("part"), dict)
+        and event["part"].get("type") == "step-finish"
+    ]
+    if not finished:
+        return None
+    return session_id_from_events(event_list)
 
 
 def _walk_objects(value: Any) -> Iterable[dict[str, Any]]:
@@ -202,15 +227,18 @@ def finalization_declaration(
     assert_no_tool_events(event_list)
     candidates: list[dict[str, Any]] = []
     for event in event_list:
-        if event.get("type") == "dispatch.finalization" and isinstance(event.get("declaration"), dict):
-            candidates.append(event["declaration"])
+        part = event.get("part")
+        if event.get("type") != "text" or not isinstance(part, dict):
             continue
-        if isinstance(event.get("finalization"), dict):
-            candidates.append(event["finalization"])
+        text = part.get("text")
+        if not isinstance(text, str):
             continue
-        for value in _walk_objects(event):
-            if value.get("contract_id") == "dispatch-finalization/v1":
-                candidates.append(value)
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("contract_id") == "dispatch-finalization/v1":
+            candidates.append(value)
     if len(candidates) != 1:
         raise LifecycleValidationError("finalizer must emit exactly one dispatch-finalization/v1 declaration")
     declaration = candidates[0]

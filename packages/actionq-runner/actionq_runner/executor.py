@@ -9,6 +9,7 @@ import signal
 import subprocess
 import time
 import threading
+import ctypes
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ _grace_seconds = 30.0
 
 def _changed_paths(worktree: Path) -> set[str]:
     completed = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z"], cwd=worktree,
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=worktree,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
     if completed.returncode:
@@ -56,7 +57,14 @@ def _workspace_fingerprint(worktree: Path) -> str:
     digest = hashlib.sha256()
     for directory, dirnames, filenames in os.walk(worktree, topdown=True, followlinks=False):
         directory_path = Path(directory)
-        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        # Only the owning repository's metadata is outside the workspace
+        # projection.  A nested, ordinary ``.git`` directory is workspace
+        # content and must not be an invisible mutation channel.
+        if directory_path == worktree:
+            dirnames[:] = sorted(name for name in dirnames if name != ".git")
+            filenames = [name for name in filenames if name != ".git"]
+        else:
+            dirnames[:] = sorted(dirnames)
         entries = sorted(dirnames + filenames)
         for name in entries:
             candidate = directory_path / name
@@ -154,6 +162,67 @@ def _stop_descendants_after_exit() -> None:
         except ProcessLookupError:
             pass
 
+    # Linux reparents orphaned descendants to a registered subreaper even if
+    # they escaped through setsid(2).  Reap that new-session escape class too.
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid <= 0:
+            break
+
+
+def _become_subreaper() -> None:
+    """Contain descendants that create a new session before their parent exits."""
+    if os.name != "posix" or not Path("/proc").exists():
+        raise RuntimeError("portable runner requires Linux descendant containment")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _direct_children() -> list[int]:
+    children: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text(encoding="utf-8")
+            parent_line = next(line for line in status.splitlines() if line.startswith("PPid:"))
+            if int(parent_line.split()[1]) == os.getpid():
+                children.append(int(entry.name))
+        except (OSError, StopIteration, ValueError):
+            continue
+    return children
+
+
+def _stop_reparented_descendants() -> None:
+    deadline = time.monotonic() + _grace_seconds
+    while True:
+        children = [pid for pid in _direct_children() if _child is None or pid != _child.pid]
+        if not children:
+            return
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        if time.monotonic() >= deadline:
+            for pid in children:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for pid in children:
+                try:
+                    os.waitpid(pid, 0)
+                except (ChildProcessError, ProcessLookupError):
+                    pass
+            return
+        time.sleep(0.01)
+
 
 def execute(packet: dict[str, Any]) -> int:
     global _child, _grace_seconds
@@ -171,6 +240,16 @@ def execute(packet: dict[str, Any]) -> int:
     )
     cwd_value = packet.get("cwd")
     worktree = Path(str(cwd_value)).resolve() if cwd_value else None
+    if worktree is not None and packet.get("projection_success_path"):
+        for managed_key in ("progress_path", "projection_success_path", "output_path"):
+            managed_value = packet.get(managed_key)
+            if not managed_value:
+                continue
+            try:
+                Path(str(managed_value)).resolve().relative_to(worktree)
+            except ValueError:
+                continue
+            raise ValueError("lifecycle controller projections must be outside the worktree")
     before: set[str] = set()
     before_fingerprint: str | None = None
     if envelope["source_commit"] != "unavailable":
@@ -198,6 +277,7 @@ def execute(packet: dict[str, Any]) -> int:
     if not 0 <= _grace_seconds <= 30:
         raise ValueError("runner grace must be between zero and 30 seconds")
     signal.signal(signal.SIGTERM, _stop)
+    _become_subreaper()
     _child = subprocess.Popen(
         command, cwd=packet.get("cwd") or None, env=environment,
         stdin=subprocess.PIPE if packet.get("stdin") is not None else subprocess.DEVNULL,
@@ -207,18 +287,58 @@ def execute(packet: dict[str, Any]) -> int:
         assert _child is not None
         _child.wait()
         _stop_descendants_after_exit()
+        _stop_reparented_descendants()
 
     reaper = threading.Thread(target=reap_after_direct_exit, name="actionq-runner-reaper", daemon=True)
     reaper.start()
-    stdout, _ = _child.communicate(
-        str(packet["stdin"]).encode() if packet.get("stdin") is not None else None
-    )
+    if packet.get("stdin") is not None:
+        assert _child.stdin is not None
+        _child.stdin.write(str(packet["stdin"]).encode())
+        _child.stdin.close()
+    projection_path = packet.get("progress_path")
+    projection_stream = None
+    if projection_path:
+        target = Path(str(projection_path))
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        projection_stream = os.fdopen(descriptor, "wb")
+    chunks: list[bytes] = []
+    pending = b""
+    assert _child.stdout is not None
+    try:
+        while chunk := _child.stdout.readline():
+            chunks.append(chunk)
+            if projection_stream is not None:
+                pending += chunk
+                lines = pending.splitlines(keepends=True)
+                pending = b""
+                if lines and not lines[-1].endswith((b"\n", b"\r")):
+                    pending = lines.pop()
+                for line in lines:
+                    projection_stream.write(_redact(line))
+                projection_stream.flush()
+        if projection_stream is not None and pending:
+            projection_stream.write(_redact(pending))
+            projection_stream.flush()
+    finally:
+        if projection_stream is not None:
+            projection_stream.close()
+    stdout = b"".join(chunks)
     reaper.join(timeout=max(0.1, _grace_seconds + 1.0))
     if worktree is not None and envelope["source_commit"] != "unavailable":
         if str(envelope["command_id"]).endswith(":finalizer"):
             if before_fingerprint != _workspace_fingerprint(worktree):
                 raise ValueError("no-tools finalizer changed the workspace")
         changed = _changed_paths(worktree) - before
+        for managed_key in ("progress_path", "projection_success_path", "output_path"):
+            managed_value = packet.get(managed_key)
+            if not managed_value:
+                continue
+            try:
+                managed = Path(str(managed_value)).resolve().relative_to(worktree).as_posix()
+            except ValueError:
+                continue
+            changed.discard(managed)
         disallowed = sorted(
             path for path in changed
             if not any(fnmatch.fnmatchcase(path, pattern) for pattern in envelope["allowed_paths"])
@@ -233,5 +353,19 @@ def execute(packet: dict[str, Any]) -> int:
         target = Path(str(output_path))
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         target.write_bytes(sealed.read_bytes())
+        target.chmod(0o600)
+    # The marker is the last projection operation.  Its presence therefore
+    # proves fingerprint, spool sealing, and requested output projection all
+    # succeeded; a step-finish event alone is never reported as success.
+    success_path = packet.get("projection_success_path")
+    if success_path:
+        target = Path(str(success_path))
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.write_text(json.dumps({
+            "action_id": int(envelope["action_id"]),
+            "attempt_id": str(envelope["attempt_id"]),
+            "command_id": str(envelope["command_id"]),
+            "source_commit": str(envelope["source_commit"]),
+        }, sort_keys=True), encoding="utf-8")
         target.chmod(0o600)
     return int(_child.returncode or 0)

@@ -178,10 +178,12 @@ def test_runner_rejects_no_tools_mutation_of_ignored_nested_files(tmp_path: Path
     envelope = ExecutionEnvelope(
         EXECUTION_ENVELOPE_V1, 2031, "finalizer-attempt", commit, "harness:finalizer", (),
     ).as_dict()
+    projection_success = tmp_path / "projection-success.json"
     packet = {
         "envelope": envelope, "registered_command_id": "harness:finalizer", "contained_worker": False,
-        "command": [sys.executable, "-c", "from pathlib import Path; Path('nested').mkdir(); Path('nested/ignored.txt').write_text('x')"],
+        "command": [sys.executable, "-c", "from pathlib import Path; Path('nested/.git').mkdir(parents=True); Path('nested/.git/ignored.txt').write_text('x')"],
         "cwd": str(repo), "environment": {"PATH": os.environ["PATH"]},
+        "projection_success_path": str(projection_success),
     }
     runner = subprocess.Popen(
         [str(Path(sys.executable).with_name("actionq-runner")), "execute"],
@@ -192,6 +194,7 @@ def test_runner_rejects_no_tools_mutation_of_ignored_nested_files(tmp_path: Path
     result = subprocess.CompletedProcess(runner.args, runner.returncode, stdout, stderr)
     assert result.returncode != 0
     assert "no-tools finalizer changed the workspace" in result.stderr
+    assert not projection_success.exists()
 
 
 def test_runner_reaps_detached_worker_before_no_tools_fingerprint(tmp_path: Path, monkeypatch):
@@ -213,7 +216,7 @@ def test_runner_reaps_detached_worker_before_no_tools_fingerprint(tmp_path: Path
     delayed_write = "import time; time.sleep(30); open('late.txt', 'w').write('late')"
     command = [
         sys.executable, "-c",
-        f"import subprocess,sys; subprocess.Popen([sys.executable, '-c', {delayed_write!r}])",
+        f"import subprocess,sys; subprocess.Popen([sys.executable, '-c', {delayed_write!r}], start_new_session=True)",
     ]
     packet = {
         "envelope": envelope, "registered_command_id": "harness:finalizer", "contained_worker": False,
