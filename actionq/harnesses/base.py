@@ -29,6 +29,9 @@ class HarnessInvocation:
     model: str | None = None
     timeout_seconds: float = 1800.0
     extra_env: Mapping[str, str] = field(default_factory=dict)
+    json_events: bool = False
+    continuation_session_id: str | None = None
+    finalizer_agent: str | None = None
 
 
 @dataclass(frozen=True)

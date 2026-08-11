@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import fnmatch
+import hashlib
 import os
 import signal
 import subprocess
+import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -42,13 +45,44 @@ def _changed_paths(worktree: Path) -> set[str]:
     return paths
 
 
+def _workspace_fingerprint(worktree: Path) -> str:
+    """Capture the whole worktree so a no-tools phase cannot mutate it.
+
+    Git status alone omits ignored files and collapses an untracked directory
+    to one path.  Hashing the filesystem (excluding only Git's metadata)
+    closes both gaps while keeping the fingerprint itself secret-free.
+    """
+    worktree = worktree.resolve()
+    digest = hashlib.sha256()
+    for directory, dirnames, filenames in os.walk(worktree, topdown=True, followlinks=False):
+        directory_path = Path(directory)
+        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        entries = sorted(dirnames + filenames)
+        for name in entries:
+            candidate = directory_path / name
+            relative = candidate.relative_to(worktree).as_posix().encode("utf-8", "surrogateescape")
+            stat_result = candidate.lstat()
+            digest.update(relative)
+            digest.update(b"\0")
+            digest.update(str(stat_result.st_mode).encode("ascii"))
+            digest.update(b"\0")
+            if candidate.is_symlink():
+                digest.update(os.readlink(candidate).encode("utf-8", "surrogateescape"))
+            elif candidate.is_file():
+                with candidate.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        digest.update(chunk)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _validate_command(command: list[str], command_id: str, *, contained_worker: bool) -> None:
     forbidden = {"actionq-runner", "actionq-daemon", "actionctl", "sprintctl"}
     if any(Path(part).name in forbidden for part in command):
         raise ValueError("nested authority or runner command is forbidden")
     runner = command_id.rsplit(":", 1)[-1]
     executable = Path(command[0]).name
-    if contained_worker and runner in {"harness", "scope-iterate"} and executable != "sudo":
+    if contained_worker and runner in {"harness", "scope-iterate", "finalizer"} and executable != "sudo":
         raise ValueError("registered contained harness command must enter through sudo")
     if runner in {"fake", "fake-commit"} and not executable.startswith("python"):
         raise ValueError("registered fake command must use the Python test runner")
@@ -83,6 +117,44 @@ def _stop(_signum, _frame) -> None:
             _child.wait()
 
 
+def _process_group_members(process_group: int) -> list[int]:
+    members: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+            if pid != os.getpid() and os.getpgid(pid) == process_group:
+                members.append(pid)
+        except (OSError, ValueError):
+            continue
+    return members
+
+
+def _stop_descendants_after_exit() -> None:
+    """Ensure a direct worker exit leaves no process running into finalization."""
+    # Production launches the runner with ``start_new_session=True``.  A
+    # direct library/CLI invocation can share its caller's process group; in
+    # that mode killing the group would also kill the supervisor.
+    if os.getpgrp() != os.getpid():
+        return
+    process_group = os.getpgrp()
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    time.sleep(0.01)
+    members = _process_group_members(process_group)
+    deadline = time.monotonic() + _grace_seconds
+    while time.monotonic() < deadline and _process_group_members(process_group):
+        time.sleep(0.01)
+    for pid in _process_group_members(process_group):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def execute(packet: dict[str, Any]) -> int:
     global _child, _grace_seconds
     envelope = dict(packet["envelope"])
@@ -100,6 +172,7 @@ def execute(packet: dict[str, Any]) -> int:
     cwd_value = packet.get("cwd")
     worktree = Path(str(cwd_value)).resolve() if cwd_value else None
     before: set[str] = set()
+    before_fingerprint: str | None = None
     if envelope["source_commit"] != "unavailable":
         if worktree is None:
             raise ValueError("source-bound execution requires an exact workspace")
@@ -110,6 +183,8 @@ def execute(packet: dict[str, Any]) -> int:
         if completed.returncode or completed.stdout.strip() != envelope["source_commit"]:
             raise ValueError("runner workspace does not match the frozen source commit")
         before = _changed_paths(worktree)
+        if str(envelope["command_id"]).endswith(":finalizer"):
+            before_fingerprint = _workspace_fingerprint(worktree)
     environment = packet.get("environment") or {}
     if not isinstance(environment, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in environment.items()):
         raise ValueError("runner environment must be a string mapping")
@@ -128,10 +203,21 @@ def execute(packet: dict[str, Any]) -> int:
         stdin=subprocess.PIPE if packet.get("stdin") is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=False,
     )
+    def reap_after_direct_exit() -> None:
+        assert _child is not None
+        _child.wait()
+        _stop_descendants_after_exit()
+
+    reaper = threading.Thread(target=reap_after_direct_exit, name="actionq-runner-reaper", daemon=True)
+    reaper.start()
     stdout, _ = _child.communicate(
         str(packet["stdin"]).encode() if packet.get("stdin") is not None else None
     )
+    reaper.join(timeout=max(0.1, _grace_seconds + 1.0))
     if worktree is not None and envelope["source_commit"] != "unavailable":
+        if str(envelope["command_id"]).endswith(":finalizer"):
+            if before_fingerprint != _workspace_fingerprint(worktree):
+                raise ValueError("no-tools finalizer changed the workspace")
         changed = _changed_paths(worktree) - before
         disallowed = sorted(
             path for path in changed

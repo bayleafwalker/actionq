@@ -12,6 +12,19 @@ session_state_path = "~/.local/state/actionq/sessions.json"
 pause_file = "~/.local/state/actionq/PAUSED"
 actionctl_bin = "actionctl"
 
+# Opt-in verified OpenCode lifecycle.  The controller owns all three ceilings;
+# the finalizer continues the same JSON session with no tools and cannot settle
+# an action by exit alone.  Keep this profile disabled unless the matching
+# qualified harness profile is provisioned.
+# [lifecycle_profiles.opencode-verified]
+# enabled = true
+# harness = "opencode"
+# work_timeout_seconds = 1200
+# finalization_timeout_seconds = 120
+# total_timeout_seconds = 1500
+# finalizer_agent = "ao-finalizer"
+# finalizer_tools = []
+
 # Tier-1 deterministic context injection at session start (item #1116).
 # Requests a bounded sprintctl `context-candidates --json` packet before the
 # child starts; only a found, claim_eligible explicit target (never an
@@ -36,6 +49,8 @@ actionctl_bin = "actionctl"
 [actions.scope-iterate]
 runner = "fake"
 fake_duration_seconds = 1
+# lifecycle_profile = "opencode-verified"
+# harness_profile = "opencode-nixpkgs-devbox-1.18.4"
 # Production scope-iterate actions set this true after provisioning the
 # owner-only durable [global].artifact_root above.
 publish_candidate = false

@@ -25,6 +25,9 @@ SESSION_EVENT_TYPES = (
     "runner.contract.frozen",
     "session.dispatch",
     "session.started",
+    "session.finalizing",
+    "session.finalized",
+    "session.finalization-rejected",
     "session.heartbeat",
     "session.paused",
     "session.resumed",
@@ -436,6 +439,7 @@ def summarize_sessions(
             session = {
                 "session_id": session_id,
                 "runtime_session_id": None,
+                "harness_session_id": None,
                 "action_id": row.get("action_id"),
                 "daemon_id": None,
                 "action_type": None,
@@ -451,11 +455,15 @@ def summarize_sessions(
                 "last_heartbeat_at": None,
                 "ttl_seconds": None,
                 "deadline_at": None,
+                "work_deadline_at": None,
+                "finalization_deadline_at": None,
+                "total_deadline_at": None,
                 "heartbeat_age_seconds": None,
                 "exited_at": None,
                 "last_event_type": None,
                 "last_event_at": None,
                 "status": "dispatched",
+                "phase": "dispatched",
                 "outcome": None,
                 "exit_code": None,
                 "claim": {
@@ -492,6 +500,9 @@ def summarize_sessions(
         session["started_at"] = payload.get("started_at", session["started_at"])
         ttl_seconds = payload.get("ttl_seconds")
         session["ttl_seconds"] = ttl_seconds if ttl_seconds is not None else session["ttl_seconds"]
+        for deadline_key in ("work_deadline_at", "finalization_deadline_at", "total_deadline_at"):
+            if payload.get(deadline_key) is not None:
+                session[deadline_key] = payload[deadline_key]
         if claim_payload:
             session["claim"]["claim_id"] = claim_payload.get("claim_id", session["claim"]["claim_id"])
             session["claim"]["work_item_id"] = claim_payload.get(
@@ -503,12 +514,15 @@ def summarize_sessions(
 
         if event_type == "session.dispatch":
             session["status"] = "dispatched"
+            session["phase"] = payload.get("phase", "dispatched")
             session["heartbeat_at"] = row["timestamp"]
         elif event_type == "session.started":
             session["status"] = "running"
+            session["phase"] = payload.get("phase", "working")
             session["heartbeat_at"] = row["timestamp"]
         elif event_type == "session.heartbeat":
             session["status"] = payload.get("status", "running")
+            session["phase"] = payload.get("phase", session.get("phase", "working"))
             session["heartbeat_at"] = row["timestamp"]
             session["last_heartbeat_at"] = row["timestamp"]
         elif event_type == "session.paused":
@@ -516,9 +530,24 @@ def summarize_sessions(
             session["heartbeat_at"] = row["timestamp"]
         elif event_type == "session.resumed":
             session["status"] = "running"
+            session["phase"] = payload.get("phase", "working")
+            session["heartbeat_at"] = row["timestamp"]
+        elif event_type == "session.finalizing":
+            session["status"] = "finalizing"
+            session["phase"] = "finalizing"
+            session["harness_session_id"] = payload.get("provider_session_id")
+            session["heartbeat_at"] = row["timestamp"]
+        elif event_type == "session.finalized":
+            session["phase"] = "finalized"
+            session["harness_session_id"] = payload.get("provider_session_id", session.get("harness_session_id"))
+            session["heartbeat_at"] = row["timestamp"]
+        elif event_type == "session.finalization-rejected":
+            session["phase"] = "finalizing"
             session["heartbeat_at"] = row["timestamp"]
         elif event_type in {"session.exited", "session.end-inferred"}:
             session["status"] = "exited"
+            session["phase"] = payload.get("phase", "terminal")
+            session["harness_session_id"] = payload.get("provider_session_id", session.get("harness_session_id"))
             session["outcome"] = payload.get("outcome")
             session["exit_code"] = payload.get("exit_code")
             session["exited_at"] = row["timestamp"]

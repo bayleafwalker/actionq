@@ -100,6 +100,19 @@ def test_opencode_adapter_builds_expected_command(tmp_path: Path):
     assert adapter.stdin_text(invocation) is None
 
 
+def test_opencode_adapter_builds_same_session_no_tools_finalizer_command(tmp_path: Path):
+    adapter = OpenCodeAdapter(bin_path="opencode")
+    invocation = HarnessInvocation(
+        prompt="ignored for continuation", worktree=tmp_path,
+        continuation_session_id="ses_123", finalizer_agent="ao-finalizer",
+        json_events=True,
+    )
+    assert adapter.build_command(invocation) == [
+        "opencode", "run", "synthesize", "--continue", "--session", "ses_123",
+        "--agent", "ao-finalizer", "--format", "json",
+    ]
+
+
 # -- invocation against fake binaries (deterministic, no real model calls) --
 
 

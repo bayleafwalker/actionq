@@ -3,7 +3,9 @@
 Command shape follows the published OpenCode CLI's noninteractive
 convention: ``opencode run <message> --model <provider/model>`` prints the
 agent's final response and exits, taking the prompt as a positional
-argument rather than on stdin.
+argument rather than on stdin.  The qualified lifecycle path adds JSON
+events and continues the same session with the exact no-tools finalizer
+agent; both are opt-in invocation fields.
 
 Verification caveat (residual risk, call out explicitly to the operator
 before trusting this adapter for a real dispatch): the ``opencode`` binary
@@ -30,9 +32,17 @@ class OpenCodeAdapter(HarnessAdapter):
 
     def build_command(self, invocation: HarnessInvocation) -> list[str]:
         command = [self.bin_path, "run"]
+        if invocation.continuation_session_id is not None:
+            command.extend([
+                "synthesize", "--continue", "--session", invocation.continuation_session_id,
+                "--agent", invocation.finalizer_agent or "ao-finalizer",
+            ])
         if invocation.model:
             command.extend(["--model", invocation.model])
-        command.append(invocation.prompt)
+        if invocation.continuation_session_id is None:
+            command.append(invocation.prompt)
+        if invocation.json_events:
+            command.extend(["--format", "json"])
         return command
 
     def stdin_text(self, invocation: HarnessInvocation) -> str | None:

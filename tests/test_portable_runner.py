@@ -161,6 +161,76 @@ def test_runner_enforces_source_commit_and_changed_path_allowlist(tmp_path: Path
     assert "frozen source commit" in result.stderr
 
 
+def test_runner_rejects_no_tools_mutation_of_ignored_nested_files(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "finalizer-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / ".gitignore").write_text("nested/\n")
+    (repo / "tracked.txt").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, check=True, capture_output=True,
+    ).stdout.strip()
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    envelope = ExecutionEnvelope(
+        EXECUTION_ENVELOPE_V1, 2031, "finalizer-attempt", commit, "harness:finalizer", (),
+    ).as_dict()
+    packet = {
+        "envelope": envelope, "registered_command_id": "harness:finalizer", "contained_worker": False,
+        "command": [sys.executable, "-c", "from pathlib import Path; Path('nested').mkdir(); Path('nested/ignored.txt').write_text('x')"],
+        "cwd": str(repo), "environment": {"PATH": os.environ["PATH"]},
+    }
+    runner = subprocess.Popen(
+        [str(Path(sys.executable).with_name("actionq-runner")), "execute"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    stdout, stderr = runner.communicate(json.dumps(packet))
+    result = subprocess.CompletedProcess(runner.args, runner.returncode, stdout, stderr)
+    assert result.returncode != 0
+    assert "no-tools finalizer changed the workspace" in result.stderr
+
+
+def test_runner_reaps_detached_worker_before_no_tools_fingerprint(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "reaper-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, check=True, capture_output=True,
+    ).stdout.strip()
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    envelope = ExecutionEnvelope(
+        EXECUTION_ENVELOPE_V1, 2031, "reaper-attempt", commit, "harness:finalizer", (),
+    ).as_dict()
+    delayed_write = "import time; time.sleep(30); open('late.txt', 'w').write('late')"
+    command = [
+        sys.executable, "-c",
+        f"import subprocess,sys; subprocess.Popen([sys.executable, '-c', {delayed_write!r}])",
+    ]
+    packet = {
+        "envelope": envelope, "registered_command_id": "harness:finalizer", "contained_worker": False,
+        "command": command, "cwd": str(repo), "environment": {"PATH": os.environ["PATH"]},
+        "grace_seconds": 0,
+    }
+    runner = subprocess.Popen(
+        [str(Path(sys.executable).with_name("actionq-runner")), "execute"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    stdout, stderr = runner.communicate(json.dumps(packet))
+    result = subprocess.CompletedProcess(runner.args, runner.returncode, stdout, stderr)
+    assert result.returncode == 0, result.stderr
+    assert not (repo / "late.txt").exists()
+
+
 def test_spool_reconcile_rejects_tampered_supervisor_proof(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     staging_dir(2031, "tamper-attempt")

@@ -160,6 +160,16 @@ settle actions. The current minimum is deliberately single-session and supports
 the fake runner for disposable verification; it does not import
 `actionq-dispatch` at runtime.
 
+Verified OpenCode actions may opt into the controller-owned bounded lifecycle
+by selecting a configured `lifecycle_profile`. The profile gives work 20
+minutes, finalization 2 minutes, and the whole attempt 25 minutes. A normal
+worker exit only advances the session to `finalizing`; ActionQ continues the
+same JSON-observed OpenCode session with the qualified `ao-finalizer` profile,
+which has no tools or MCP access. Missing, malformed, changed-session, or
+timed-out finalizer output is a deterministic failure and cannot authorize
+terminal success. See the commented profile in
+`examples/actionq-daemon.toml`.
+
 Start from [examples/actionq-daemon.toml](examples/actionq-daemon.toml), then:
 
 ```bash

@@ -13,8 +13,8 @@ import os
 import re
 import pwd
 import shutil
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import signal
 import socket
@@ -56,10 +56,22 @@ from .scope_iterate import (
 )
 from .usage_limit import classify_usage_limit, write_handoff
 from .cas import _DaemonCAS, artifact_ref as _artifact_ref, fsync_directory as _fsync_directory
+from .lifecycle import (
+    BoundedLifecycleProfile,
+    LifecycleValidationError,
+    NO_TOOLS_OPENCODE_CONFIG,
+    finalization_declaration,
+    parse_json_events,
+    session_id_from_events,
+)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _deadline_after(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0.0, seconds))).isoformat().replace("+00:00", "Z")
 
 
 def _is_shared_sprint_backend(project: ProjectConfig | None) -> bool:
@@ -133,6 +145,7 @@ class DaemonConfig:
     audit: AuditConfig = AuditConfig()
     context: ContextConfig = ContextConfig()
     routing: RoutingContext = RoutingContext()
+    lifecycle_profiles: dict[str, BoundedLifecycleProfile] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -170,6 +183,10 @@ class ActionConfig:
     oci_pids: int = 128
     oci_disk_bytes: int = 10 * 1024**3
     oci_seccomp_sha256: str | None = None
+    # Opt-in controller-owned bounded lifecycle.  A string resolves through
+    # DaemonConfig.lifecycle_profiles; a profile object is useful to callers
+    # constructing a daemon directly in tests.
+    lifecycle_profile: str | BoundedLifecycleProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +228,11 @@ class SessionRecord:
     fallback_reason: str | None = None
     caller_harness: str | None = None
     catalog_workaround: str | None = None
+    phase: str = "working"
+    harness_session_id: str | None = None
+    work_deadline_at: str | None = None
+    finalization_deadline_at: str | None = None
+    total_deadline_at: str | None = None
 
     def routing_provenance(self) -> dict[str, str | None] | None:
         if self.harness is None:
@@ -629,6 +651,13 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
     audit_raw = global_raw.get("audit", {})
     context_raw = global_raw.get("context", {})
     routing_raw = global_raw.get("routing") or raw.get("routing") or {}
+    lifecycle_raw = raw.get("lifecycle_profiles") or raw.get("lifecycle", {}).get("profiles", {})
+    if not isinstance(lifecycle_raw, dict):
+        raise ValueError("lifecycle_profiles must be a table")
+    lifecycle_profiles = {
+        str(profile_id): BoundedLifecycleProfile.from_config(str(profile_id), value)
+        for profile_id, value in lifecycle_raw.items()
+    }
     harnesses: dict[str, HarnessRoute] = {}
     for name, value in raw.get("harnesses", {}).items():
         catalog_workaround = (
@@ -713,6 +742,7 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             ),
             harnesses=harnesses,
         ),
+        lifecycle_profiles=lifecycle_profiles,
     )
     actions = {
         name: ActionConfig(
@@ -738,6 +768,11 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
             oci_pids=int(value.get("oci_pids", 128)),
             oci_disk_bytes=int(value.get("oci_disk_bytes", 10 * 1024**3)),
             oci_seccomp_sha256=(str(value["oci_seccomp_sha256"]) if "oci_seccomp_sha256" in value else None),
+            lifecycle_profile=(
+                str(value["lifecycle_profile"])
+                if isinstance(value.get("lifecycle_profile"), str)
+                else None
+            ),
         )
         for name, value in raw.get("actions", {}).items()
     }
@@ -787,6 +822,18 @@ class Daemon:
             if config.completion_outbox_path == DEFAULT_OUTBOX_PATH
             else config.completion_outbox_path
         )
+
+    def _lifecycle_profile(self, action_config: ActionConfig) -> BoundedLifecycleProfile | None:
+        configured = action_config.lifecycle_profile
+        if configured is None:
+            return None
+        if isinstance(configured, BoundedLifecycleProfile):
+            return configured.validate()
+        try:
+            profile = self.config.lifecycle_profiles[str(configured)]
+        except KeyError as exc:
+            raise LifecycleValidationError(f"unknown lifecycle profile {configured!r}") from exc
+        return profile.validate()
 
     def request_shutdown(self, *_: object) -> None:
         self._shutdown = True
@@ -1022,6 +1069,105 @@ class Daemon:
     def _publication_policy(self, action: dict[str, Any]) -> ActionConfig | None:
         policy = self.actions.get(str(action.get("action_type") or ""))
         return policy if policy is not None and policy.publish_candidate else None
+
+    @staticmethod
+    def _read_output(path: Path | None) -> str:
+        if path is None or not path.exists():
+            raise LifecycleValidationError("lifecycle output is missing")
+        try:
+            return path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            raise LifecycleValidationError("lifecycle output is unreadable") from exc
+
+    def _run_finalization(
+        self,
+        *,
+        action: dict[str, Any],
+        action_config: ActionConfig,
+        profile: BoundedLifecycleProfile,
+        routing: RoutingResult,
+        project: ProjectConfig,
+        record: SessionRecord,
+        payload: dict[str, Any],
+        envelope: ExecutionEnvelope,
+        work_output_path: Path | None,
+        claim_receipt: str,
+        runner_auth_token: str,
+        sprint_claim_lease: SprintClaimLease | None,
+        lifecycle_started: float,
+        audit_actor: str,
+        audit_refs: Sequence[str],
+    ) -> tuple[str, int, dict[str, Any] | None, Path]:
+        """Stop the work child, continue its OpenCode session, and validate it."""
+        record.phase = "finalizing"
+        remaining_total = profile.total_timeout_seconds - (time.monotonic() - lifecycle_started)
+        finalization_budget = min(profile.finalization_timeout_seconds, max(0.0, remaining_total))
+        record.finalization_deadline_at = _deadline_after(finalization_budget)
+        self._write_state(record)
+        events = parse_json_events(self._read_output(work_output_path))
+        provider_session_id = session_id_from_events(events)
+        record.harness_session_id = provider_session_id
+        self._write_state(record)
+        self.client.emit(
+            "session.finalizing", action_id=int(action["id"]), actor=self.actor,
+            payload={
+                **payload, "phase": "finalizing", "provider_session_id": provider_session_id,
+                "finalizer_agent": profile.finalizer_agent,
+                "finalizer_tools": [], "work_exit_observed": True,
+                "work_output_present": work_output_path is not None and work_output_path.exists(),
+                "finalization_budget_seconds": finalization_budget,
+                "finalization_deadline_at": record.finalization_deadline_at,
+                "total_deadline_at": record.total_deadline_at,
+            },
+        )
+        final_output_path = self.config.session_state_path.parent / "harness-output" / (
+            f"{record.session_id.replace(':', '_').replace('/', '_')}.finalization.log"
+        )
+        finalizer_envelope = ExecutionEnvelope(
+            contract_id=EXECUTION_ENVELOPE_V1,
+            action_id=int(action["id"]), attempt_id=str(envelope.attempt_id),
+            source_commit=(
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=project.path,
+                    text=True, capture_output=True, check=False,
+                ).stdout.strip()
+                or envelope.source_commit
+            ),
+            command_id=f"{action_config.runner}:finalizer", allowed_paths=(),
+        )
+        require_compatible(finalizer_envelope.as_dict())
+        try:
+            self._child = self._start_child(
+                action_config, project=project, routing=routing,
+                prompt="", output_path=final_output_path, envelope=finalizer_envelope,
+                lifecycle_profile=profile, finalizer_session_id=provider_session_id,
+            )
+            record.pid = self._child.pid
+            self._write_state(record)
+            outcome, exit_code = self._wait_for_child(
+                int(action["id"]), {**payload, "phase": "finalizing"}, record,
+                claim_receipt, runner_auth_token, sprint_claim_lease, project,
+                audit_actor, audit_refs, timeout_seconds=finalization_budget,
+                phase="finalizing",
+            )
+        finally:
+            self._child = None
+        declaration: dict[str, Any] | None = None
+        if outcome == "completed" and exit_code == 0:
+            final_events = parse_json_events(self._read_output(final_output_path))
+            declaration = finalization_declaration(
+                final_events, action_id=int(action["id"]),
+                attempt_id=str(action["attempt_id"]), session_id=provider_session_id,
+            )
+            self.client.emit(
+                "session.finalized", action_id=int(action["id"]), actor=self.actor,
+                payload={
+                    **payload, "phase": "finalized", "provider_session_id": provider_session_id,
+                    "terminal_status": declaration["terminal_status"],
+                    "declaration_contract": declaration["contract_id"],
+                },
+            )
+        return outcome, exit_code, declaration, final_output_path
 
     @staticmethod
     def _claim_attempt(action: dict[str, Any]) -> str:
@@ -1433,6 +1579,14 @@ class Daemon:
         if action_config is None:
             self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
             return
+        try:
+            lifecycle_profile = self._lifecycle_profile(action_config)
+        except LifecycleValidationError:
+            self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
+            return
+        if lifecycle_profile is not None and action_config.runner not in {"harness", "scope-iterate"}:
+            self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
+            return
         scope_runners = {"scope-iterate", "oci-scope-iterate"}
         if action_config.publish_candidate and action_config.runner not in scope_runners:
             self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
@@ -1491,6 +1645,20 @@ class Daemon:
             except RoutingError as exc:
                 self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
                 return
+        if lifecycle_profile is not None and (
+            routing is None or routing.harness != lifecycle_profile.harness
+        ):
+            self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
+            return
+        if lifecycle_profile is not None and routing is not None:
+            try:
+                validate_harness_profile(
+                    action_config.harness_profile, routing,
+                    worker_user=action_config.worker_user,
+                )
+            except RoutingError:
+                self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
+                return
         if action_config.runner == "oci-scope-iterate":
             try:
                 if project is None or action_config.scope_iterate is None:
@@ -1515,7 +1683,11 @@ class Daemon:
         # local fallback: a daemon that cannot prove this binding must stop
         # before emitting session state or starting a child.
         session_id = claim_attempt_id
-        ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
+        ttl_seconds = (
+            lifecycle_profile.total_timeout_seconds
+            if lifecycle_profile is not None
+            else (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
+        )
         payload = {
             "session_id": session_id, "runtime_session_id": session_id,
             "daemon_id": self.daemon_id, "action_id": action_id,
@@ -1523,6 +1695,14 @@ class Daemon:
             "target_ref": action.get("target_ref"), "runner": action_config.runner,
             "ttl_seconds": ttl_seconds,
         }
+        if lifecycle_profile is not None:
+            payload.update({
+                "lifecycle_profile": lifecycle_profile.profile_id,
+                "phase": "working",
+                "work_budget_seconds": lifecycle_profile.work_timeout_seconds,
+                "finalization_budget_seconds": lifecycle_profile.finalization_timeout_seconds,
+                "total_budget_seconds": lifecycle_profile.total_timeout_seconds,
+            })
         if routing is not None:
             payload["routing"] = routing.provenance()
         audit_actor = f"actionq:{session_id}"
@@ -1598,6 +1778,15 @@ class Daemon:
                 worktree = str(evidence_project.path)
             except Exception:
                 worktree, base_commit = None, None
+        if lifecycle_profile is not None and (evidence_project is None or base_commit is None):
+            # The finalizer's no-tools boundary is proven by an exact
+            # source-bound worktree fingerprint.  Never start a bounded
+            # lifecycle where that invariant cannot be established.
+            self._settle_result(
+                action, claim_receipt=claim_receipt,
+                terminal_status="blocked", stop_reason="start-failed",
+            )
+            return
         record = SessionRecord(
             session_id=session_id,
             runtime_session_id=session_id,
@@ -1623,6 +1812,7 @@ class Daemon:
             fallback_reason=routing.fallback_reason if routing else None,
             caller_harness=routing.caller_harness if routing else None,
             catalog_workaround=routing.catalog_workaround if routing else None,
+            phase="working",
         )
         output_path = (
             self._output_path(session_id)
@@ -1646,6 +1836,7 @@ class Daemon:
             "runner.contract.frozen", action_id=action_id, actor=self.actor,
             payload={"session_id": session_id, "contract": envelope.as_dict(), "digest": sha256_digest(envelope)},
         )
+        lifecycle_started = time.monotonic()
         try:
             try:
                 self._child = self._start_child(
@@ -1658,6 +1849,7 @@ class Daemon:
                     ),
                     output_path=output_path,
                     envelope=envelope,
+                    lifecycle_profile=lifecycle_profile,
                 )
             except Exception:
                 self._record_session_completion(
@@ -1665,6 +1857,11 @@ class Daemon:
                 )
                 raise
             record.pid, record.started_at, record.updated_at = self._child.pid, _now(), _now()
+            if lifecycle_profile is not None:
+                record.work_deadline_at = _deadline_after(lifecycle_profile.work_timeout_seconds)
+                record.total_deadline_at = _deadline_after(
+                    max(0.0, lifecycle_profile.total_timeout_seconds - (time.monotonic() - lifecycle_started))
+                )
             try:
                 takeup = self._takeup_take(project, session_id, record.pid)
             except Exception as exc:
@@ -1689,15 +1886,62 @@ class Daemon:
             )
             self.client.emit("session.started", action_id=action_id, actor=self.actor,
                              payload={**payload, "pid": record.pid, "started_at": record.started_at,
-                                     "sprint_takeup": takeup, "audit_start": audit_start})
+                                     "sprint_takeup": takeup, "audit_start": audit_start,
+                                     "work_deadline_at": record.work_deadline_at,
+                                     "total_deadline_at": record.total_deadline_at})
             sprint_claim_lease = self._sprint_claim_leases.get(session_id)
             outcome, exit_code = self._wait_for_child(
                 action_id, payload, record, claim_receipt, runner_auth_token, sprint_claim_lease,
                 project, audit_actor, audit_refs,
+                timeout_seconds=(lifecycle_profile.work_timeout_seconds if lifecycle_profile else None),
+                phase="working",
             )
             record.updated_at = _now()
             usage_limit_reason: str | None = None
             session_failure_reason: str | None = None
+            lifecycle_declaration: dict[str, Any] | None = None
+            finalization_output_path: Path | None = None
+            if lifecycle_profile is not None and outcome not in {"cancelled", "claim-lost"}:
+                try:
+                    assert routing is not None and evidence_project is not None
+                    finalization_outcome, finalization_exit, lifecycle_declaration, finalization_output_path = (
+                        self._run_finalization(
+                            action=action, action_config=action_config, profile=lifecycle_profile,
+                            routing=routing, project=evidence_project, record=record,
+                            payload=payload, envelope=envelope, work_output_path=output_path,
+                            claim_receipt=claim_receipt, runner_auth_token=runner_auth_token,
+                            sprint_claim_lease=sprint_claim_lease, lifecycle_started=lifecycle_started,
+                            audit_actor=audit_actor, audit_refs=audit_refs,
+                        )
+                    )
+                    if finalization_outcome == "claim-lost":
+                        outcome = "claim-lost"
+                        session_failure_reason = "finalization claim authority lost"
+                    elif finalization_outcome == "cancelled":
+                        outcome = "cancelled"
+                    elif lifecycle_declaration is None:
+                        outcome = "failed"
+                        session_failure_reason = "finalization-timeout" if finalization_exit != 0 else "finalization-invalid"
+                        self.client.emit(
+                            "session.finalization-rejected", action_id=action_id, actor=self.actor,
+                            payload={**payload, "phase": "finalizing", "reason": session_failure_reason},
+                        )
+                    else:
+                        outcome = (
+                            "failed"
+                            if lifecycle_declaration["terminal_status"] in {"blocked", "failed", "budget_exhausted"}
+                            else "completed"
+                        )
+                except (LifecycleValidationError, AssertionError) as exc:
+                    outcome = "failed"
+                    session_failure_reason = str(exc)
+                    self.client.emit(
+                        "session.finalization-rejected", action_id=action_id, actor=self.actor,
+                        payload={**payload, "phase": "finalizing", "reason": str(exc)},
+                    )
+            record.phase = "terminal"
+            if lifecycle_profile is not None:
+                record.finalization_deadline_at = record.finalization_deadline_at or _now()
             if outcome == "failed":
                 usage_limit_reason = self._detect_and_handle_usage_limit(
                     action_id=action_id, action_type=action_type, action_config=action_config,
@@ -1762,7 +2006,14 @@ class Daemon:
             exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(),
                      "sprint_takeup_release": released, "audit_exit": audit_exit,
                      "usage_limit_paused": usage_limit_reason is not None,
-                     "settlement_error": settlement_error}
+                     "settlement_error": settlement_error,
+                     "phase": record.phase,
+                     "provider_session_id": record.harness_session_id,
+                     "finalization_output_present": finalization_output_path is not None,
+                     "finalization_terminal_status": (
+                         lifecycle_declaration.get("terminal_status")
+                         if lifecycle_declaration is not None else None
+                     )}
             self.client.emit("session.exited", action_id=action_id, actor=self.actor, payload=exited)
             if outcome == "claim-lost":
                 # The ActionQ receipt is no longer authoritative.  Do not
@@ -1780,17 +2031,43 @@ class Daemon:
                     action, claim_receipt=claim_receipt, terminal_status="failed",
                     stop_reason="settlement-failed",
                 )
-            elif outcome == "completed":
-                if publication is not None:
+            elif outcome in {"completed", "failed"} and lifecycle_declaration is not None:
+                declared_status = (
+                    lifecycle_declaration.get("terminal_status")
+                    if lifecycle_declaration is not None else None
+                )
+                if declared_status in {"blocked", "failed", "budget_exhausted"}:
+                    self._settle_result(
+                        action, claim_receipt=claim_receipt,
+                        terminal_status=declared_status,
+                        stop_reason=("timeout" if declared_status == "budget_exhausted" else "verification-failed"),
+                    )
+                elif outcome == "completed" and publication is not None:
                     self._complete_published(
                         action_id, claim_attempt_id=claim_attempt_id,
                         claim_receipt=claim_receipt, publication=publication,
                     )
+                elif outcome == "completed":
+                    self._settle_result(
+                        action, claim_receipt=claim_receipt,
+                        terminal_status=(
+                            declared_status
+                            if declared_status in {"completed", "no_change"}
+                            else ("no_change" if scope_result is not None and not scope_result.changed_paths else "completed")
+                        ),
+                    )
                 else:
                     self._settle_result(
                         action, claim_receipt=claim_receipt,
-                        terminal_status=("no_change" if scope_result is not None and not scope_result.changed_paths else "completed"),
+                        terminal_status="failed", stop_reason="verification-failed",
                     )
+            elif outcome == "completed":
+                self._settle_result(
+                    action, claim_receipt=claim_receipt,
+                    terminal_status=(
+                        "no_change" if scope_result is not None and not scope_result.changed_paths else "completed"
+                    ),
+                )
             else:
                 self._settle_result(
                     action, claim_receipt=claim_receipt,
@@ -2088,6 +2365,8 @@ class Daemon:
         prompt: str | None = None,
         output_path: Path | None = None,
         envelope: ExecutionEnvelope,
+        lifecycle_profile: BoundedLifecycleProfile | None = None,
+        finalizer_session_id: str | None = None,
     ) -> subprocess.Popen[str]:
         def portable(command: list[str], *, cwd: Path | None = None,
                      environment: dict[str, str] | None = None,
@@ -2095,7 +2374,7 @@ class Daemon:
             allowed_environment = {
                 "HOME", "LANG", "LC_ALL", "LC_CTYPE", "OPENCODE_CONFIG",
                 "PATH", "TERM", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
-                "XDG_STATE_HOME",
+                "XDG_STATE_HOME", "OPENCODE_CONFIG_CONTENT",
             }
             source = environment if environment is not None else os.environ
             clean_env = {
@@ -2191,11 +2470,14 @@ class Daemon:
                 model=routing.model,
                 timeout_seconds=(action.timeout_minutes or self.config.default_timeout_minutes) * 60,
                 extra_env=project.env or {},
+                json_events=lifecycle_profile is not None,
+                continuation_session_id=finalizer_session_id,
+                finalizer_agent=(lifecycle_profile.finalizer_agent if lifecycle_profile else None),
             )
             command = adapter.build_command(invocation)
             env = adapter.build_env(invocation)
             try:
-                if action.worker_user is not None:
+                if action.worker_user is not None and self.config.enforce_worker_isolation:
                     # `sudo -H` supplies the worker's HOME, so provider
                     # credentials remain with that identity.  Preserve only
                     # the reviewed OpenCode policy path; do not pass the
@@ -2203,13 +2485,22 @@ class Daemon:
                     sudo_bin = shutil.which("sudo")
                     if sudo_bin is None:
                         raise RuntimeError("contained worker requires an approved sudo executable")
+                    preserved_env = (
+                        "OPENCODE_CONFIG,OPENCODE_CONFIG_CONTENT"
+                        if finalizer_session_id is not None else "OPENCODE_CONFIG"
+                    )
                     command = [
                         sudo_bin, "-n", "-H",
-                        f"--preserve-env=OPENCODE_CONFIG",
+                        f"--preserve-env={preserved_env}",
                         "-u", action.worker_user, "--",
                         *command,
                     ]
-                    env = {"OPENCODE_CONFIG": env.get("OPENCODE_CONFIG", "")}
+                    env = {
+                        key: env[key] for key in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT")
+                        if key in env
+                    }
+                if finalizer_session_id is not None:
+                    env = {**env, "OPENCODE_CONFIG_CONTENT": NO_TOOLS_OPENCODE_CONFIG}
                 stdin_text = adapter.stdin_text(invocation)
                 return portable(command, cwd=invocation.worktree, environment=env, stdin_text=stdin_text)
             finally:
@@ -2344,11 +2635,15 @@ class Daemon:
         project: ProjectConfig | None = None,
         audit_actor: str | None = None,
         audit_refs: Sequence[str] = (),
+        timeout_seconds: float | None = None,
+        phase: str = "working",
     ) -> tuple[str, int]:
         assert self._child is not None
         next_heartbeat = time.monotonic() + self.config.heartbeat_interval_seconds
         next_cancel_poll = time.monotonic()
-        deadline = time.monotonic() + float(payload.get("ttl_seconds", 0))
+        deadline = time.monotonic() + float(
+            payload.get("ttl_seconds", 0) if timeout_seconds is None else max(0.0, timeout_seconds)
+        )
         while self._child.poll() is None:
             if time.monotonic() >= deadline:
                 os.killpg(self._child.pid, signal.SIGTERM)
@@ -2421,7 +2716,7 @@ class Daemon:
                 record.updated_at = _now()
                 self._write_state(record)
                 self.client.emit("session.heartbeat", action_id=action_id, actor=self.actor,
-                                 payload={**payload, "pid": record.pid, "status": "running"})
+                                 payload={**payload, "pid": record.pid, "status": phase, "phase": phase})
                 next_heartbeat = time.monotonic() + self.config.heartbeat_interval_seconds
             time.sleep(0.05)
         exit_code = self._child.returncode
