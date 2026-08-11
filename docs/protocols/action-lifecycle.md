@@ -118,7 +118,7 @@ The optional `opencode-verified` profile adds controller phases
 `working -> finalizing -> terminal` with fixed 20-minute work, 2-minute
 finalization, and 25-minute total ceilings. A worker exit only advances the
 phase. The daemon requires JSON events with one stable
-`properties.sessionID`, then continues that same session with the qualified
+top-level `sessionID`, then continues that same session with the qualified
 `ao-finalizer` agent and an explicitly denied tool/MCP surface. The runner
 also rejects any finalizer workspace mutation. The finalizer must emit one
 bound `dispatch-finalization/v1` declaration; missing, malformed, changed-

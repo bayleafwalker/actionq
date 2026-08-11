@@ -1095,6 +1095,15 @@ class Daemon:
             return False
         claim_receipt, runner_auth_token = authority
         try:
+            command_id = f"{record.action_type}:{action_config.runner}"
+            if not self._projection_succeeded(
+                self._projection_success_path(record.session_id, "working"),
+                action_id=record.action_id,
+                attempt_id=record.session_id,
+                command_id=command_id,
+                source_commit=record.base_commit,
+            ):
+                return False
             # A readable claimed projection is not authority.  Renewal with
             # the private receipt must succeed before another provider turn.
             self.client.renew(
@@ -1124,7 +1133,7 @@ class Daemon:
             envelope = ExecutionEnvelope(
                 contract_id=EXECUTION_ENVELOPE_V1, action_id=record.action_id,
                 attempt_id=record.session_id, source_commit=record.base_commit,
-                command_id=f"{record.action_type}:{action_config.runner}", allowed_paths=(),
+                command_id=command_id, allowed_paths=(),
             )
             output_path = self._output_path(record.session_id)
             if not output_path.exists():
@@ -2718,6 +2727,7 @@ class Daemon:
     @staticmethod
     def _projection_succeeded(
         path: Path | None, *, action_id: int, attempt_id: str, command_id: str | None,
+        source_commit: str | None = None,
     ) -> bool:
         if path is None or command_id is None:
             return True
@@ -2725,12 +2735,13 @@ class Daemon:
             value = json.loads(path.read_text(encoding="utf-8", errors="strict"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return False
+        expected_source = source_commit if source_commit is not None else value.get("source_commit")
         return value == {
             "action_id": action_id,
             "attempt_id": attempt_id,
             "command_id": command_id,
-            "source_commit": value.get("source_commit"),
-        } and isinstance(value.get("source_commit"), str) and bool(value["source_commit"])
+            "source_commit": expected_source,
+        } and isinstance(expected_source, str) and bool(expected_source)
 
     def _detect_and_handle_usage_limit(
         self,

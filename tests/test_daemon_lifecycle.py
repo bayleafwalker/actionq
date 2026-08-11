@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from actionq.daemon import ActionConfig, Daemon, DaemonConfig, ProjectConfig, SessionRecord, _deadline_after, _now
 from actionq.lifecycle import BoundedLifecycleProfile
 from actionq.routing import HarnessRoute, RoutingContext
@@ -155,6 +157,17 @@ def _stale_working_record(daemon: Daemon, tmp_path: Path) -> SessionRecord:
     )
 
 
+def _write_working_projection_success(daemon: Daemon, record: SessionRecord) -> None:
+    path = daemon._projection_success_path(record.session_id, "working")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "action_id": record.action_id,
+        "attempt_id": record.session_id,
+        "command_id": f"{record.action_type}:{record.runner}",
+        "source_commit": record.base_commit,
+    }, sort_keys=True), encoding="utf-8")
+
+
 def test_restart_finalizes_same_session_only_after_receipt_renewal(tmp_path: Path):
     daemon, client = _daemon(tmp_path, declaration=True)
     client.action = None
@@ -164,6 +177,7 @@ def test_restart_finalizes_same_session_only_after_receipt_renewal(tmp_path: Pat
         json.dumps({"type": "step_start", "sessionID": "ses_81", "timestamp": 1, "part": {"type": "step-start"}}),
         json.dumps({"type": "step_finish", "sessionID": "ses_81", "timestamp": 2, "part": {"type": "step-finish"}}),
     ]) + "\n", encoding="utf-8")
+    _write_working_projection_success(daemon, record)
     daemon._write_state(record)
     daemon._write_recovery_authority(
         session_id=record.session_id, claim_receipt="receipt", runner_auth_token="runner",
@@ -180,6 +194,7 @@ def test_restart_fails_closed_when_claim_receipt_cannot_be_renewed(tmp_path: Pat
     daemon, client = _daemon(tmp_path, declaration=True)
     client.action = None
     record = _stale_working_record(daemon, tmp_path)
+    _write_working_projection_success(daemon, record)
     daemon._write_state(record)
     daemon._write_recovery_authority(
         session_id=record.session_id, claim_receipt="stale", runner_auth_token="runner",
@@ -190,3 +205,44 @@ def test_restart_fails_closed_when_claim_receipt_cannot_be_renewed(tmp_path: Pat
     assert client.settled == []
     assert "session.finalizing" not in [event[0] for event in client.events]
     assert "session.end-inferred" in [event[0] for event in client.events]
+
+
+def test_restart_fails_closed_without_working_projection_success(tmp_path: Path):
+    daemon, client = _daemon(tmp_path, declaration=True)
+    client.action = None
+    record = _stale_working_record(daemon, tmp_path)
+    daemon._write_state(record)
+    daemon._write_recovery_authority(
+        session_id=record.session_id, claim_receipt="receipt", runner_auth_token="runner",
+    )
+
+    assert daemon.recover_stale_state() is False
+    assert client.settled == []
+    assert "session.finalizing" not in [event[0] for event in client.events]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("action_id", 82),
+    ("attempt_id", "aqs:82"),
+    ("command_id", "opencode:other"),
+    ("source_commit", "0" * 40),
+])
+def test_restart_fails_closed_on_mismatched_working_projection_success(
+    tmp_path: Path, field: str, value: object,
+):
+    daemon, client = _daemon(tmp_path, declaration=True)
+    client.action = None
+    record = _stale_working_record(daemon, tmp_path)
+    _write_working_projection_success(daemon, record)
+    marker = daemon._projection_success_path(record.session_id, "working")
+    marker_value = json.loads(marker.read_text(encoding="utf-8"))
+    marker_value[field] = value
+    marker.write_text(json.dumps(marker_value), encoding="utf-8")
+    daemon._write_state(record)
+    daemon._write_recovery_authority(
+        session_id=record.session_id, claim_receipt="receipt", runner_auth_token="runner",
+    )
+
+    assert daemon.recover_stale_state() is False
+    assert client.settled == []
+    assert "session.finalizing" not in [event[0] for event in client.events]
