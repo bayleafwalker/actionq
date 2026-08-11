@@ -62,6 +62,17 @@ def main() -> int:
     target = ROOT / "verification/history-receipts" / f"{history}.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    result_path = ROOT / "verification/results" / f"action-resource-owner-{history}.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["implementation_sha"] = f"candidate-tree:{receipt['candidate_tree_digest']}"
+    result["execution"]["receipt"] = {
+        "path": target.relative_to(ROOT).as_posix(),
+        "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+    }
+    result_path.write_text(
+        json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     return 0
 
 if __name__ == "__main__":
