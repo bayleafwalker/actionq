@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 10
+MAX_SCHEMA_VERSION = 11
 PRE_MIGRATION_BRIDGE_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
@@ -1295,34 +1295,130 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
             )
         )
     conn.execute(
-        sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
-            schema_identifier,
-            sql.Identifier(MIGRATION_TABLE),
-            role_identifier,
+        sql.SQL("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(
+            schema_identifier, role_identifier
         )
-    )
-    conn.execute(
-        sql.SQL(
-            "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}"
-        ).format(schema_identifier, role_identifier)
     )
     conn.execute(
         sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
             schema_identifier, role_identifier
         )
     )
+    _grant_completion_privileges(conn, schema)
     conn.execute(
-        sql.SQL(
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA {} "
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {}"
-        ).format(schema_identifier, role_identifier)
+        sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
+            schema_identifier,
+            sql.Identifier(MIGRATION_TABLE),
+            role_identifier,
+        )
     )
-    conn.execute(
-        sql.SQL(
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA {} "
-            "GRANT USAGE, SELECT ON SEQUENCES TO {}"
-        ).format(schema_identifier, role_identifier)
+
+
+def _completion_role(name: str | None, capability: str) -> tuple[str, Any] | None:
+    if not name:
+        return None
+    if not db.SCHEMA_RE.fullmatch(name):
+        raise SchemaMigrationError(
+            f"ACTIONQ_COMPLETION_{capability.upper()}_ROLE must be a simple PostgreSQL identifier"
+        )
+    if name == os.environ.get("ACTIONQ_RUNTIME_ROLE"):
+        raise SchemaMigrationError(
+            "completion database roles must be distinct from ACTIONQ_RUNTIME_ROLE"
+        )
+    from psycopg import sql
+    return name, sql.Identifier(name)
+
+
+def _grant_completion_privileges(conn, schema: str) -> None:
+    """Grant completion roles only their append/read projection rights.
+
+    These roles intentionally do not receive any privilege on ``actions`` or
+    the legacy ``events`` ledger.  The queue runtime role remains the owner of
+    queue lifecycle APIs; completion bearer credentials must use these separate
+    database roles when the served completion URLs are configured.
+    """
+    from psycopg import sql
+
+    schema_identifier = sql.Identifier(schema)
+    ingest = _completion_role(
+        os.environ.get("ACTIONQ_COMPLETION_INGEST_ROLE"), "ingest"
     )
+    read = _completion_role(
+        os.environ.get("ACTIONQ_COMPLETION_READ_ROLE"), "read"
+    )
+    for item in (ingest, read):
+        if item is None:
+            continue
+        _name, role_identifier = item
+        conn.execute(
+            sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {}.{}, {}.{} FROM {}").format(
+                schema_identifier, sql.Identifier("actions"),
+                schema_identifier, sql.Identifier("events"), role_identifier,
+            )
+        )
+        conn.execute(
+            sql.SQL("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {} FROM {}").format(
+                schema_identifier, role_identifier
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                schema_identifier, role_identifier
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
+                schema_identifier, sql.Identifier(MIGRATION_TABLE), role_identifier
+            )
+        )
+        conn.execute(
+            sql.SQL("REVOKE CREATE ON SCHEMA {} FROM {}").format(
+                schema_identifier, role_identifier
+            )
+        )
+    if ingest is not None:
+        _name, role_identifier = ingest
+        conn.execute(
+            sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{}, {}.{}, {}.{} TO {}").format(
+                schema_identifier, sql.Identifier("session_completion_events"),
+                schema_identifier, sql.Identifier("session_completion_stream_positions"),
+                schema_identifier, sql.Identifier("session_completion_acknowledgements"),
+                role_identifier,
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT INSERT ON TABLE {}.{} TO {}").format(
+                schema_identifier, sql.Identifier("session_completion_quarantine"), role_identifier
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT SELECT, UPDATE ON TABLE {}.{} TO {}").format(
+                schema_identifier, sql.Identifier("session_completion_watermarks"), role_identifier
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT USAGE, SELECT ON SEQUENCE {}.{}, {}.{} TO {}").format(
+                schema_identifier, sql.Identifier("session_completion_events_server_cursor_seq"),
+                schema_identifier, sql.Identifier("session_completion_quarantine_id_seq"),
+                role_identifier,
+            )
+        )
+    if read is not None:
+        _name, role_identifier = read
+        conn.execute(
+            sql.SQL("GRANT SELECT ON TABLE {}.{}, {}.{}, {}.{}, {}.{} TO {}").format(
+                schema_identifier, sql.Identifier("session_completion_events"),
+                schema_identifier, sql.Identifier("session_completion_stream_positions"),
+                schema_identifier, sql.Identifier("session_completion_acknowledgements"),
+                schema_identifier, sql.Identifier("session_completion_quarantine"),
+                role_identifier,
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
+                schema_identifier, sql.Identifier("session_completion_watermarks"), role_identifier
+            )
+        )
 
 
 def migrate(

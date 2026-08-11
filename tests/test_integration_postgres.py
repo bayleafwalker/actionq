@@ -550,9 +550,9 @@ def test_exact_v3_bridge_lifecycle_then_exact_migration_to_current(
 
     migration = runner.invoke(cli, ["migrate", "--json-output"])
     assert migration.exit_code == 0, migration.output
-    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7, 8, 9, 10]
+    assert json.loads(migration.output)["applied_versions"] == list(range(4, schema_contract.MAX_SCHEMA_VERSION + 1))
     final = _invoke_json(runner, ["check-compatibility"])
-    assert final["observed_schema_version"] == 10
+    assert final["observed_schema_version"] == schema_contract.MAX_SCHEMA_VERSION
     assert final["state"] == "compatible"
 
 
@@ -563,11 +563,11 @@ def test_schema8_rendered_guard_executes_against_postgres(runner_env):
 
     report = schema_contract.migrate(conn, schema, runtime_role=RUNTIME_ROLE)
 
-    assert report["applied_versions"] == [8, 9, 10]
+    assert report["applied_versions"] == list(range(8, schema_contract.MAX_SCHEMA_VERSION + 1))
     assert conn.execute(
         f'SELECT MAX(version) AS version FROM "{schema}".schema_migrations WHERE domain=%s',
         (schema_contract.DOMAIN,),
-    ).fetchone()["version"] == 10
+    ).fetchone()["version"] == schema_contract.MAX_SCHEMA_VERSION
     conn.close()
 
 
@@ -976,6 +976,17 @@ def test_deployment_migration_adopts_unversioned_current_schema(runner_env):
                         "action_resources_action_id_key",
                         "action_resources_principal_scope_operation_idempotency_key_key",
                         "idx_action_resource_changes_lookup",
+                    }
+                )
+            if schema_contract.MAX_SCHEMA_VERSION >= 11:
+                expected_indexes.update(
+                    {
+                        "session_completion_events_event_id_key",
+                        "session_completion_stream_positions_event_id_key",
+                        "session_completion_stream_positions_server_cursor_key",
+                        "idx_session_completion_events_received",
+                        "idx_session_completion_events_origin",
+                        "idx_session_completion_quarantine_time",
                     }
                 )
     assert before <= expected_indexes

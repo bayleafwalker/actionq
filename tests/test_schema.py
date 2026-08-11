@@ -452,7 +452,7 @@ def _packaged_checksums() -> dict[int, str]:
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     migrations = schema.load_migrations()
 
-    assert [migration.version for migration in migrations] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert [migration.version for migration in migrations] == list(range(1, schema.MAX_SCHEMA_VERSION + 1))
     rendered = schema._render(migrations[0], "aq")
     assert "{{schema}}" not in rendered
     assert '"aq".actions' in rendered
@@ -501,8 +501,8 @@ def test_compatibility_accepts_exact_packaged_version_and_checksum():
         "domain": "execution",
         "api_version": "v1",
         "minimum_schema_version": 1,
-        "maximum_schema_version": 10,
-        "observed_schema_version": 10,
+        "maximum_schema_version": schema.MAX_SCHEMA_VERSION,
+        "observed_schema_version": schema.MAX_SCHEMA_VERSION,
         "state": "compatible",
         "compatible": True,
         "detail": "schema is compatible with the packaged execution adapter",
@@ -820,7 +820,7 @@ def test_sql_canonicalization_preserves_semantic_tokens():
                 },
                 "checksum-mismatch",
             ),
-            ({**_packaged_checksums(), 11: "future"}, "too-new"),
+            ({**_packaged_checksums(), schema.MAX_SCHEMA_VERSION + 1: "future"}, "too-new"),
     ],
 )
 def test_compatibility_rejects_unsupported_schema(applied, state):
@@ -838,7 +838,7 @@ def test_migration_is_serialized_idempotent_and_returns_compatibility():
     first = schema.migrate(conn, "aq")
     second = schema.migrate(conn, "aq")
 
-    assert first["applied_versions"] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert first["applied_versions"] == list(range(1, schema.MAX_SCHEMA_VERSION + 1))
     assert second["applied_versions"] == []
     assert second["compatibility"]["compatible"] is True
     locks = [

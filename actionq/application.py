@@ -22,6 +22,7 @@ from . import db
 from .action_resource import ActionResourceOwner, ResourceNotFound, serialize_envelope
 from .runner_auth import VerifiedRunner, verify_runner_proof
 from .cas import _DaemonCAS
+from .completion_log import CompletionLog
 
 
 _KIND_TO_ACTION_TYPE = {
@@ -117,6 +118,8 @@ class ActionQApplication:
         resource_cursor_secret: bytes | None = None,
         artifact_root: Path | str | None = None,
         cas_factory: Callable[[Path], Any] | None = None,
+        completion_ingest_connection_factory: Callable[[], Any] | None = None,
+        completion_read_connection_factory: Callable[[], Any] | None = None,
     ) -> None:
         self.schema = db.schema_name(schema)
         self._connection_factory = connection_factory
@@ -125,6 +128,8 @@ class ActionQApplication:
         configured_root = artifact_root if artifact_root is not None else os.environ.get("ACTIONQ_ARTIFACT_ROOT")
         self.artifact_root = Path(configured_root).expanduser() if configured_root else None
         self._cas_factory = cas_factory or _DaemonCAS
+        self._completion_ingest_connection_factory = completion_ingest_connection_factory
+        self._completion_read_connection_factory = completion_read_connection_factory
 
     def _verified_result_store(self, result_ref: str) -> Any:
         if self.artifact_root is None:
@@ -242,6 +247,43 @@ class ActionQApplication:
             return db.check_compatibility(conn, self.schema).as_dict()
         finally:
             conn.close()
+
+    def _completion_log(self, capability: str) -> CompletionLog:
+        configured = (
+            self._completion_ingest_connection_factory
+            if capability == "ingest"
+            else self._completion_read_connection_factory
+        )
+        if configured is None:
+            variable = (
+                "ACTIONQ_COMPLETION_INGEST_URL"
+                if capability == "ingest"
+                else "ACTIONQ_COMPLETION_READ_URL"
+            )
+            url = os.environ.get(variable)
+            if url:
+                configured = lambda url=url: db.connect(url)
+        return CompletionLog(schema=self.schema, connection_factory=configured or self._open)
+
+    def ingest_session_completion(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Accept one observation through the narrow completion-log owner API."""
+        return self._completion_log("ingest").ingest(event)
+
+    def list_session_completions(
+        self, *, cursor: str | int | None = None, limit: int = 100, replay: bool = False
+    ) -> dict[str, Any]:
+        """Read the replayable completion log; this does not read queue tables."""
+        return self._completion_log("read").list(cursor=cursor, limit=limit, replay=replay)
+
+    def session_completion_health(self) -> dict[str, Any]:
+        return self._completion_log("read").health()
+
+    def compact_session_completions(self, *, older_than_seconds: int | None = None) -> int:
+        # Compaction is an owner/operator operation, never a completion bearer
+        # capability; retain the application's ordinary owner connection.
+        return CompletionLog(schema=self.schema, connection_factory=self._open).compact(
+            older_than_seconds=older_than_seconds
+        )
 
     def _read(self, reader: Callable[[Any], Any]) -> Any:
         with self.connection() as conn:

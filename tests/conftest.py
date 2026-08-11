@@ -26,6 +26,8 @@ from actionq_runner.identity import sign_runner_request
 
 MIGRATION_ROLE = "actionq_migration"
 RUNTIME_ROLE = "actionq_runtime"
+COMPLETION_INGEST_ROLE = "actionq_completion_ingest"
+COMPLETION_READ_ROLE = "actionq_completion_read"
 _POSTGRES_STATE = None
 
 
@@ -129,8 +131,9 @@ def _start_postgres() -> dict:
         runtime_url = external_url.replace("//actionq:", "//actionq_runtime:")
         migration_url = external_url.replace("//actionq:", "//actionq_migration:")
         return {"external": True, "pg_ctl": None,
-                "urls": {"admin": external_url, "migration": migration_url, "runtime": runtime_url},
-                "previous_env": {name: os.environ.get(name) for name in ("ACTIONQ_TEST_URL", "ACTIONQ_TEST_MIGRATION_URL", "ACTIONQ_TEST_RUNTIME_URL", "ACTIONQ_RUNTIME_ROLE")}}
+                "urls": {"admin": external_url, "migration": migration_url, "runtime": runtime_url,
+                        "completion_ingest": runtime_url, "completion_read": runtime_url},
+                "previous_env": {name: os.environ.get(name) for name in ("ACTIONQ_TEST_URL", "ACTIONQ_TEST_MIGRATION_URL", "ACTIONQ_TEST_RUNTIME_URL", "ACTIONQ_RUNTIME_ROLE", "ACTIONQ_COMPLETION_INGEST_ROLE", "ACTIONQ_COMPLETION_READ_ROLE")}}
 
     binaries = {command: shutil.which(command) for command in ("initdb", "pg_ctl")}
     missing = sorted(command for command, path in binaries.items() if path is None)
@@ -184,6 +187,8 @@ def _start_postgres() -> dict:
         "admin": f"{base} user={getpass.getuser()}",
         "migration": f"{base} user={MIGRATION_ROLE}",
         "runtime": f"{base} user={RUNTIME_ROLE}",
+        "completion_ingest": f"{base} user={COMPLETION_INGEST_ROLE}",
+        "completion_read": f"{base} user={COMPLETION_READ_ROLE}",
     }
     try:
         with psycopg.connect(urls["admin"], autocommit=True) as conn:
@@ -192,6 +197,12 @@ def _start_postgres() -> dict:
             )
             conn.execute(
                 sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(RUNTIME_ROLE))
+            )
+            conn.execute(
+                sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(COMPLETION_INGEST_ROLE))
+            )
+            conn.execute(
+                sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(COMPLETION_READ_ROLE))
             )
             conn.execute(
                 sql.SQL("GRANT CREATE ON DATABASE postgres TO {}").format(
@@ -219,6 +230,8 @@ def _start_postgres() -> dict:
                 "ACTIONQ_TEST_MIGRATION_URL",
                 "ACTIONQ_TEST_RUNTIME_URL",
                 "ACTIONQ_RUNTIME_ROLE",
+                "ACTIONQ_COMPLETION_INGEST_ROLE",
+                "ACTIONQ_COMPLETION_READ_ROLE",
             )
         },
     }
@@ -234,6 +247,9 @@ def pytest_configure(config) -> None:
     os.environ["ACTIONQ_TEST_MIGRATION_URL"] = urls["migration"]
     os.environ["ACTIONQ_TEST_RUNTIME_URL"] = urls["runtime"]
     os.environ["ACTIONQ_RUNTIME_ROLE"] = RUNTIME_ROLE
+    if not _POSTGRES_STATE.get("external"):
+        os.environ["ACTIONQ_COMPLETION_INGEST_ROLE"] = COMPLETION_INGEST_ROLE
+        os.environ["ACTIONQ_COMPLETION_READ_ROLE"] = COMPLETION_READ_ROLE
 
 
 def pytest_unconfigure(config) -> None:
