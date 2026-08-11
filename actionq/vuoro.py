@@ -176,6 +176,46 @@ _IMMUTABLE_CANDIDATE_ACTION_INPUT_SCHEMA = _object(
     },
     required=("request", "spec", "input_refs", "project"),
 )
+_COMPLETION_EVENT_SCHEMA = {
+    "type": "object",
+    "required": [
+        "schema_version", "event_id", "origin_stream_id", "origin_sequence",
+        "runtime_session_id", "attempt_id", "action_id", "repo", "harness",
+        "model", "terminal", "started_at", "completed_at", "observed_at",
+        "duration_ms", "refs", "evidence", "privacy",
+    ],
+    "properties": {
+        "schema_version": {"const": "session.completion-observed/v1"},
+        "event_id": {"type": "string", "format": "uuid"},
+        "origin_stream_id": {"type": "string", "format": "uuid"},
+        "origin_sequence": {"type": "integer", "minimum": 1},
+        "runtime_session_id": {"type": "string", "minLength": 1},
+        "attempt_id": _NULLABLE_STRING, "action_id": _NULLABLE_STRING,
+        "repo": {"type": "object"}, "harness": {"type": "string", "minLength": 1},
+        "model": {"type": ["object", "null"]}, "terminal": {"type": "object"},
+        "started_at": {"type": "string"}, "completed_at": {"type": "string"},
+        "observed_at": {"type": "string"}, "duration_ms": _NULLABLE_INTEGER,
+        "refs": {"type": "array"}, "evidence": {"type": "object"},
+        "privacy": {"type": "object"},
+    },
+    "additionalProperties": True,
+}
+_COMPLETION_PAGE_SCHEMA = _object(
+    {
+        "schema_version": {"enum": ["session-completion-page/v1", "session-completion-cursor/v1"]},
+        "status": {"enum": ["ok", "cursor_expired"]},
+        "cursor": {"type": "integer", "minimum": 0},
+        "events": {"type": "array", "items": _COMPLETION_EVENT_SCHEMA},
+        "next_cursor": {"type": "integer", "minimum": 0},
+        "server_cursor": {"type": "integer", "minimum": 0},
+        "recovery_floor": {"type": "integer", "minimum": 0},
+        "gap": {"type": "boolean"}, "requires_replay": {"type": "boolean"},
+        "advance_cursor": {"type": "boolean"},
+        "error": {"type": ["object", "null"]},
+        "health": {"type": "object"},
+    },
+    required=("schema_version", "status", "cursor", "events", "next_cursor", "server_cursor", "recovery_floor", "gap", "requires_replay", "advance_cursor", "health"),
+)
 
 
 @dataclass(frozen=True)
@@ -683,6 +723,65 @@ def build_operations(
                     provenance=p,
                 ),
             ),
+        )
+    )
+
+    name = "execution.session-completion.ingest"
+    operations.append(
+        AdapterOperation(
+            _definition(
+                name,
+                input_schema=_object({"event": _COMPLETION_EVENT_SCHEMA}, required=("event",)),
+                result_schema=_object({
+                    "schema_version": {"const": "session-completion-ack/v1"},
+                    "event_id": {"type": "string", "format": "uuid"},
+                    "origin_stream_id": {"type": "string", "format": "uuid"},
+                    "origin_sequence": {"type": "integer", "minimum": 1},
+                    "event_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "server_cursor": {"type": "integer", "minimum": 1},
+                    "acknowledged": {"type": "boolean"},
+                    "acknowledged_at": _NULLABLE_STRING,
+                    "replayed": {"type": "boolean"},
+                }, required=("schema_version", "event_id", "origin_stream_id", "origin_sequence", "event_digest", "server_cursor", "acknowledged", "acknowledged_at", "replayed")),
+                authority="execution.session-completion.ingest",
+                semantics="write",
+                idempotency="required",
+            ),
+            lambda a, _context: _transport(app.ingest_session_completion(a["event"])),
+        )
+    )
+
+    for suffix, semantics, callback in (
+        ("list", "read", lambda a: app.list_session_completions(cursor=a.get("cursor"), limit=a.get("limit", 100), replay=False)),
+        ("replay", "read", lambda a: app.list_session_completions(cursor=a.get("cursor"), limit=a.get("limit", 100), replay=True)),
+    ):
+        name = f"execution.session-completion.{suffix}"
+        operations.append(
+            AdapterOperation(
+                _definition(
+                    name,
+                    input_schema=_object({"cursor": _NULLABLE_STRING, "limit": limit}),
+                    result_schema=_COMPLETION_PAGE_SCHEMA,
+                    authority="execution.session-completion.read",
+                    semantics=semantics,
+                    idempotency="not-allowed",
+                ),
+                lambda a, _context, callback=callback: _transport(callback(a)),
+            )
+        )
+
+    name = "execution.session-completion.health"
+    operations.append(
+        AdapterOperation(
+            _definition(
+                name,
+                input_schema=_object({}),
+                result_schema=_object({"schema_version": {"const": "session-completion-health/v1"}, "cursor": {"type": "integer"}, "recovery_floor": {"type": "integer"}, "event_count": {"type": "integer"}, "quarantine_count": {"type": "integer"}, "oldest_event_age_seconds": _NULLABLE_INTEGER, "ingest_lag_seconds": _NULLABLE_INTEGER, "stream_lag_seconds": _NULLABLE_INTEGER, "retry_age_seconds": _NULLABLE_INTEGER, "retention_seconds": {"type": "integer", "minimum": 1}, "last_acknowledged_at": _NULLABLE_STRING}, required=("schema_version", "cursor", "recovery_floor", "event_count", "quarantine_count", "oldest_event_age_seconds", "ingest_lag_seconds", "stream_lag_seconds", "retry_age_seconds", "retention_seconds", "last_acknowledged_at")),
+                authority="execution.session-completion.read",
+                semantics="read",
+                idempotency="not-allowed",
+            ),
+            lambda _a, _context: _transport(app.session_completion_health()),
         )
     )
 

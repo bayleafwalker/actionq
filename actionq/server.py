@@ -6,6 +6,7 @@ Routing: COCKPIT_ACTIONQ_SERVER_URL -> this server -> actionq pg.
 from __future__ import annotations
 
 import json
+import hmac
 import os
 import sys
 import re
@@ -15,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from . import db as _db
 from . import schema as _schema_contract
 from .application import ActionQApplication, InvocationProvenance
+from .completion_log import CompletionConflictError
 
 CONTRACT_VERSION = "v1"
 V2_CONTRACT_VERSION = "v2"
@@ -44,6 +46,7 @@ def _no_authenticator(_headers) -> AuthenticatedDispatchIdentity:
 
 
 _served_authenticator = _no_authenticator
+_completion_authenticator = None
 
 
 def set_served_authenticator_for_testing(authenticator) -> None:
@@ -52,8 +55,77 @@ def set_served_authenticator_for_testing(authenticator) -> None:
     _served_authenticator = authenticator
 
 
+def set_completion_authenticator_for_testing(authenticator) -> None:
+    """Inject a capability-scoped completion identity in boundary tests."""
+    global _completion_authenticator
+    _completion_authenticator = authenticator
+
+
+def _completion_identity(headers, capability: str) -> AuthenticatedDispatchIdentity:
+    if _completion_authenticator is not None:
+        identity = _completion_authenticator(headers, capability)
+        if not isinstance(identity, AuthenticatedDispatchIdentity):
+            raise _db.ActionQError("completion credential did not produce a trusted identity")
+        return identity
+    configured = os.environ.get(
+        "ACTIONQ_COMPLETION_INGEST_TOKEN" if capability == "ingest" else "ACTIONQ_COMPLETION_READ_TOKEN"
+    )
+    authorization = headers.get("authorization", "")
+    supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    if not configured or not supplied or not hmac.compare_digest(supplied, configured):
+        raise _db.ActionQError("completion credential is invalid or not configured")
+    return AuthenticatedDispatchIdentity(
+        actor=f"completion:{capability}", environment="served", repositories=(),
+    )
+
+
 def _schema() -> str:
     return os.environ.get("ACTIONQ_SCHEMA", "actionq")
+
+
+def _completion_application(capability: str) -> ActionQApplication:
+    """Build a served completion facade on its capability-specific DB role."""
+    variable = (
+        "ACTIONQ_COMPLETION_INGEST_URL"
+        if capability == "ingest"
+        else "ACTIONQ_COMPLETION_READ_URL"
+    )
+    url = os.environ.get(variable)
+    if not url:
+        raise _db.ActionQError(f"{variable} is not configured")
+    return ActionQApplication(
+        schema=_schema(),
+        connection_factory=lambda: _db.connect(url),
+    )
+
+
+def _completion_bearer_matches(headers) -> bool:
+    authorization = headers.get("authorization", "")
+    supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    if not supplied:
+        return False
+    return any(
+        configured and hmac.compare_digest(supplied, configured)
+        for configured in (
+            os.environ.get("ACTIONQ_COMPLETION_INGEST_TOKEN"),
+            os.environ.get("ACTIONQ_COMPLETION_READ_TOKEN"),
+        )
+    )
+
+
+def _reject_completion_credential_escalation(handler: BaseHTTPRequestHandler) -> bool:
+    if not _completion_bearer_matches(getattr(handler, "headers", {})):
+        return False
+    handler._send_json(
+        403,
+        {
+            "error": {
+                "code": "completion-credential-scope",
+                "message": "completion credential is not authorized for this route",
+            }
+        },
+    )
+    return True
 
 
 def _compatibility() -> dict:
@@ -116,6 +188,16 @@ def _dispatches(query_string: str) -> list:
     )
 
 
+def _completion_page(query_string: str) -> dict:
+    params = parse_qs(query_string or "")
+    replay = params.get("replay", ["false"])[0].lower() in ("true", "1", "yes")
+    return _completion_application("read").list_session_completions(
+        cursor=params.get("cursor", [None])[0],
+        limit=min(int(params.get("limit", ["100"])[0]), 500),
+        replay=replay,
+    )
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         print(format % args, file=sys.stderr, flush=True)
@@ -161,6 +243,8 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if self._quarantine_v2_dispatch():
             return
+        if parsed.path not in {"/session-completions", "/session-completions/health"} and _reject_completion_credential_escalation(self):
+            return
         if parsed.path == "/health":
             self._send_json(200, {"ok": True})
         elif parsed.path == "/compatibility":
@@ -195,6 +279,28 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": "internal server error"})
                 return
             self._send_json(200, dispatches)
+        elif parsed.path in {"/session-completions", "/session-completions/health"}:
+            try:
+                _completion_identity(self.headers, "read")
+                if parsed.path.endswith("/health") or parse_qs(parsed.query).get("health", ["false"])[0].lower() in ("true", "1", "yes"):
+                    result = _completion_application("read").session_completion_health()
+                else:
+                    result = _completion_page(parsed.query)
+            except _schema_contract.SchemaCompatibilityError as exc:
+                print(f"session completions refused: {exc}", file=sys.stderr, flush=True)
+                self._send_json(503, {"error": "schema incompatible"})
+                return
+            except _db.ActionQError as exc:
+                self._send_json(401, {"error": {"code": "completion-authorization", "message": str(exc)}})
+                return
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except Exception as exc:
+                print(f"session completions error: {exc}", file=sys.stderr, flush=True)
+                self._send_json(500, {"error": "internal server error"})
+                return
+            self._send_json(409 if result.get("status") == "cursor_expired" else 200, result)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -202,8 +308,39 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if self._quarantine_v2_dispatch():
             return
-        if parsed.path != "/dispatch":
+        if parsed.path != "/session-completions" and _reject_completion_credential_escalation(self):
+            return
+        if parsed.path not in {"/dispatch", "/session-completions"}:
             self._send_json(404, {"error": "not found"})
+            return
+
+        if parsed.path == "/session-completions":
+            try:
+                _completion_identity(self.headers, "ingest")
+            except _db.ActionQError as exc:
+                self._send_json(401, {"error": {"code": "completion-authorization", "message": str(exc)}})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                if length <= 0 or length > 2 * 1024 * 1024:
+                    raise ValueError("completion event body must be between 1 byte and 2 MiB")
+                raw = self.rfile.read(length)
+                payload = json.loads(raw)
+                result = _completion_application("ingest").ingest_session_completion(payload)
+            except CompletionConflictError as exc:
+                self._send_json(409, {"error": {"code": exc.code, "message": str(exc)}})
+                return
+            except _schema_contract.SchemaCompatibilityError:
+                self._send_json(503, {"error": "schema incompatible"})
+                return
+            except (_db.ActionQError, ValueError, json.JSONDecodeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except Exception as exc:
+                print(f"session completion ingest error: {exc}", file=sys.stderr, flush=True)
+                self._send_json(500, {"error": "internal server error"})
+                return
+            self._send_json(200, result)
             return
 
         contract_header = self.headers.get("x-actionq-dispatch-contract", "")
