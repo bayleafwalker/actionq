@@ -242,7 +242,8 @@ def test_scope_iterate_claims_exact_target_branch_and_settles_verified_commit(tm
     assert claim.calls[0][4] == "agent/scope-iterate/142"
     assert len(claim.release_calls) == 1
     assert client.completed
-    assert "branch=agent/scope-iterate/142" in client.completed[0][1]
+    assert client.settled[0][1]["terminal_status"] == "completed"
+    assert client.settled[0][1]["attempt_id"] == client.events[0][3]["session_id"]
     event_types = [event[0] for event in client.events]
     assert event_types.index("settlement.sprint_claim_released") < len(event_types)
 
@@ -276,7 +277,7 @@ def test_scope_iterate_rejects_context_target_mismatch_before_claim(tmp_path: Pa
     assert daemon.run_once() is True
     assert claim.calls == []
     assert client.completed == []
-    assert "exact target item 5 was not found" in client.failed[0][1]
+    assert client.failed[0][1] == "start-failed"
 
 
 def test_non_explicit_candidates_are_advisory_only_no_claim(tmp_path: Path):
@@ -351,7 +352,7 @@ def test_claim_acquisition_failure_fails_closed_before_child_starts(tmp_path: Pa
     assert len(claim.calls) == 1
     assert "session.started" not in [event[0] for event in client.events]
     assert client.failed and client.failed[0][0] == 44
-    assert "context claim acquisition failed before session start" in client.failed[0][1]
+    assert client.failed[0][1] == "start-failed"
     assert not client.completed
     assert daemon._child is None
     assert client.events[0][3]["context_claim"]["status"] == "failed"
@@ -374,7 +375,7 @@ def test_claim_without_opaque_proof_fails_closed_before_child_starts(tmp_path: P
 
     assert daemon.run_once() is True
     assert "session.started" not in [event[0] for event in client.events]
-    assert client.failed and "opaque token" in client.failed[0][1]
+    assert client.failed and client.failed[0][1] == "start-failed"
 
 
 def test_supervision_renews_sprint_claim_without_emitting_its_proof(tmp_path: Path):
@@ -436,7 +437,7 @@ def test_sprint_claim_release_failure_journals_and_fails_queue_settlement(tmp_pa
     assert daemon.run_once() is True
     assert claim.release_calls
     assert not client.completed
-    assert client.failed and "sprint claim release failed" in client.failed[0][1]
+    assert client.failed and client.failed[0][1] == "settlement-failed"
     event_types = [event[0] for event in client.events]
     assert "settlement.pending" in event_types
     assert "settlement.sprint_claim_release_failed" in event_types

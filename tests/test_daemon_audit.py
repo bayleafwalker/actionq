@@ -103,14 +103,24 @@ def _arg(call: list[str], name: str) -> str | None:
 class FakeClient:
     def __init__(self, action=None):
         self.action = action
+        self.attempt_id = None
         self.events = []
         self.completed = []
         self.failed = []
+        self.settled = []
 
     def claim(self, worker, timeout_minutes):
         action, self.action = self.action, None
-        return {**action, "claim_receipt": action.get("claim_receipt", "test-receipt"),
-                "runner_auth_token": action.get("runner_auth_token", "test-runner-auth")} if action else None
+        result = ({**action, "claim_receipt": action.get("claim_receipt", "test-receipt"),
+                "runner_auth_token": action.get("runner_auth_token", "test-runner-auth"),
+                "attempt_id": action.get("attempt_id", "aqs:test"),
+                "claim_attempt_id": action.get(
+                    "claim_attempt_id", action.get("attempt_id", "aqs:test")
+                )}
+                if action else None)
+        if result is not None:
+            self.attempt_id = result["attempt_id"]
+        return result
 
     def renew(self, action_id, *, worker, timeout_minutes, claim_receipt):
         assert claim_receipt == "test-receipt"
@@ -118,11 +128,19 @@ class FakeClient:
     def emit(self, event_type, *, action_id, actor, payload):
         self.events.append((event_type, action_id, actor, payload))
 
-    def complete(self, action_id, *, result_ref, actor, claim_receipt):
-        self.completed.append((action_id, result_ref, actor))
+    def settle(self, action_id, *, result, actor, claim_receipt):
+        assert result["attempt_id"] == self.attempt_id
+        self.settled.append((action_id, result, actor, claim_receipt))
+        if result["terminal_status"] in {"completed", "no_change"}:
+            self.completed.append((action_id, result["result_ref"], actor))
+        else:
+            self.failed.append((action_id, result["stop_reason"], actor))
 
-    def fail(self, action_id, *, reason, actor, claim_receipt):
-        self.failed.append((action_id, reason, actor))
+    def complete(self, *_args, **_kwargs):
+        raise AssertionError("legacy complete must not be used by the daemon")
+
+    def fail(self, *_args, **_kwargs):
+        raise AssertionError("legacy fail must not be used by the daemon")
 
 
 def _daemon(tmp_path: Path, fake_bin: Path, *, action, log_path: Path, **audit_overrides) -> tuple[Daemon, FakeClient]:

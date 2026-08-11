@@ -12,6 +12,7 @@ CANDIDATE_V1 = "candidate/v1"
 EXECUTION_V1 = "execution/v1"
 VERIFICATION_V1 = "verification/v1"
 PUBLICATION_V1 = "publication/v1"
+DISPATCH_RESULT_V1 = "dispatch-result/v1"
 RUNNER_AUTH_V1 = "runner-auth/v1"
 ACTION_CREATION_REQUEST_V1 = "action-creation-request/v1"
 VERIFICATION_PROFILE_V1 = "verification-profile/v1"
@@ -28,11 +29,20 @@ SUPPORTED_CONTRACT_IDS = frozenset({
     CANDIDATE_VERIFICATION_SPEC_V1, CANDIDATE_VERIFICATION_RESULT_V1,
     CANDIDATE_INTEGRATION_SPEC_V1, CANDIDATE_INTEGRATION_RESULT_V1,
     CANDIDATE_REVIEW_SPEC_V1, CANDIDATE_REVIEW_RESULT_V1,
+    DISPATCH_RESULT_V1,
 })
 
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _ARTIFACT = re.compile(r"artifact:sha256:[0-9a-f]{64}\Z")
 _GIT_OID = re.compile(r"[0-9a-f]{40,64}\Z")
+_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+DISPATCH_TERMINAL_STATUSES = frozenset({
+    "blocked", "budget_exhausted", "completed", "failed", "no_change",
+})
+DISPATCH_STOP_REASONS = frozenset({
+    "cancelled", "claim-lost", "crash-inferred", "process-exit", "settlement-failed",
+    "start-failed", "timeout", "usage-limit", "verification-failed",
+})
 _FORBIDDEN_FIELD = re.compile(
     r"(?:claim_?(?:token|receipt)|receipt|credential|secret|password|token|"
     r"local_?path|worktree|remote|prompt|transcript|raw_?log|approval|"
@@ -121,6 +131,29 @@ class Publication:
 
 
 @dataclass(frozen=True)
+class DispatchResult:
+    """The one worker result that may authorize a verified terminal settle.
+
+    The result is intentionally an artifact reference, rather than an inline
+    worker payload.  Both success and failure carry the same immutable result
+    bytes; only the terminal status and stop reason differ. ActionQ validates the
+    binding and owns the terminal transition, but does not interpret the
+    artifact's action-specific contents.
+    """
+
+    action_id: int
+    attempt_id: str
+    terminal_status: str
+    result_ref: str
+    result_digest: str
+    stop_reason: str | None = None
+    contract_id: str = DISPATCH_RESULT_V1
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RunnerAuth:
     runner_id: str
     operation: str
@@ -140,6 +173,7 @@ _REQUIRED_FIELDS = {
     EXECUTION_V1: frozenset(Execution.__dataclass_fields__),
     VERIFICATION_V1: frozenset(Verification.__dataclass_fields__),
     PUBLICATION_V1: frozenset(Publication.__dataclass_fields__),
+    DISPATCH_RESULT_V1: frozenset(DispatchResult.__dataclass_fields__),
     RUNNER_AUTH_V1: frozenset(RunnerAuth.__dataclass_fields__),
     EXECUTION_ENVELOPE_V1: frozenset(ExecutionEnvelope.__dataclass_fields__),
 }
@@ -241,7 +275,30 @@ def require_compatible(value: dict[str, Any]) -> str:
                 raise ValueError("allowed paths must be relative and traversal-free")
     if contract_id == VERIFICATION_V1 and value["outcome"] not in {"passed", "failed", "skipped"}:
         raise ValueError("verification outcome is invalid")
+    if contract_id == DISPATCH_RESULT_V1:
+        _require_dispatch_result_v1(value)
     return str(contract_id)
+
+
+def _require_dispatch_result_v1(value: dict[str, Any]) -> None:
+    """Validate the fail-closed, result-bearing settlement packet."""
+
+    _deny_forbidden(value)
+    if isinstance(value["action_id"], bool):
+        raise ValueError("action_id must be a positive integer")
+    if not isinstance(value["attempt_id"], str) or not _ATTEMPT_ID_RE.fullmatch(value["attempt_id"]):
+        raise ValueError("attempt_id is invalid")
+    if value["terminal_status"] not in DISPATCH_TERMINAL_STATUSES:
+        raise ValueError("dispatch result terminal_status is invalid")
+    _artifact_binding(value, "result_ref", "result_digest")
+    stop_reason = value["stop_reason"]
+    if stop_reason is not None and stop_reason not in DISPATCH_STOP_REASONS:
+        raise ValueError("stop_reason is not an allowed privacy-safe reason")
+    successful = value["terminal_status"] in {"completed", "no_change"}
+    if successful and stop_reason is not None:
+        raise ValueError("successful dispatch results must not contain stop_reason")
+    if not successful and stop_reason is None:
+        raise ValueError("non-successful dispatch results require stop_reason")
 
 
 def artifact_digest(reference: str) -> str:

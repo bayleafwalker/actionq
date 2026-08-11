@@ -248,10 +248,10 @@ def test_publication_registration_and_cancellation_serialize_on_action_row(
 
 
 @pytest.mark.parametrize("journal_state", ("incomplete", "complete-unregistered"))
-def test_reclaimed_claim_resumes_registers_and_settles_real_postgres(
+def test_reclaimed_claim_does_not_adopt_old_publication_real_postgres(
     signed_runner_proof, journal_state,
 ):
-    """Durable journal + ActionQ history suffice; no prior daemon state or packet."""
+    """A publication frozen by an old claim is not adoptable by a replacement."""
     schema = _schema()
     action, old_claim = _publication_fixture(schema)
     attempt_id = "attempt-crashed"
@@ -291,12 +291,12 @@ def test_reclaimed_claim_resumes_registers_and_settles_real_postgres(
                 )},
             )
 
-        def complete(self, action_id, *, result_ref, actor, claim_receipt):
+        def settle(self, action_id, *, result, actor, claim_receipt):
             proof = signed_runner_proof(
-                actor, "execution.action.complete", f"action:{action_id}",
+                actor, "execution.action.settle", f"action:{action_id}",
             )
-            app.complete(action_id=action_id, result_ref=result_ref, actor=None,
-                         claim_receipt=claim_receipt, runner_proof=proof)
+            app.settle(action_id=action_id, result=result, actor=None,
+                       claim_receipt=claim_receipt, runner_proof=proof)
 
         def emit(self, event_type, *, action_id, actor, payload):
             app.emit_event(event_type=event_type, action_id=action_id,
@@ -328,10 +328,10 @@ def test_reclaimed_claim_resumes_registers_and_settles_real_postgres(
         LiveClient(),
     )
     claimed_action = {**replacement, "action_type": "scope-iterate"}
-    assert daemon._resume_and_settle_interrupted_publication(claimed_action) is True
+    assert daemon._resume_and_settle_interrupted_publication(claimed_action) is False
     with db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"]) as conn:
         current = db.get_action(conn, schema, action["id"])
         events = db.action_events(conn, schema, action["id"])
-    assert current["status"] == "completed" and current["result_ref"] == journal_ref
-    assert [event["event_type"] for event in events].count("publication.registered") == 1
+    assert current["status"] == "claimed" and current["result_ref"] is None
+    assert [event["event_type"] for event in events].count("publication.registered") == 0
     assert old_claim["claim_receipt"] != replacement["claim_receipt"]

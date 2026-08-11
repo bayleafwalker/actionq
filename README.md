@@ -41,6 +41,7 @@ uv sync --extra dev
 | --- | --- | --- | --- |
 | `ACTIONQ_URL` | Yes | None | Postgres connection string used by `actionctl`; deployment migration Jobs and runtime processes use separate role-specific values. |
 | `ACTIONQ_SCHEMA` | No | `actionq` | Schema name for queue tables and events. |
+| `ACTIONQ_ARTIFACT_ROOT` | Required for verified settlement | None | Server-owned, owner-only durable CAS root used to verify dispatch-result referents before terminal mutation. |
 | `ACTIONQ_RUNTIME_ROLE` | Migration Job | None | Simple PostgreSQL role name that `actionctl migrate` grants queue DML, sequence use, and migration-ledger read access. It never grants schema `CREATE` or ledger writes. |
 | `ACTIONQ_MAX_CHAIN_DEPTH` | No | `3` | Maximum allowed parent-child depth for enqueued actions. |
 | `ACTIONQ_RATE_LIMIT_PER_HOUR` | No | `20` | Hourly enqueue cap for `agent:` and `script:` producers. |
@@ -85,6 +86,12 @@ actionctl check-compatibility
 
 Normal commands and `actionq-server` fail closed when this check is not
 compatible. They never apply migrations as a startup side effect.
+
+Verified `settle` also requires `ACTIONQ_ARTIFACT_ROOT` (or an explicitly
+configured application root). The root is server-owned durable storage; the
+runner may write result bytes there, but a caller-supplied root is never
+trusted. Missing or corrupt result referents leave the ActionQ row, claim, and
+events unchanged.
 
 Enqueue one action:
 

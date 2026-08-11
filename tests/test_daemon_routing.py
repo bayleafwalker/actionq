@@ -185,7 +185,7 @@ def test_routing_error_rejects_before_any_child_or_lifecycle_event(tmp_path: Pat
     assert not (tmp_path / "capture.json").exists()
     assert client.events == []
     assert client.failed[0][0] == 41
-    assert client.failed[0][1].startswith("harness-routing:")
+    assert client.failed[0][1] == "start-failed"
 
 
 def test_spark_limit_writes_same_provider_luna_redispatch_handoff(tmp_path: Path):
@@ -206,7 +206,7 @@ def test_spark_limit_writes_same_provider_luna_redispatch_handoff(tmp_path: Path
     assert "redispatch_harness: codex" in handoff
     assert "redispatch_provider: codex" in handoff
     assert "redispatch_model: gpt-luna" in handoff
-    assert client.failed[0][1].startswith("usage-limit-paused:")
+    assert client.failed[0][1] == "usage-limit"
     completion = CompletionOutbox(
         daemon.config.session_state_path.parent / "completion-outbox.sqlite3"
     ).pending()[0]["payload"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+from pathlib import Path
 import re
 import secrets
 import time
@@ -12,7 +13,7 @@ from typing import Any
 
 from actionq_contracts import (
     ACTION_CREATION_REQUEST_V1,
-    EXECUTION_ENVELOPE_V1, canonical_bytes as contract_canonical_bytes,
+    DISPATCH_RESULT_V1, EXECUTION_ENVELOPE_V1, canonical_bytes as contract_canonical_bytes,
     require_compatible as require_contract_compatible, sha256_digest as contract_digest,
 )
 
@@ -1274,9 +1275,10 @@ def claim(
                         f"""UPDATE {qname(schema, 'actions')}
                             SET status='claimed', claimed_at=now(), claimed_by=%s,
                                 claim_deadline=now() + (%s * interval '1 minute'),
-                                claim_receipt=%s, runner_auth_digest=%s
+                                claim_receipt=%s, claim_attempt_id=%s, runner_auth_digest=%s
                             WHERE id=%s AND status='pending' RETURNING *""",
-                        (worker, timeout_minutes, str(uuid.uuid4()), receipt_digest(runner_auth_token), candidate["id"]),
+                        (worker, timeout_minutes, str(uuid.uuid4()), f"aqs:{uuid.uuid4()}",
+                         receipt_digest(runner_auth_token), candidate["id"]),
                     ).fetchone()
                     if row is None:
                         raise SkipClaimCandidate
@@ -1300,12 +1302,17 @@ def claim(
                     "claimed_by": worker,
                     "claim_deadline": json_default(row["claim_deadline"]),
                     "claim_receipt_digest": receipt_digest(row["claim_receipt"]),
+                    "attempt_id": row["claim_attempt_id"],
                 },
                 provenance,
             ),
         )
     result = dict(row)
     result["runner_auth_token"] = runner_auth_token
+    # The storage column is deliberately internal; the public claim contract
+    # names the ActionQ-minted incarnation ``attempt_id``.  Keep both fields
+    # in the claim response so consumers can assert the binding explicitly.
+    result["attempt_id"] = result["claim_attempt_id"]
     if selected is not None and selected["group_id"] is not None:
         result["execution_group_id"] = str(selected["group_id"])
         result["execution_envelope_digest"] = selected["envelope_digest"]
@@ -1477,6 +1484,7 @@ def renew(
                         "new_deadline": json_default(row["claim_deadline"]),
                         "requested_timeout_minutes": timeout_minutes,
                         "claim_receipt_digest": receipt_digest(claim_receipt),
+                        "attempt_id": row.get("claim_attempt_id"),
                     },
                     provenance,
                 ),
@@ -1508,12 +1516,22 @@ def _transition_terminal(
     payload: dict[str, Any] | None = None,
     allowed_statuses: tuple[str, ...] = ("claimed",),
     provenance: dict[str, Any] | None = None,
+    claim_attempt_id: str | None = None,
 ) -> dict:
     allowed_sql = ", ".join(f"'{status}'" for status in allowed_statuses)
     runner_auth_clear = (
         "" if _runtime_schema_version(conn, schema) == 3
         else ", runner_auth_digest = NULL"
     )
+    claim_attempt_clear = (
+        "" if _runtime_schema_version(conn, schema) == 3
+        else ", claim_attempt_id = NULL"
+    )
+    attempt_predicate = ""
+    attempt_params: tuple[Any, ...] = ()
+    if claim_attempt_id is not None:
+        attempt_predicate = " AND claim_attempt_id = %s"
+        attempt_params = (claim_attempt_id,)
     with conn.transaction():
         row = conn.execute(
             f"""
@@ -1525,14 +1543,16 @@ def _transition_terminal(
                 claimed_at = NULL, claimed_by = NULL, claim_deadline = NULL,
                 claim_receipt = NULL
                 {runner_auth_clear}
+                {claim_attempt_clear}
             WHERE id = %s
               AND status IN ({allowed_sql})
               AND claimed_by = %s
               AND claim_receipt = %s
               AND claim_deadline > now()
+              {attempt_predicate}
             RETURNING *
             """,
-            (status, result_ref, failure_reason, action_id, worker, claim_receipt),
+            (status, result_ref, failure_reason, action_id, worker, claim_receipt, *attempt_params),
         ).fetchone()
         if row is None:
             raise ActionQError(f"Action #{action_id} cannot transition to {status}")
@@ -1629,6 +1649,109 @@ def reject(
     )
 
 
+def settle_dispatch_result(
+    conn,
+    schema: str,
+    *,
+    action_id: int,
+    result: dict[str, Any],
+    actor: str | None = None,
+    worker: str,
+    claim_receipt: str,
+    provenance: dict[str, Any] | None = None,
+    artifact_root: str | os.PathLike[str] | None = None,
+    _artifact_store: Any | None = None,
+) -> dict:
+    """Atomically settle one claimed action from a verified result packet.
+
+    The packet is the worker/controller boundary. ActionQ validates its
+    immutable shape and proves the result referent exists and hashes to the
+    server-owned CAS locator; action-specific artifact contents remain outside
+    queue storage. The claim receipt and live lease still fence the actual
+    terminal write.
+    """
+
+    result_ref = validate_dispatch_result(result, action_id=action_id)
+    _verify_dispatch_result_referent(
+        result_ref,
+        artifact_root=artifact_root,
+        artifact_store=_artifact_store,
+    )
+    terminal_status = result["terminal_status"]
+    completed = terminal_status in {"completed", "no_change"}
+    status = "completed" if completed else "failed"
+    event_type = "action_completed" if completed else "action_failed"
+    payload = {
+        "contract_id": DISPATCH_RESULT_V1,
+        "attempt_id": result["attempt_id"],
+        "terminal_status": terminal_status,
+        "result_ref": result_ref,
+        "result_digest": result["result_digest"],
+        "stop_reason": result["stop_reason"],
+    }
+    return _transition_terminal(
+        conn,
+        schema,
+        action_id=action_id,
+        status=status,
+        event_type=event_type,
+        actor=actor,
+        worker=worker,
+        claim_receipt=claim_receipt,
+        result_ref=result_ref,
+        failure_reason=result["stop_reason"],
+        payload=payload,
+        allowed_statuses=("claimed",),
+        provenance=provenance,
+        claim_attempt_id=result["attempt_id"],
+    )
+
+
+def validate_dispatch_result(result: dict[str, Any], *, action_id: int) -> str:
+    """Validate packet shape and return its immutable result reference."""
+
+    if not isinstance(result, dict):
+        raise ActionQError("invalid dispatch result: packet must be an object")
+    try:
+        contract = require_contract_compatible(result)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ActionQError(f"invalid dispatch result: {exc}") from exc
+    if contract != DISPATCH_RESULT_V1:
+        raise ActionQError("terminal settlement requires dispatch-result/v1")
+    if int(result["action_id"]) != action_id:
+        raise ActionQError("dispatch result action_id does not match settlement action")
+    return str(result["result_ref"])
+
+
+def _verify_dispatch_result_referent(
+    result_ref: str,
+    *,
+    artifact_root: str | os.PathLike[str] | None = None,
+    artifact_store: Any | None = None,
+) -> None:
+    """Prove the result locator resolves to owner-controlled, intact bytes.
+
+    This check deliberately happens before ``_transition_terminal``.  A
+    packet with a valid locator syntax is not sufficient authority to create a
+    terminal state or event.
+    """
+
+    if artifact_store is None:
+        configured_root = artifact_root or os.environ.get("ACTIONQ_ARTIFACT_ROOT")
+        if not configured_root:
+            raise ActionQError("verified settlement requires a configured durable artifact_root")
+        try:
+            from .cas import _DaemonCAS
+
+            artifact_store = _DaemonCAS(Path(configured_root))
+        except Exception as exc:  # noqa: BLE001 - an invalid root fails closed
+            raise ActionQError("verified settlement requires a valid durable artifact_root") from exc
+    try:
+        artifact_store.get(result_ref)
+    except Exception as exc:  # noqa: BLE001 - missing/corrupt bytes fail closed
+        raise ActionQError("dispatch result referent is not durable") from exc
+
+
 def cancel(
     conn,
     schema: str,
@@ -1679,7 +1802,7 @@ def cancel(
                     cancel_stop_deadline=now() + interval '30 seconds', stop_acknowledged=false,
                     cancel_former_claimed_by=%s, cancel_former_receipt_digest=%s,
                     cancel_runner_auth_digest=runner_auth_digest,
-                    claim_receipt=NULL, claim_deadline=NULL, runner_auth_digest=NULL
+                    claim_receipt=NULL, claim_attempt_id=NULL, claim_deadline=NULL, runner_auth_digest=NULL
                     WHERE id=%s RETURNING *""",
                 (request_id, row["claimed_by"], receipt_digest(row["claim_receipt"] or ""), action_id),
             ).fetchone()
@@ -1724,7 +1847,7 @@ def acknowledge_cancellation(
             f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
                 stop_acknowledged=true, claimed_at=NULL, claimed_by=NULL,
                 cancel_terminal_kind='stop-acknowledged',
-                claim_deadline=NULL, claim_receipt=NULL
+                claim_deadline=NULL, claim_receipt=NULL, claim_attempt_id=NULL
                 WHERE id=%s RETURNING *""", (action_id,)
         ).fetchone()
         insert_event(conn, schema, action_id=action_id, event_type="action_cancelled",
@@ -1741,7 +1864,7 @@ def reap_cancellations(conn, schema: str, *, actor: str = "actionctl:cancel-reap
             f"""UPDATE {qname(schema, 'actions')} SET status='cancelled', completed_at=now(),
                 stop_acknowledged=false, claimed_at=NULL, claimed_by=NULL,
                 cancel_terminal_kind='stop-unacknowledged-timeout',
-                claim_deadline=NULL, claim_receipt=NULL
+                claim_deadline=NULL, claim_receipt=NULL, claim_attempt_id=NULL
                 WHERE status='cancelling' AND cancel_stop_deadline < now()
                 RETURNING *"""
         ).fetchall()
@@ -1764,6 +1887,10 @@ def sweep(
         "" if _runtime_schema_version(conn, schema) == 3
         else ", runner_auth_digest = NULL"
     )
+    claim_attempt_clear = (
+        "" if _runtime_schema_version(conn, schema) == 3
+        else ", claim_attempt_id = NULL"
+    )
     with conn.transaction():
         rows = conn.execute(
             f"""
@@ -1783,6 +1910,7 @@ def sweep(
                     claimed_by = NULL,
                     claim_deadline = NULL
                     , claim_receipt = NULL
+                    {claim_attempt_clear}
                     {runner_auth_clear}
                 WHERE id = %s
                 RETURNING *

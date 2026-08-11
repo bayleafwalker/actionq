@@ -26,10 +26,11 @@ import uuid
 from typing import Any, Callable, Protocol, Sequence
 
 from actionq_contracts import (
-    EXECUTION_ENVELOPE_V1, EXECUTION_V1, Execution, ExecutionEnvelope,
-    require_compatible, sha256_digest,
+    DISPATCH_RESULT_V1, DISPATCH_STOP_REASONS, EXECUTION_ENVELOPE_V1, EXECUTION_V1,
+    Execution, ExecutionEnvelope,
+    artifact_digest,
+    canonical_bytes, require_compatible, sha256_digest,
 )
-
 from .git_evidence import collect_git_evidence_bounded, git_state_at_start
 from .completion_outbox import CompletionOutbox, DEFAULT_OUTBOX_PATH
 from .schema import MAX_SCHEMA_VERSION
@@ -54,6 +55,7 @@ from .scope_iterate import (
     load_policy,
 )
 from .usage_limit import classify_usage_limit, write_handoff
+from .cas import _DaemonCAS, artifact_ref as _artifact_ref, fsync_directory as _fsync_directory
 
 
 def _now() -> str:
@@ -122,9 +124,10 @@ class DaemonConfig:
     runner_private_key_path: Path = Path("~/.local/state/actionq/runner-identity.pem")
     runner_id: str = "runner:devbox"
     enforce_worker_isolation: bool = True
-    # Explicit durable #2032 CAS root.  None preserves legacy runners that do
-    # not produce immutable candidates; scope-iterate publication is enabled
-    # only when an operator provisions this owner-controlled path.
+    # Explicit durable CAS root for both runner publications and the
+    # privacy-minimal dispatch-result artifacts used by terminal settlement.
+    # A missing or invalid root is fail-closed: the daemon must not settle a
+    # result whose immutable referent cannot be proven to exist.
     artifact_root: Path | None = None
     takeup: TakeupConfig = TakeupConfig()
     audit: AuditConfig = AuditConfig()
@@ -231,10 +234,9 @@ class CoordinatorClient(Protocol):
     def claim(self, worker: str, timeout_minutes: int) -> dict[str, Any] | None: ...
     def renew(self, action_id: int, *, worker: str, timeout_minutes: int, claim_receipt: str) -> None: ...
     def emit(self, event_type: str, *, action_id: int | None, actor: str, payload: dict[str, Any]) -> None: ...
-    def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None: ...
+    def settle(self, action_id: int, *, result: dict[str, Any], actor: str, claim_receipt: str) -> None: ...
     def register_publication(self, action_id: int, *, publication: dict[str, Any],
                              actor: str, claim_receipt: str) -> dict[str, Any]: ...
-    def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None: ...
     def show(self, action_id: int) -> dict[str, Any]: ...
     def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
                                  former_claim_receipt: str, runner_auth_token: str) -> None: ...
@@ -294,17 +296,23 @@ class AuditClient(Protocol):
 
 class ActionctlClient:
     def __init__(self, executable: str, *, runnerctl: str = "actionq-runner",
-                 runner_private_key_path: Path | None = None):
+                 runner_private_key_path: Path | None = None,
+                 artifact_root: Path | None = None):
         self.executable = executable
         self.runnerctl = runnerctl
+        self.artifact_root = artifact_root
         configured_key = os.environ.get("ACTIONQ_RUNNER_PRIVATE_KEY")
         self.runner_private_key_path = runner_private_key_path or (Path(configured_key) if configured_key else None)
         self.runner_id: str | None = None
         self._daemon_schema_checked = False
 
     def _run(self, *args: str, allow_empty: bool = False, input_text: str | None = None) -> dict[str, Any] | None:
+        environment = os.environ.copy()
+        if self.artifact_root is not None:
+            environment["ACTIONQ_ARTIFACT_ROOT"] = str(self.artifact_root)
         completed = subprocess.run(
-            [self.executable, *args], text=True, input=input_text, capture_output=True, check=False
+            [self.executable, *args], text=True, input=input_text, capture_output=True,
+            check=False, env=environment,
         )
         if allow_empty and completed.returncode == 2:
             return None
@@ -359,10 +367,12 @@ class ActionctlClient:
             args.extend(["--action", str(action_id)])
         self._run(*args)
 
-    def complete(self, action_id: int, *, result_ref: str, actor: str, claim_receipt: str) -> None:
-        proof = self._proof(runner_id=actor, operation="execution.action.complete", resource=f"action:{action_id}")
-        self._run("complete", str(action_id), "--result", result_ref, "--proof-stdin",
-                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
+    def settle(self, action_id: int, *, result: dict[str, Any], actor: str, claim_receipt: str) -> None:
+        proof = self._proof(runner_id=actor, operation="execution.action.settle", resource=f"action:{action_id}")
+        self._run(
+            "settle", str(action_id), "--packet-stdin",
+            input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof, "result": result}),
+        )
 
     def register_publication(self, action_id: int, *, publication: dict[str, Any],
                              actor: str, claim_receipt: str) -> dict[str, Any]:
@@ -384,11 +394,6 @@ class ActionctlClient:
         )
         assert result is not None
         return result
-
-    def fail(self, action_id: int, *, reason: str, actor: str, claim_receipt: str) -> None:
-        proof = self._proof(runner_id=actor, operation="execution.action.fail", resource=f"action:{action_id}")
-        self._run("fail", str(action_id), "--reason", reason, "--proof-stdin",
-                  input_text=json.dumps({"claim_receipt": claim_receipt, "runner_proof": proof}))
 
     def acknowledge_cancellation(self, action_id: int, *, cancel_request_id: str,
                                  former_claim_receipt: str, runner_auth_token: str) -> None:
@@ -996,6 +1001,7 @@ class Daemon:
         action = self.client.claim(self.config.runner_id, self.config.default_timeout_minutes)
         if action is None:
             return False
+        self._require_verified_settlement(action)
         if self._resume_and_settle_interrupted_publication(action):
             return True
         if self._settle_recovered_publication(action):
@@ -1016,6 +1022,117 @@ class Daemon:
     def _publication_policy(self, action: dict[str, Any]) -> ActionConfig | None:
         policy = self.actions.get(str(action.get("action_type") or ""))
         return policy if policy is not None and policy.publish_candidate else None
+
+    @staticmethod
+    def _claim_attempt(action: dict[str, Any]) -> str:
+        """Return only the attempt identity ActionQ minted with this claim."""
+        attempt_id = action.get("attempt_id")
+        claim_attempt_id = action.get("claim_attempt_id")
+        if not isinstance(claim_attempt_id, str) or not claim_attempt_id:
+            raise RuntimeError("ActionQ claim did not include its claim_attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise RuntimeError("ActionQ claim did not include its attempt_id")
+        if claim_attempt_id != attempt_id:
+            raise RuntimeError("ActionQ claim attempt identities disagree")
+        return claim_attempt_id
+
+    def _require_verified_settlement(self, action: dict[str, Any]) -> str:
+        if not callable(getattr(self.client, "settle", None)):
+            raise RuntimeError("verified dispatch settlement is unavailable")
+        return self._claim_attempt(action)
+
+    @staticmethod
+    def _result_artifact_bytes(
+        *, action_id: int, attempt_id: str, terminal_status: str, stop_reason: str | None,
+    ) -> bytes:
+        """Serialize only the privacy-safe metadata for one dispatch result.
+
+        Action-specific output and prose remain in their existing private
+        evidence channels; neither is copied into the durable result object.
+        """
+        return canonical_bytes(
+            {
+                "contract_id": DISPATCH_RESULT_V1,
+                "action_id": action_id,
+                "attempt_id": attempt_id,
+                "terminal_status": terminal_status,
+                "stop_reason": stop_reason,
+            }
+        )
+
+    def _cas(self) -> _DaemonCAS:
+        root = self.config.artifact_root
+        if root is None:
+            raise RuntimeError(
+                "verified dispatch settlement requires a provisioned durable artifact_root"
+            )
+        try:
+            return _DaemonCAS(root)
+        except Exception as exc:  # noqa: BLE001 - invalid durability must fail closed
+            raise RuntimeError(
+                "verified dispatch settlement requires a valid durable artifact_root"
+            ) from exc
+
+    @staticmethod
+    def _verify_cas_bytes(store: _DaemonCAS, result_ref: str, expected: bytes | None = None) -> None:
+        try:
+            actual = store.get(result_ref)
+        except Exception as exc:  # noqa: BLE001 - an unresolvable referent cannot settle
+            raise RuntimeError("verified dispatch result referent is not durable") from exc
+        if expected is not None and actual != expected:
+            raise RuntimeError("verified dispatch result referent bytes changed")
+        if _artifact_ref(actual) != result_ref:
+            raise RuntimeError("verified dispatch result referent digest does not match")
+
+    def _put_result_artifact(self, material: bytes) -> str:
+        store = self._cas()
+        try:
+            result_ref = store.put(material)
+        except Exception as exc:  # noqa: BLE001 - do not settle after a failed CAS write
+            raise RuntimeError("verified dispatch result artifact could not be durably stored") from exc
+        self._verify_cas_bytes(store, result_ref, material)
+        return result_ref
+
+    def _verify_result_ref(self, result_ref: str) -> str:
+        store = self._cas()
+        self._verify_cas_bytes(store, result_ref)
+        return result_ref
+
+    def _settle_result(
+        self, action: dict[str, Any], *, claim_receipt: str, terminal_status: str,
+        result_ref: str | None = None, stop_reason: str | None = None,
+    ) -> None:
+        attempt_id = self._require_verified_settlement(action)
+        if terminal_status not in {"completed", "no_change", "blocked", "failed", "budget_exhausted"}:
+            raise RuntimeError(f"unsupported dispatch terminal status: {terminal_status}")
+        if stop_reason is not None and stop_reason not in DISPATCH_STOP_REASONS:
+            raise RuntimeError(f"unsupported dispatch stop reason: {stop_reason}")
+        successful = terminal_status in {"completed", "no_change"}
+        if successful and stop_reason is not None:
+            raise RuntimeError("successful dispatch settlement cannot contain a stop reason")
+        if not successful and stop_reason is None:
+            raise RuntimeError("non-successful dispatch settlement requires a stop reason")
+        if result_ref is None:
+            result_ref = self._put_result_artifact(self._result_artifact_bytes(
+                action_id=int(action["id"]), attempt_id=attempt_id,
+                terminal_status=terminal_status, stop_reason=stop_reason,
+            ))
+        else:
+            self._verify_result_ref(result_ref)
+        self.client.settle(
+            int(action["id"]),
+            result={
+                "contract_id": DISPATCH_RESULT_V1,
+                "action_id": int(action["id"]),
+                "attempt_id": attempt_id,
+                "terminal_status": terminal_status,
+                "result_ref": result_ref,
+                "result_digest": artifact_digest(result_ref),
+                "stop_reason": stop_reason,
+            },
+            actor=self.config.runner_id,
+            claim_receipt=claim_receipt,
+        )
 
     def _resume_interrupted_publication(
         self, action_id: int, action_type: str, attempt_id: str,
@@ -1044,6 +1161,7 @@ class Daemon:
         """Adopt only a previously frozen interrupted attempt under this live claim."""
         if self._publication_policy(action) is None:
             return False
+        claim_attempt_id = self._require_verified_settlement(action)
         if self.config.artifact_root is None:
             raise RuntimeError("publish_candidate requires a provisioned artifact_root")
         history = self.client.show(int(action["id"]))
@@ -1066,6 +1184,7 @@ class Daemon:
         interrupted = next(
             (value for value in attempts
              if (value.get("attempt_id"), value.get("source_commit")) in frozen
+             and value.get("attempt_id") == claim_attempt_id
              and (value.get("attempt_id"), value.get("journal_ref")) not in registered_attempts),
             None,
         )
@@ -1076,6 +1195,8 @@ class Daemon:
             command, "--artifact-root", str(self.config.artifact_root),
             "--action-id", str(action["id"]), "--attempt-id", str(interrupted["attempt_id"]),
         )
+        if publication is None or publication.get("attempt_id") != claim_attempt_id:
+            raise RuntimeError("recovered publication attempt is not the live ActionQ claim attempt")
         receipt = str(action.get("claim_receipt") or "")
         if not receipt:
             raise RuntimeError("publication recovery requires a live claim receipt")
@@ -1084,7 +1205,8 @@ class Daemon:
             claim_receipt=receipt,
         )
         self._complete_published(
-            int(action["id"]), claim_receipt=receipt, publication=publication,
+            int(action["id"]), claim_attempt_id=claim_attempt_id,
+            claim_receipt=receipt, publication=publication,
         )
         if hasattr(self.client, "reconcile_runner_spool"):
             self.client.reconcile_runner_spool(
@@ -1107,12 +1229,31 @@ class Daemon:
         })
 
     def _complete_published(
-        self, action_id: int, *, claim_receipt: str, publication: dict[str, Any],
+        self, action_id: int, *, claim_attempt_id: str,
+        claim_receipt: str, publication: dict[str, Any],
     ) -> None:
         result_ref = str(publication["journal_ref"])
+        if not callable(getattr(self.client, "settle", None)):
+            raise RuntimeError("verified dispatch settlement is unavailable")
+        if publication.get("attempt_id") != claim_attempt_id:
+            raise RuntimeError("publication attempt does not match the live ActionQ claim attempt")
+        # ``journal-recover`` verifies the publication receipt, but keep this
+        # boundary independently fail-closed: a terminal ActionQ event must
+        # never point at bytes that this daemon cannot read and re-hash from
+        # the provisioned CAS.
+        self._verify_result_ref(result_ref)
+        dispatch_result = {
+            "contract_id": DISPATCH_RESULT_V1,
+            "action_id": action_id,
+            "attempt_id": str(publication["attempt_id"]),
+            "terminal_status": "completed",
+            "result_ref": result_ref,
+            "result_digest": artifact_digest(result_ref),
+            "stop_reason": None,
+        }
         try:
-            self.client.complete(
-                action_id, result_ref=result_ref, actor=self.config.runner_id,
+            self.client.settle(
+                action_id, result=dispatch_result, actor=self.config.runner_id,
                 claim_receipt=claim_receipt,
             )
         except Exception:
@@ -1121,6 +1262,9 @@ class Daemon:
             completed = any(
                 event.get("event_type") == "action_completed"
                 and event.get("payload", {}).get("result_ref") == result_ref
+                and event.get("payload", {}).get("contract_id") == DISPATCH_RESULT_V1
+                and event.get("payload", {}).get("attempt_id") == dispatch_result["attempt_id"]
+                and event.get("payload", {}).get("result_digest") == dispatch_result["result_digest"]
                 for event in history.get("events", [])
             )
             if (current.get("status") != "completed"
@@ -1132,6 +1276,9 @@ class Daemon:
             completed = any(
                 event.get("event_type") == "action_completed"
                 and event.get("payload", {}).get("result_ref") == result_ref
+                and event.get("payload", {}).get("contract_id") == DISPATCH_RESULT_V1
+                and event.get("payload", {}).get("attempt_id") == dispatch_result["attempt_id"]
+                and event.get("payload", {}).get("result_digest") == dispatch_result["result_digest"]
                 for event in history.get("events", [])
             )
             if (current.get("status") != "completed"
@@ -1151,6 +1298,7 @@ class Daemon:
     def _settle_recovered_publication(self, action: dict[str, Any]) -> bool:
         if self._publication_policy(action) is None:
             return False
+        claim_attempt_id = self._require_verified_settlement(action)
         if self.config.artifact_root is None:
             raise RuntimeError("publish_candidate requires a provisioned artifact_root")
         publication = self._runnerctl_json(
@@ -1170,10 +1318,15 @@ class Daemon:
         )
         if not registered:
             return False
+        if publication.get("attempt_id") != claim_attempt_id:
+            return False
         receipt = str(action.get("claim_receipt") or "")
         if not receipt:
             raise RuntimeError("recovered publication settlement requires a live claim receipt")
-        self._complete_published(int(action["id"]), claim_receipt=receipt, publication=publication)
+        self._complete_published(
+            int(action["id"]), claim_attempt_id=claim_attempt_id,
+            claim_receipt=receipt, publication=publication,
+        )
         if hasattr(self.client, "reconcile_runner_spool"):
             self.client.reconcile_runner_spool(
                 int(action["id"]), attempt_id=str(publication["attempt_id"]),
@@ -1199,9 +1352,13 @@ class Daemon:
         history = self.client.show(action_id)
         current = history.get("action", {})
         result_ref = str(publication["journal_ref"])
+        self._verify_result_ref(result_ref)
         completed = any(
             event.get("event_type") == "action_completed"
             and event.get("payload", {}).get("result_ref") == result_ref
+            and event.get("payload", {}).get("contract_id") == DISPATCH_RESULT_V1
+            and event.get("payload", {}).get("attempt_id") == publication.get("attempt_id")
+            and event.get("payload", {}).get("result_digest") == artifact_digest(result_ref)
             for event in history.get("events", [])
         )
         if (current.get("status") != "completed"
@@ -1264,6 +1421,7 @@ class Daemon:
 
     def _run_action(self, action: dict[str, Any]) -> None:
         action_id = int(action["id"])
+        claim_attempt_id = self._require_verified_settlement(action)
         claim_receipt = str(action.get("claim_receipt") or "")
         runner_auth_token = str(action.get("runner_auth_token") or "")
         if not claim_receipt:
@@ -1273,20 +1431,14 @@ class Daemon:
         action_type = str(action["action_type"])
         action_config = self.actions.get(action_type)
         if action_config is None:
-            self.client.fail(action_id, reason=f"no daemon config for action type {action_type}", actor=self.config.runner_id, claim_receipt=claim_receipt)
+            self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
             return
         scope_runners = {"scope-iterate", "oci-scope-iterate"}
         if action_config.publish_candidate and action_config.runner not in scope_runners:
-            self.client.fail(
-                action_id, reason="publication-policy: immutable candidates require scope-iterate",
-                actor=self.config.runner_id, claim_receipt=claim_receipt,
-            )
+            self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
             return
         if action_config.publish_candidate and self.config.artifact_root is None:
-            self.client.fail(
-                action_id, reason="publication-policy: artifact_root is not provisioned",
-                actor=self.config.runner_id, claim_receipt=claim_receipt,
-            )
+            self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
             return
         project = self.projects.get(str(action.get("project") or ""))
         routing: RoutingResult | None = None
@@ -1337,7 +1489,7 @@ class Daemon:
                             worker_user=action_config.worker_user,
                         )
             except RoutingError as exc:
-                self.client.fail(action_id, reason=f"harness-routing: {exc}", actor=self.config.runner_id, claim_receipt=claim_receipt)
+                self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
                 return
         if action_config.runner == "oci-scope-iterate":
             try:
@@ -1357,10 +1509,12 @@ class Daemon:
                 if (action_config.timeout_minutes or self.config.default_timeout_minutes) > 30:
                     raise RoutingError("rootless OCI pilot timeout may not exceed 30 minutes")
             except RoutingError as exc:
-                self.client.fail(action_id, reason=f"oci-routing: {exc}", actor=self.config.runner_id,
-                                 claim_receipt=claim_receipt)
+                self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
                 return
-        session_id = f"aqs:{uuid.uuid4()}"
+        # The session identity is the ActionQ claim incarnation.  There is no
+        # local fallback: a daemon that cannot prove this binding must stop
+        # before emitting session state or starting a child.
+        session_id = claim_attempt_id
         ttl_seconds = (action_config.timeout_minutes or self.config.default_timeout_minutes) * 60
         payload = {
             "session_id": session_id, "runtime_session_id": session_id,
@@ -1410,10 +1564,7 @@ class Daemon:
                     action_config.scope_iterate,
                 )
             except Exception as exc:
-                self.client.fail(
-                    action_id, reason=f"scope-iterate preparation failed: {exc}",
-                    actor=self.config.runner_id, claim_receipt=claim_receipt,
-                )
+                self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
                 return
         claim_result = self._context_claim_acquire(
             project, context_result, session_id, ttl_seconds,
@@ -1424,11 +1575,7 @@ class Daemon:
                          payload={**payload, "audit_dispatch": audit_dispatch,
                                  "context": context_result, "context_claim": claim_result})
         if claim_result is not None and claim_result.get("status") == "failed":
-            self.client.fail(
-                action_id,
-                reason=f"context claim acquisition failed before session start: {claim_result['error']}",
-                actor=self.config.runner_id, claim_receipt=claim_receipt,
-            )
+            self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
             return
         # Best-effort starting git state for this project (#1115 crash-
         # recovery evidence). Never blocks dispatch: a project with no git
@@ -1529,8 +1676,10 @@ class Daemon:
                 # invisible to cockpit takeup from doing model work at all.
                 os.killpg(self._child.pid, signal.SIGTERM)
                 self._child.wait()
-                self.client.fail(action_id, reason=f"sprintctl takeup failed before session start: {exc}",
-                                 actor=self.config.runner_id, claim_receipt=claim_receipt)
+                self._settle_result(
+                    action, claim_receipt=claim_receipt, terminal_status="blocked",
+                    stop_reason="start-failed",
+                )
                 return
             self._write_state(record)
             audit_start = self._publish_audit(
@@ -1627,40 +1776,57 @@ class Daemon:
                 # The acknowledgement already performed the terminal mutation.
                 pass
             elif settlement_error is not None:
-                self.client.fail(action_id, reason=settlement_error, actor=self.config.runner_id, claim_receipt=claim_receipt)
+                self._settle_result(
+                    action, claim_receipt=claim_receipt, terminal_status="failed",
+                    stop_reason="settlement-failed",
+                )
             elif outcome == "completed":
                 if publication is not None:
                     self._complete_published(
-                        action_id, claim_receipt=claim_receipt, publication=publication,
+                        action_id, claim_attempt_id=claim_attempt_id,
+                        claim_receipt=claim_receipt, publication=publication,
                     )
                 else:
-                    self.client.complete(
-                        action_id,
-                        result_ref=(
-                            scope_result.result_ref if scope_result is not None
-                            else f"session={session_id}"
-                        ),
-                        actor=self.config.runner_id,
-                        claim_receipt=claim_receipt,
+                    self._settle_result(
+                        action, claim_receipt=claim_receipt,
+                        terminal_status=("no_change" if scope_result is not None and not scope_result.changed_paths else "completed"),
                     )
             else:
-                self.client.fail(
-                    action_id,
-                    reason=(
-                        session_failure_reason
-                        or usage_limit_reason
-                        or f"daemon session {outcome}"
+                self._settle_result(
+                    action, claim_receipt=claim_receipt,
+                    terminal_status=(
+                        "budget_exhausted" if usage_limit_reason is not None else "failed"
                     ),
-                    actor=self.config.runner_id,
-                    claim_receipt=claim_receipt,
+                    stop_reason=(
+                        "usage-limit" if usage_limit_reason is not None
+                        else "verification-failed" if session_failure_reason is not None
+                        else "crash-inferred" if outcome == "end-inferred"
+                        else "timeout" if outcome == "timed-out"
+                        else "process-exit"
+                    ),
                 )
             if outcome not in {"claim-lost"} and settlement_error is None and hasattr(self.client, "reconcile_runner_spool"):
                 self.client.reconcile_runner_spool(action_id, attempt_id=session_id)
             if (outcome == "completed" and settlement_error is None and publication is not None
                     and action_config.runner == "oci-scope-iterate" and prepared_scope is not None):
                 self._destroy_oci_workspace(action_id, session_id, prepared_scope)
-        except Exception as exc:
-            self.client.fail(action_id, reason=f"daemon failure: {exc}", actor=self.config.runner_id, claim_receipt=claim_receipt)
+        except Exception:
+            # A daemon exception is not permission to use a legacy terminal
+            # command.  Reconcile an already committed verified decision; if
+            # none exists, make one bounded coded settlement attempt. A
+            # missing capability or stale claim remains fail-closed.
+            try:
+                current = self.client.show(action_id).get("action", {})
+            except Exception:
+                current = {}
+            if current.get("status") not in {"completed", "failed", "rejected", "cancelled"}:
+                try:
+                    self._settle_result(
+                        action, claim_receipt=claim_receipt, terminal_status="failed",
+                        stop_reason="settlement-failed",
+                    )
+                except Exception:
+                    pass
             raise
         finally:
             self._sprint_claim_leases.pop(session_id, None)
@@ -2283,6 +2449,7 @@ def main(argv: list[str] | None = None) -> int:
     daemon = Daemon(config, actions, ActionctlClient(
         config.actionctl_bin, runnerctl=config.runnerctl_bin,
         runner_private_key_path=config.runner_private_key_path,
+        artifact_root=config.artifact_root,
     ), projects,
                     reload_config=lambda: load_config(config_path))
     signal.signal(signal.SIGTERM, daemon.request_shutdown)

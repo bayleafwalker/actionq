@@ -5,17 +5,17 @@ from .execution import (
     CANDIDATE_INTEGRATION_SPEC_V1, CANDIDATE_REVIEW_RESULT_V1,
     CANDIDATE_REVIEW_SPEC_V1, CANDIDATE_VERIFICATION_RESULT_V1,
     CANDIDATE_VERIFICATION_SPEC_V1,
-    CANDIDATE_V1, CLAIM_V1, EXECUTION_ENVELOPE_V1, EXECUTION_V1,
+    CANDIDATE_V1, CLAIM_V1, DISPATCH_RESULT_V1, DISPATCH_STOP_REASONS, DISPATCH_TERMINAL_STATUSES, EXECUTION_ENVELOPE_V1, EXECUTION_V1,
     PUBLICATION_V1, RUNNER_AUTH_V1, SUPPORTED_CONTRACT_IDS, VERIFICATION_PROFILE_V1, VERIFICATION_V1, Candidate, Claim,
-    ContractRecord, Execution, ExecutionEnvelope, Publication, RunnerAuth, Verification,
+    ContractRecord, DispatchResult, Execution, ExecutionEnvelope, Publication, RunnerAuth, Verification,
     artifact_digest, canonical_bytes, require_compatible, sha256_digest,
 )
 
 __all__ = [
     "ACTION_CREATION_REQUEST_V1", "CANDIDATE_INTEGRATION_RESULT_V1", "CANDIDATE_INTEGRATION_SPEC_V1",
     "CANDIDATE_REVIEW_RESULT_V1", "CANDIDATE_REVIEW_SPEC_V1", "CANDIDATE_VERIFICATION_RESULT_V1",
-    "CANDIDATE_VERIFICATION_SPEC_V1", "CANDIDATE_V1", "CLAIM_V1", "EXECUTION_ENVELOPE_V1", "EXECUTION_V1",
+    "CANDIDATE_VERIFICATION_SPEC_V1", "CANDIDATE_V1", "CLAIM_V1", "DISPATCH_RESULT_V1", "DISPATCH_STOP_REASONS", "DISPATCH_TERMINAL_STATUSES", "EXECUTION_ENVELOPE_V1", "EXECUTION_V1",
     "PUBLICATION_V1", "RUNNER_AUTH_V1", "SUPPORTED_CONTRACT_IDS", "VERIFICATION_PROFILE_V1", "VERIFICATION_V1", "Candidate", "Claim",
-    "ContractRecord", "Execution", "ExecutionEnvelope", "Publication", "RunnerAuth", "Verification",
+    "ContractRecord", "DispatchResult", "Execution", "ExecutionEnvelope", "Publication", "RunnerAuth", "Verification",
     "artifact_digest", "canonical_bytes", "require_compatible", "sha256_digest",
 ]

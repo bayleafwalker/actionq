@@ -16,10 +16,12 @@ from actionq.daemon import ActionConfig, ActionctlClient, Daemon, DaemonConfig, 
 class FakeClient:
     def __init__(self, action=None):
         self.action = action
+        self._attempt_id = "aqs:test"
         self.claims = []
         self.events = []
         self.completed = []
         self.failed = []
+        self.settled = []
         self.started = threading.Event()
         self.current_status = "claimed"
         self.cancel_request_id = "00000000-0000-0000-0000-000000000001"
@@ -30,7 +32,12 @@ class FakeClient:
         action, self.action = self.action, None
         if action is not None:
             action = {**action, "claim_receipt": action.get("claim_receipt", "test-receipt"),
-                      "runner_auth_token": action.get("runner_auth_token", "test-runner-auth")}
+                      "runner_auth_token": action.get("runner_auth_token", "test-runner-auth"),
+                      "attempt_id": action.get("attempt_id", action.get("claim_attempt_id", "aqs:test")),
+                      "claim_attempt_id": action.get(
+                          "claim_attempt_id", action.get("attempt_id", "aqs:test")
+                      )}
+            self._attempt_id = action["attempt_id"]
         return action
 
     def renew(self, action_id, *, worker, timeout_minutes, claim_receipt):
@@ -49,11 +56,61 @@ class FakeClient:
         if event_type == "session.started":
             self.started.set()
 
-    def complete(self, action_id, *, result_ref, actor, claim_receipt):
-        self.completed.append((action_id, result_ref, actor))
+    def settle(self, action_id, *, result, actor, claim_receipt):
+        assert result["action_id"] == action_id
+        assert result["attempt_id"] == self._attempt_id
+        self.settled.append((action_id, result, actor, claim_receipt))
+        if result["terminal_status"] in {"completed", "no_change"}:
+            self.current_status = "completed"
+            self.completed.append((action_id, result["result_ref"], actor))
+        else:
+            self.current_status = "failed"
+            self.failed.append((action_id, result["stop_reason"], actor))
 
-    def fail(self, action_id, *, reason, actor, claim_receipt):
-        self.failed.append((action_id, reason, actor))
+    def complete(self, *_args, **_kwargs):
+        raise AssertionError("legacy complete must not be used by the daemon")
+
+    def fail(self, *_args, **_kwargs):
+        raise AssertionError("legacy fail must not be used by the daemon")
+
+
+class MissingSettlementClient:
+    def __init__(self, action):
+        self.action = action
+        self.events = []
+
+    def claim(self, worker, timeout_minutes):
+        return {**self.action, "claim_receipt": "receipt", "runner_auth_token": "runner"}
+
+    def emit(self, *args, **kwargs):
+        self.events.append((args, kwargs))
+
+
+def test_daemon_fails_closed_when_verified_settlement_is_missing(tmp_path: Path):
+    client = MissingSettlementClient({"id": 801, "action_type": "scope-iterate", "attempt_id": "aqa:801"})
+    daemon = Daemon(
+        DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED"),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=0.01)}, client,
+    )
+    with pytest.raises(RuntimeError, match="settlement is unavailable"):
+        daemon.run_once()
+    assert client.events == []
+
+
+def test_daemon_fails_closed_without_actionq_minted_attempt(tmp_path: Path):
+    client = FakeClient({"id": 802, "action_type": "scope-iterate"})
+    daemon = Daemon(
+        DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED"),
+        {"scope-iterate": ActionConfig(fake_duration_seconds=0.01)}, client,
+    )
+    # Simulate a claim response that omitted ActionQ's attempt identity.
+    client.claim = lambda worker, timeout_minutes: {
+        "id": 802, "action_type": "scope-iterate", "claim_receipt": "receipt",
+        "runner_auth_token": "runner",
+    }
+    with pytest.raises(RuntimeError, match="did not include its claim_attempt_id"):
+        daemon.run_once()
+    assert client.events == []
 
 
 class FakeTakeup:
@@ -370,7 +427,7 @@ def test_takeup_pre_start_failure_fails_action_without_crashing_daemon(tmp_path:
     assert claimed is True
     assert [call[0] for call in takeup.calls] == ["take"]
     assert client.failed and client.failed[0][0] == 20
-    assert "takeup failed before session start" in client.failed[0][1]
+    assert client.failed[0][1] == "start-failed"
     assert not client.completed
     # The child never effectively ran as a tracked session.
     assert "session.started" not in [event[0] for event in client.events]

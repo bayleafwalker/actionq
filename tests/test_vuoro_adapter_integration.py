@@ -45,6 +45,7 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
         "execution.action.show",
         "execution.action.claim",
         "execution.action.renew",
+        "execution.action.settle",
         "execution.action.complete",
         "execution.action.fail",
         "execution.action.reject",

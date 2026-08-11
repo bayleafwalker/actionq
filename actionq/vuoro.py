@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from . import db
 from .application import ActionQApplication, InvocationProvenance
+from actionq_contracts import DISPATCH_STOP_REASONS, DISPATCH_TERMINAL_STATUSES
 
 
 SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -124,6 +125,28 @@ _DISPATCH_V2_INPUT_SCHEMA = _object(
     },
     required=("contract_version", "action_type", "output_expectation", "repo_id", "sprint_id", "work_item_id", "title", "prompt", "harness", "model", "priority", "refs", "dispatch_group_id"),
 )
+_DISPATCH_RESULT_SCHEMA = _object(
+    {
+        "contract_id": {"const": "dispatch-result/v1"},
+        "action_id": {"type": "integer", "minimum": 1},
+        "attempt_id": {"type": "string", "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+        "terminal_status": {"enum": sorted(DISPATCH_TERMINAL_STATUSES)},
+        "result_ref": {"type": "string", "pattern": r"^artifact:sha256:[0-9a-f]{64}$"},
+        "result_digest": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
+        "stop_reason": {"type": ["string", "null"], "enum": [*sorted(DISPATCH_STOP_REASONS), None]},
+    },
+    required=("contract_id", "action_id", "attempt_id", "terminal_status", "result_ref", "result_digest", "stop_reason"),
+)
+_DISPATCH_RESULT_SCHEMA["allOf"] = [
+    {
+        "if": {"properties": {"terminal_status": {"enum": ["completed", "no_change"]}}},
+        "then": {"properties": {"stop_reason": {"type": "null"}}},
+    },
+    {
+        "if": {"properties": {"terminal_status": {"enum": ["blocked", "failed", "budget_exhausted"]}}},
+        "then": {"properties": {"stop_reason": {"type": "string"}}},
+    },
+]
 _EXECUTION_ENVELOPE_SCHEMA = {
     "type": "object",
     "properties": {"contract_id": {"const": "execution-envelope/v1"}},
@@ -471,6 +494,15 @@ def build_operations(
     )
 
     terminal_specs = (
+        (
+            "settle",
+            {"action_id": action_id, "result": _DISPATCH_RESULT_SCHEMA, "claim_receipt": {"type": "string", "minLength": 1}},
+            ("action_id", "result", "claim_receipt"),
+            lambda a, p, actor: app.settle(
+                action_id=a["action_id"], result=a["result"], actor=actor,
+                claim_receipt=a["claim_receipt"], provenance=p,
+            ),
+        ),
         (
             "complete",
             {"action_id": action_id, "result_ref": {"type": "string", "minLength": 1}, "claim_receipt": {"type": "string", "minLength": 1}},

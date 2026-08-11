@@ -90,6 +90,28 @@ recorded as `stop-unacknowledged-timeout` with process state `unknown`; its
 private recovery spool remains unreconciled and therefore ineligible for garbage
 collection until the supervisor or an operator records an independent decision.
 
+## Verified dispatch settlement
+
+The verified dispatch path settles only from the exact `dispatch-result/v1`
+contract in `docs/contracts/dispatch-result-v1.md`. The packet binds one
+positive `action_id` and ActionQ-minted claim attempt to one immutable `result_ref`/`result_digest`
+pair. Before opening the lifecycle mutation transaction, the authority reads
+the referent from its configured owner-controlled durable CAS and re-hashes the
+bytes against the locator. Missing, corrupt, or rehashed bytes fail closed with
+no row, claim, or event change. `completed` and `no_change` map to action status
+`completed`; `blocked`, `failed`, and `budget_exhausted` map to action status
+`failed`. The packet uses the frozen `stop_reason` vocabulary and stores it as
+the bounded failure reason for failed action rows. ActionQ owns the claim-fenced
+row update and lifecycle event; it does not inspect action-specific artifact
+contents or grant another system
+terminal authority. The row update and `action_completed`/`action_failed`
+event commit in the same transaction. Exit status, session observation, or
+worker prose alone cannot settle a verified dispatch.
+The daemon reuses the claim attempt as its session and execution-envelope
+identity. A timeout sweep or reclaim mints a different attempt and fences the
+earlier packet. Stop reasons are a closed privacy-safe registry, never free-
+form failure text.
+
 ## Safety properties
 
 - One completed `claim` call returns at most one action.

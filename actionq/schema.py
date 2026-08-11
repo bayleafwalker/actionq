@@ -20,7 +20,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 9
+MAX_SCHEMA_VERSION = 10
 PRE_MIGRATION_BRIDGE_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
@@ -40,6 +40,7 @@ _COLUMN_SHAPE = {
         "claimed_by": ("text", "YES", None),
         "claim_deadline": ("timestamp with time zone", "YES", None),
         "claim_receipt": ("text", "YES", None),
+        "claim_attempt_id": ("text", "YES", None),
         "cancel_request_id": ("uuid", "YES", None),
         "cancel_stop_deadline": ("timestamp with time zone", "YES", None),
         "stop_acknowledged": ("boolean", "YES", None),
@@ -987,6 +988,7 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
     """
     expected_later_absence = (
         "column-missing:actions.claim_receipt",
+        "column-missing:actions.claim_attempt_id",
         "column-missing:actions.cancel_request_id",
         "column-missing:actions.cancel_stop_deadline",
         "column-missing:actions.stop_acknowledged",

@@ -8,32 +8,50 @@ import pytest
 from actionq.daemon import ActionConfig, Daemon, DaemonConfig
 from actionq.scope_iterate import VerificationResult
 from actionq_contracts import EXECUTION_ENVELOPE_V1, ExecutionEnvelope
+from actionq_contracts import DISPATCH_RESULT_V1, artifact_digest
 
 
 JOURNAL_REF = "artifact:sha256:" + "a" * 64
 
 
 class Client:
-    def __init__(self, *, lose_completion_response: bool = False):
-        self.completed = []
+    def __init__(self, *, lose_settlement_response: bool = False):
+        self.settled = []
         self.events = []
-        self.lose_completion_response = lose_completion_response
+        self.lose_settlement_response = lose_settlement_response
         self.result_ref = None
+        self.result_packet = None
         self.status = "completed"
         self.reconciled = []
         self.registered = []
         self.frozen = []
 
-    def complete(self, action_id, *, result_ref, actor, claim_receipt):
-        self.completed.append((action_id, result_ref, actor, claim_receipt))
-        self.result_ref = result_ref
-        if self.lose_completion_response:
+    def settle(self, action_id, *, result, actor, claim_receipt):
+        assert result["action_id"] == action_id
+        assert result["attempt_id"] == "attempt-old"
+        self.settled.append((action_id, result, actor, claim_receipt))
+        self.result_packet = dict(result)
+        self.result_ref = result["result_ref"]
+        if self.lose_settlement_response:
             raise RuntimeError("response lost after commit")
+
+    def complete(self, *_args, **_kwargs):
+        raise AssertionError("legacy complete must not be used by the daemon")
 
     def show(self, action_id):
         events = []
         if self.result_ref is not None:
-            events.append({"event_type": "action_completed", "payload": {"result_ref": self.result_ref}})
+            events.append({
+                "event_type": "action_completed",
+                "payload": {
+                    "result_ref": self.result_ref,
+                    **({
+                        "contract_id": self.result_packet["contract_id"],
+                        "attempt_id": self.result_packet["attempt_id"],
+                        "result_digest": self.result_packet["result_digest"],
+                    } if self.result_packet is not None else {}),
+                },
+            })
         events.extend(self.frozen)
         events.extend(self.registered)
         return {"action": {"id": action_id, "status": self.status, "result_ref": self.result_ref,
@@ -66,6 +84,12 @@ class PublicationDaemon(Daemon):
         self.recovered = recovered
         self.commands = []
 
+    def _verify_result_ref(self, result_ref):
+        # These tests model runnerctl's already-verified publication receipt;
+        # the real FilesystemCAS boundary is covered by the artifact tests.
+        assert result_ref == JOURNAL_REF
+        return result_ref
+
     def _runnerctl_json(self, *args, input_value=None):
         self.commands.append((args, input_value))
         if args[0] == "journal-recover":
@@ -90,11 +114,43 @@ def publication():
             "source_commit": "b" * 40, "candidate_commit": "c" * 40}
 
 
-def test_completion_response_loss_is_reconciled_before_settlement_ack():
-    client = Client(lose_completion_response=True)
+def test_verified_publication_uses_claim_bound_dispatch_settlement():
+    client = Client()
     daemon = PublicationDaemon(client, recovered=publication())
-    daemon._complete_published(2032, claim_receipt="memory-only", publication=publication())
-    assert client.completed == [(2032, JOURNAL_REF, "runner:devbox", "memory-only")]
+    daemon._complete_published(
+        2032, claim_attempt_id="attempt-old", claim_receipt="memory-only",
+        publication=publication(),
+    )
+
+    assert client.settled == [(2032, {
+        "contract_id": DISPATCH_RESULT_V1,
+        "action_id": 2032,
+        "attempt_id": "attempt-old",
+        "terminal_status": "completed",
+        "result_ref": JOURNAL_REF,
+        "result_digest": artifact_digest(JOURNAL_REF),
+        "stop_reason": None,
+    }, "runner:devbox", "memory-only")]
+
+
+def test_publication_settlement_fails_closed_without_settle_capability():
+    client = type("MissingSettleClient", (), {})()
+    daemon = PublicationDaemon(client, recovered=publication())
+    with pytest.raises(RuntimeError, match="settlement is unavailable"):
+        daemon._complete_published(
+            2032, claim_attempt_id="attempt-old", claim_receipt="memory-only",
+            publication=publication(),
+        )
+
+
+def test_settlement_response_loss_is_reconciled_before_settlement_ack():
+    client = Client(lose_settlement_response=True)
+    daemon = PublicationDaemon(client, recovered=publication())
+    daemon._complete_published(
+        2032, claim_attempt_id="attempt-old", claim_receipt="memory-only",
+        publication=publication(),
+    )
+    assert client.settled
     ack = next(value for args, value in daemon.commands if args[0] == "settlement-ack")
     assert ack == {
         "artifact_root": "/durable/actionq", "action_id": 2032,
@@ -113,10 +169,11 @@ def test_reclaimed_action_settles_recovered_publication_without_execution():
                                 claim_receipt="old-memory-only")
     daemon = PublicationDaemon(client, recovered=publication())
     action = {
-        "id": 2032, "action_type": "scope-iterate", "claim_receipt": "new-live-receipt",
+        "id": 2032, "action_type": "scope-iterate", "claim_receipt": "live-receipt",
+        "attempt_id": "attempt-old", "claim_attempt_id": "attempt-old",
     }
     assert daemon._settle_recovered_publication(action) is True
-    assert client.completed[0][1] == JOURNAL_REF
+    assert client.settled[0][1]["attempt_id"] == "attempt-old"
     assert client.reconciled == [(2032, "attempt-old")]
     assert daemon.commands[0][0][0] == "journal-recover"
 
@@ -126,8 +183,19 @@ def test_unregistered_recovered_publication_is_not_adopted_by_new_claim():
     daemon = PublicationDaemon(client, recovered=publication())
     assert daemon._settle_recovered_publication({
         "id": 2032, "action_type": "scope-iterate", "claim_receipt": "new-live-receipt",
+        "attempt_id": "attempt-new", "claim_attempt_id": "attempt-new",
     }) is False
-    assert not client.completed
+    assert not client.settled
+
+
+def test_recovered_publication_from_old_attempt_is_fenced_by_new_claim():
+    client = Client()
+    daemon = PublicationDaemon(client, recovered=publication())
+    assert daemon._settle_recovered_publication({
+        "id": 2032, "action_type": "scope-iterate", "claim_receipt": "new-live-receipt",
+        "attempt_id": "attempt-new", "claim_attempt_id": "attempt-new",
+    }) is False
+    assert not client.settled
 
 
 def test_daemon_restart_resumes_exact_interrupted_attempt_without_packet():
@@ -153,11 +221,12 @@ def test_fresh_daemon_claim_resumes_registers_and_settles_without_harness(
     }}})
     daemon = PublicationDaemon(client, recovered=journal_state)
     action = {"id": 2032, "action_type": "scope-iterate",
-              "claim_receipt": "new-live-receipt"}
+              "claim_receipt": "new-live-receipt", "attempt_id": "attempt-old",
+              "claim_attempt_id": "attempt-old"}
     assert daemon._resume_and_settle_interrupted_publication(action) is True
     assert [args[0] for args, _ in daemon.commands][:2] == ["journal-list", expected_command]
     assert len(client.registered) == 1
-    assert client.completed == [(2032, JOURNAL_REF, "runner:devbox", "new-live-receipt")]
+    assert client.settled[0][1]["attempt_id"] == "attempt-old"
     assert client.reconciled == [(2032, "attempt-old")]
 
 
@@ -166,8 +235,9 @@ def test_no_recovered_publication_falls_through_to_normal_execution():
     daemon = PublicationDaemon(client, recovered=None)
     assert daemon._settle_recovered_publication({
         "id": 2032, "action_type": "scope-iterate", "claim_receipt": "live",
+        "attempt_id": "attempt-new", "claim_attempt_id": "attempt-new",
     }) is False
-    assert not client.completed
+    assert not client.settled
 
 
 def test_late_publication_is_not_acknowledged_after_cancellation_fences_claim():
@@ -182,6 +252,11 @@ def test_late_publication_is_not_acknowledged_after_cancellation_fences_claim():
 def test_startup_reconciles_commit_before_local_settlement_ack():
     client = Client()
     client.result_ref = JOURNAL_REF
+    client.result_packet = {
+        "contract_id": DISPATCH_RESULT_V1,
+        "attempt_id": "attempt-old",
+        "result_digest": artifact_digest(JOURNAL_REF),
+    }
     daemon = PublicationDaemon(client, recovered=publication())
     assert daemon._reconcile_terminal_publication(2032, "scope-iterate") is True
     assert any(args[0] == "settlement-ack" for args, _ in daemon.commands)
@@ -222,12 +297,13 @@ def test_publish_policy_requires_explicit_durable_root():
     with pytest.raises(RuntimeError, match="artifact_root"):
         daemon._settle_recovered_publication({
             "id": 2032, "action_type": "scope-iterate", "claim_receipt": "live",
+            "attempt_id": "attempt-new", "claim_attempt_id": "attempt-new",
         })
 
 
 def test_bounded_depth3_artifact_postgres_crash_model():
     """Exhaust the publication/terminal boundary without claiming exactly-once work."""
-    operations = ("publish", "complete", "cancel", "ack")
+    operations = ("publish", "settle", "cancel", "ack")
     for history in product(operations, repeat=3):
         artifact = False
         terminal = None
@@ -236,7 +312,7 @@ def test_bounded_depth3_artifact_postgres_crash_model():
         for operation in history:
             if operation == "publish":
                 artifact = True  # digest-idempotent even when repeated
-            elif operation == "complete" and terminal is None:
+            elif operation == "settle" and terminal is None:
                 terminal = "completed"
                 terminal_mutations += 1
             elif operation == "cancel" and terminal is None:

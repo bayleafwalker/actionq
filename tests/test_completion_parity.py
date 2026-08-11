@@ -24,13 +24,24 @@ class _Client:
         self.action = action
         self.completed: list[int] = []
         self.failed: list[str] = []
+        self.settled: list[dict] = []
+        self.attempt_id = "aqs:test"
         self.events: list[tuple[str, dict]] = []
         self.current_status = "claimed"
 
     def claim(self, worker, timeout_minutes):
         action, self.action = self.action, None
-        return ({**action, "claim_receipt": "receipt", "runner_auth_token": "proof"}
-                if action else None)
+        if action is None:
+            return None
+        result = {
+            **action,
+            "claim_receipt": action.get("claim_receipt", "receipt"),
+            "runner_auth_token": action.get("runner_auth_token", "proof"),
+            "attempt_id": action.get("attempt_id", "aqs:test"),
+            "claim_attempt_id": action.get("claim_attempt_id", action.get("attempt_id", "aqs:test")),
+        }
+        self.attempt_id = result["attempt_id"]
+        return result
 
     def renew(self, *args, **kwargs):
         return None
@@ -38,11 +49,22 @@ class _Client:
     def emit(self, event_type, *, action_id, actor, payload):
         self.events.append((event_type, payload))
 
-    def complete(self, action_id, **kwargs):
-        self.completed.append(action_id)
+    def settle(self, action_id, *, result, actor, claim_receipt):
+        assert result["action_id"] == action_id
+        assert result["attempt_id"] == self.attempt_id
+        self.settled.append(result)
+        if result["terminal_status"] in {"completed", "no_change"}:
+            self.current_status = "completed"
+            self.completed.append(action_id)
+        else:
+            self.current_status = "failed"
+            self.failed.append(result["stop_reason"])
 
-    def fail(self, action_id, *, reason, **kwargs):
-        self.failed.append(reason)
+    def complete(self, *_args, **_kwargs):
+        raise AssertionError("legacy complete must not be used by the daemon")
+
+    def fail(self, *_args, **_kwargs):
+        raise AssertionError("legacy fail must not be used by the daemon")
 
     def show(self, action_id):
         return {

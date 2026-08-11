@@ -16,6 +16,7 @@ from actionq import db, schema as schema_contract, server
 from actionq.action_resource import ActionResourceOwner, CursorExpired, IdempotencyConflict
 import actionq.action_resource as action_resource_module
 from actionq.application import ActionQApplication, AuthenticatedActionResourcePrincipal, InvocationProvenance
+from actionq.cas import _DaemonCAS
 
 MIGRATION_ROLE = "actionq_migration"
 RUNTIME_ROLE = "actionq_runtime"
@@ -24,9 +25,10 @@ LEGACY_V1_SHA256 = "ae2b2166dc841b06793de6a6f706a01056725cd674aa018bb98aba36eab4
 
 
 @pytest.fixture
-def runner_env(monkeypatch, actionq_cli_runner):
+def runner_env(monkeypatch, actionq_cli_runner, server_cas_root):
     schema = "aqtest_" + uuid.uuid4().hex
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
+    monkeypatch.setenv("ACTIONQ_ARTIFACT_ROOT", str(server_cas_root))
     return actionq_cli_runner, schema
 
 
@@ -548,9 +550,9 @@ def test_exact_v3_bridge_lifecycle_then_exact_migration_to_current(
 
     migration = runner.invoke(cli, ["migrate", "--json-output"])
     assert migration.exit_code == 0, migration.output
-    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7, 8, 9]
+    assert json.loads(migration.output)["applied_versions"] == [4, 5, 6, 7, 8, 9, 10]
     final = _invoke_json(runner, ["check-compatibility"])
-    assert final["observed_schema_version"] == 9
+    assert final["observed_schema_version"] == 10
     assert final["state"] == "compatible"
 
 
@@ -561,11 +563,11 @@ def test_schema8_rendered_guard_executes_against_postgres(runner_env):
 
     report = schema_contract.migrate(conn, schema, runtime_role=RUNTIME_ROLE)
 
-    assert report["applied_versions"] == [8, 9]
+    assert report["applied_versions"] == [8, 9, 10]
     assert conn.execute(
         f'SELECT MAX(version) AS version FROM "{schema}".schema_migrations WHERE domain=%s',
         (schema_contract.DOMAIN,),
-    ).fetchone()["version"] == 9
+    ).fetchone()["version"] == 10
     conn.close()
 
 
@@ -712,6 +714,70 @@ def test_lifecycle_claim_complete_show(runner_env, signed_runner_proof):
         "action_claimed",
         "action_completed",
     ]
+
+
+def test_verified_dispatch_settlement_maps_canonical_terminal_statuses(
+    runner_env, signed_runner_proof
+):
+    runner, _schema = runner_env
+    result_ref = _DaemonCAS(Path(os.environ["ACTIONQ_ARTIFACT_ROOT"])).put(b"dispatch-result")
+    result_digest = "sha256:" + result_ref.removeprefix("artifact:sha256:")
+    assert runner.invoke(cli, ["migrate"]).exit_code == 0
+
+    for terminal_status, stop_reason, expected_status, event_type in (
+        ("completed", None, "completed", "action_completed"),
+        ("no_change", None, "completed", "action_completed"),
+        ("blocked", "start-failed", "failed", "action_failed"),
+        ("failed", "process-exit", "failed", "action_failed"),
+        ("budget_exhausted", "usage-limit", "failed", "action_failed"),
+    ):
+        action = _invoke_json(
+            runner,
+            ["add", "--type", "scope-iterate", "--project", "actionq", "--created-by", "human:test"],
+        )
+        claimed = _invoke_json(
+            runner,
+            ["claim", "--proof-stdin"],
+            input=json.dumps(
+                signed_runner_proof("worker:test", "execution.action.claim", "queue:next")
+            ),
+        )
+        assert claimed["id"] == action["id"]
+        packet = {
+            "claim_receipt": claimed["claim_receipt"],
+            "runner_proof": signed_runner_proof(
+                "worker:test", "execution.action.settle", f"action:{action['id']}"
+            ),
+            "result": {
+                "contract_id": "dispatch-result/v1",
+                "action_id": action["id"],
+                "attempt_id": claimed["attempt_id"],
+                "terminal_status": terminal_status,
+                "result_ref": result_ref,
+                "result_digest": result_digest,
+                "stop_reason": stop_reason,
+            },
+        }
+        settled = _invoke_json(
+            runner, ["settle", str(action["id"]), "--packet-stdin"], input=json.dumps(packet)
+        )
+        assert settled["status"] == expected_status
+        detail = _invoke_json(runner, ["show", str(action["id"])])
+        assert detail["action"]["result_ref"] == result_ref
+        assert detail["action"]["failure_reason"] == stop_reason
+        event = detail["events"][-1]
+        assert event["event_type"] == event_type
+        assert event["payload"] == {
+            "contract_id": "dispatch-result/v1",
+            "attempt_id": claimed["attempt_id"],
+            "terminal_status": terminal_status,
+            "result_ref": result_ref,
+            "result_digest": result_digest,
+            "stop_reason": stop_reason,
+        }
+        serialized = json.dumps(detail)
+        assert '"claim_receipt":' not in serialized
+        assert '"runner_auth_token":' not in serialized
 
 
 def test_claim_exits_nonzero_when_empty(runner_env, signed_runner_proof):

@@ -2,6 +2,8 @@
 # on devbox, with ACTIONQ_URL supplied through the environment.
 [global]
 artifact_root = "/var/lib/actionq/artifacts"
+# The actionctl/actionq-server authority must use the same owner-controlled
+# root through ACTIONQ_ARTIFACT_ROOT when accepting verified settlements.
 poll_interval_seconds = 30
 heartbeat_interval_seconds = 60
 graceful_shutdown_seconds = 30

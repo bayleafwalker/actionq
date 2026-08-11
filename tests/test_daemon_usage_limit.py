@@ -57,7 +57,7 @@ def test_confirmed_usage_limit_signal_pauses_before_failing(tmp_path: Path):
     assert "session.resumed" in handoff_text  # documents the resume/re-dispatch path
 
     assert client.failed and client.failed[0][0] == 30
-    assert client.failed[0][1].startswith("usage-limit-paused:")
+    assert client.failed[0][1] == "usage-limit"
     assert not client.completed
 
     exited_payload = client.events[exited_index][3]
@@ -78,7 +78,7 @@ def test_ordinary_failure_is_not_misclassified_as_a_pause(tmp_path: Path):
     event_types = [event[0] for event in client.events]
     assert "session.paused" not in event_types
     assert client.failed and client.failed[0][0] == 31
-    assert client.failed[0][1] == "daemon session failed"
+    assert client.failed[0][1] == "process-exit"
     exited_payload = client.events[event_types.index("session.exited")][3]
     assert exited_payload["usage_limit_paused"] is False
 
@@ -106,7 +106,7 @@ def test_missing_harness_classification_key_never_pauses(tmp_path: Path):
     assert daemon.run_once() is True
 
     assert "session.paused" not in [event[0] for event in client.events]
-    assert client.failed and client.failed[0][1] == "daemon session failed"
+    assert client.failed and client.failed[0][1] == "process-exit"
 
 
 # -- manual resume/re-dispatch drill --------------------------------------

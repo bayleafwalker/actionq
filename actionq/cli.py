@@ -271,6 +271,33 @@ def reject(ctx, action_id: int, reason: str, validator: str, proof_stdin: bool) 
 
 @cli.command()
 @click.argument("action_id", type=int)
+@click.option("--packet-stdin", is_flag=True, required=True,
+              help="Read the result packet, claim receipt, and runner proof as JSON from stdin")
+@click.pass_context
+def settle(ctx, action_id: int, packet_stdin: bool) -> None:
+    """Settle a claimed action from a verified dispatch-result/v1 packet."""
+    packet = json.load(sys.stdin)
+    if not isinstance(packet, dict) or set(packet) != {"claim_receipt", "runner_proof", "result"}:
+        raise click.ClickException("settlement packet contains unsupported fields")
+    result = packet["result"]
+    if (
+        not isinstance(packet["claim_receipt"], str)
+        or not isinstance(packet["runner_proof"], dict)
+        or not isinstance(result, dict)
+        or result.get("action_id") != action_id
+    ):
+        raise click.ClickException("settlement result action_id does not match the command")
+    _echo_json(_app(ctx).settle(
+        action_id=action_id,
+        result=result,
+        actor=None,
+        claim_receipt=str(packet["claim_receipt"]),
+        runner_proof=dict(packet["runner_proof"]),
+    ))
+
+
+@cli.command()
+@click.argument("action_id", type=int)
 @click.option("--reason", required=True)
 @click.option("--actor", default="human")
 @click.pass_context

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import json
 import base64
+import uuid
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,41 @@ def signed_runner_proof(runner_identity):
     return sign
 
 
+@pytest.fixture(autouse=True)
+def daemon_test_result_cas(tmp_path: Path, request, monkeypatch):
+    """Give legacy daemon unit doubles an explicitly test-only CAS.
+
+    Production ``Daemon._cas`` still requires ``DaemonConfig.artifact_root``
+    and uses the strict FilesystemCAS checks.  Most older coordinator tests
+    predate result artifacts and intentionally focus on lifecycle wiring, so
+    this fixture supplies an unsafe temporary CAS only to those unit doubles.
+    Tests for the fail-closed root boundary opt out with the marker below.
+    """
+    if request.node.get_closest_marker("real_daemon_result_cas"):
+        return
+    from actionq.daemon import Daemon
+    from actionq_runner import FilesystemCAS
+
+    root = tmp_path / "daemon-result-cas"
+    root.mkdir(mode=0o700)
+
+    def test_cas(self):
+        if self.config.artifact_root is None:
+            return FilesystemCAS(root, allow_unsafe_test_root=True)
+        return FilesystemCAS(self.config.artifact_root, allow_unsafe_test_root=True)
+
+    monkeypatch.setattr(Daemon, "_cas", test_cas)
+
+
+@pytest.fixture
+def server_cas_root():
+    """Provision a real owner-controlled CAS outside test-runner staging."""
+    root = Path("/dev/shm") / f"actionq-test-cas-{uuid.uuid4().hex}"
+    root.mkdir(mode=0o700)
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def _needs_postgres(config) -> bool:
     args = [str(argument) for argument in config.args]
     if not args:
@@ -79,6 +115,7 @@ def _needs_postgres(config) -> bool:
         or "claim_authority" in argument
         or "runner_auth" in argument
         or "cross_authority" in argument
+        or "dispatch_settlement" in argument
         for argument in args
     )
 

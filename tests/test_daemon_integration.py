@@ -21,7 +21,9 @@ def _text(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
 
 
-def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: Path, runner_identity):
+def test_fake_daemon_lifecycle_uses_actionctl_subprocess(
+    monkeypatch, tmp_path: Path, runner_identity, server_cas_root: Path,
+):
     schema = "aqdaemon_" + uuid.uuid4().hex
     monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
     with db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"]) as conn:
@@ -47,10 +49,12 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
             session_state_path=tmp_path / "session.json",
             pause_file=tmp_path / "PAUSED",
             actionctl_bin=str(actionctl),
+            artifact_root=server_cas_root,
         ),
         {"scope-iterate": ActionConfig(fake_duration_seconds=1)},
         ActionctlClient(str(actionctl), runnerctl=str(Path(sys.executable).with_name("actionq-runner")),
-                        runner_private_key_path=runner_identity["private_key"]),
+                        runner_private_key_path=runner_identity["private_key"],
+                        artifact_root=server_cas_root),
     )
 
     assert daemon.run_once() is True
@@ -75,10 +79,12 @@ def test_fake_daemon_lifecycle_uses_actionctl_subprocess(monkeypatch, tmp_path: 
             session_state_path=tmp_path / "stale.json",
             pause_file=tmp_path / "PAUSED",
             actionctl_bin=str(actionctl),
+            artifact_root=server_cas_root,
         ),
         {},
         ActionctlClient(str(actionctl), runnerctl=str(Path(sys.executable).with_name("actionq-runner")),
-                        runner_private_key_path=runner_identity["private_key"]),
+                        runner_private_key_path=runner_identity["private_key"],
+                        artifact_root=server_cas_root),
     )
     recovery._write_state(
         SessionRecord(

@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Any, Callable, Iterator
 import time
 import uuid
@@ -19,6 +21,7 @@ import uuid
 from . import db
 from .action_resource import ActionResourceOwner, ResourceNotFound, serialize_envelope
 from .runner_auth import VerifiedRunner, verify_runner_proof
+from .cas import _DaemonCAS
 
 
 _KIND_TO_ACTION_TYPE = {
@@ -112,11 +115,28 @@ class ActionQApplication:
         connection_factory: Callable[[], Any] | None = None,
         authorizer: Callable[[InvocationProvenance, str, str], bool] | None = None,
         resource_cursor_secret: bytes | None = None,
+        artifact_root: Path | str | None = None,
+        cas_factory: Callable[[Path], Any] | None = None,
     ) -> None:
         self.schema = db.schema_name(schema)
         self._connection_factory = connection_factory
         self._authorizer = authorizer
         self._resource_cursor_secret = resource_cursor_secret
+        configured_root = artifact_root if artifact_root is not None else os.environ.get("ACTIONQ_ARTIFACT_ROOT")
+        self.artifact_root = Path(configured_root).expanduser() if configured_root else None
+        self._cas_factory = cas_factory or _DaemonCAS
+
+    def _verified_result_store(self, result_ref: str) -> Any:
+        if self.artifact_root is None:
+            raise db.ActionQError("verified settlement requires a configured durable artifact_root")
+        try:
+            store = self._cas_factory(self.artifact_root)
+            store.get(result_ref)
+            return store
+        except db.ActionQError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - authority must fail closed
+            raise db.ActionQError("dispatch result referent is not durable") from exc
 
     def _project_owned_action(self, conn: Any, action_id: int, *, claim_receipt: str | None = None) -> None:
         if self._resource_cursor_secret is not None:
@@ -809,6 +829,55 @@ class ActionQApplication:
                 claim_receipt=claim_receipt,
                 provenance=event_provenance,
             )),
+        )
+
+    def settle(
+        self,
+        *,
+        action_id: int,
+        result: dict[str, Any],
+        actor: str | None,
+        claim_receipt: str,
+        provenance: InvocationProvenance | None = None,
+        runner_proof: dict[str, Any] | None = None,
+    ) -> Any:
+        """Settle a claimed action from one verified dispatch-result/v1 packet."""
+
+        if runner_proof is not None:
+            actor = verify_runner_proof(
+                runner_proof, operation="execution.action.settle", resource=f"action:{action_id}"
+            ).runner_id
+        elif provenance is None or actor != provenance.actor:
+            raise db.ActionQError("settle requires signed runner proof or authenticated served identity")
+        assert actor is not None
+        result_ref = db.validate_dispatch_result(result, action_id=action_id)
+        artifact_store = self._verified_result_store(result_ref)
+        return self._terminal(
+            operation="execution.action.settle",
+            action_id=action_id,
+            actor=actor,
+            arguments={
+                "dispatch_result": result,
+                "claim_receipt_digest": db.receipt_digest(claim_receipt),
+            },
+            provenance=provenance,
+            transition=lambda conn, event_provenance: self._transition_owned_action(
+                conn,
+                action_id,
+                lambda: db.settle_dispatch_result(
+                    conn,
+                    self.schema,
+                    action_id=action_id,
+                    result=result,
+                    actor=actor,
+                    worker=actor,
+                    claim_receipt=claim_receipt,
+                    provenance=event_provenance,
+                    artifact_root=self.artifact_root,
+                    _artifact_store=artifact_store,
+                ),
+                claim_receipt=claim_receipt,
+            ),
         )
 
     def cancel(
