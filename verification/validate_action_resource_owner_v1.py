@@ -92,7 +92,7 @@ def validate(root: Path = ROOT) -> None:
         require(receipt["schema_version"] == "action-resource-history-receipt/v1", f"runtime receipt version invalid: {name}")
         require(receipt["history"] == history and receipt["assertion_ids"] == assertion_ids, f"runtime assertion content mismatch: {name}")
         require(receipt["candidate_tree_digest"] == candidate.hexdigest(), f"runtime receipt candidate mismatch: {name}")
-        expected_argv = [str(root / ".venv/bin/python3"), "-m", "pytest", receipt["node"], "-q", "-s"]
+        expected_argv = [".venv/bin/python3", "-m", "pytest", receipt["node"], "-q", "-s"]
         require(receipt["command"] == expected_argv and receipt["returncode"] == 0, f"runtime command proof invalid: {name}")
         expected_stream = "".join(f"OWNER_ASSERTION {assertion_id}\n" for assertion_id in sorted(assertion_ids))
         require(receipt["assertion_stream"] == expected_stream, f"runtime assertion stream mismatch: {name}")

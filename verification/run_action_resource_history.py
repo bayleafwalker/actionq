@@ -54,7 +54,7 @@ def main() -> int:
         "node": node,
         "assertion_ids": [assertion_id],
         "candidate_tree_digest": candidate_digest(),
-        "command": command,
+        "command": [".venv/bin/python3", "-m", "pytest", node, "-q", "-s"],
         "returncode": completed.returncode,
         "assertion_stream": assertion_stream,
         "assertion_stream_sha256": hashlib.sha256(assertion_stream.encode()).hexdigest(),
