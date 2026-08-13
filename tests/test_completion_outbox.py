@@ -9,6 +9,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, Lock
 
 import pytest
 
@@ -115,6 +116,51 @@ def test_concurrent_allocation_is_gap_free_and_unique(tmp_path: Path) -> None:
         events = list(pool.map(record, range(24)))
     assert sorted(event["origin_sequence"] for event in events) == list(range(1, 25))
     assert len({event["event_id"] for event in events}) == 24
+
+
+def test_wal_initialization_recovers_when_concurrent_opener_wins_lock() -> None:
+    class Result:
+        def __init__(self, row: tuple[str]) -> None:
+            self.row = row
+
+        def fetchone(self) -> tuple[str]:
+            return self.row
+
+    class SharedJournal:
+        mode = "delete"
+        setters = Barrier(2)
+        lock = Lock()
+
+    class ConcurrentOpenConnection:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def execute(self, command: str):
+            self.commands.append(command)
+            if command == "PRAGMA journal_mode":
+                return Result((SharedJournal.mode,))
+            if command == "PRAGMA journal_mode=WAL":
+                SharedJournal.setters.wait()
+                with SharedJournal.lock:
+                    if SharedJournal.mode == "delete":
+                        SharedJournal.mode = "wal"
+                        return Result(("wal",))
+                error = sqlite3.OperationalError("database is locked")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
+            raise AssertionError(command)
+
+    connections = [ConcurrentOpenConnection(), ConcurrentOpenConnection()]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(CompletionOutbox._enable_wal, connections))  # type: ignore[arg-type]
+
+    assert SharedJournal.mode == "wal"
+    assert sorted(len(connection.commands) for connection in connections) == [2, 3]
+    assert sum(
+        connection.commands.count("PRAGMA journal_mode=WAL")
+        for connection in connections
+    ) == 2
 
 
 def test_lost_ack_retry_digest_quarantine_and_health(tmp_path: Path) -> None:

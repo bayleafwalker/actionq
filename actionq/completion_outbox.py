@@ -18,6 +18,8 @@ DEFAULT_OUTBOX_PATH = Path("~/.local/state/actionq/session-wrapper/completion-ou
 MAX_RETRY_SECONDS = 300
 DEFAULT_ACK_RETENTION_SECONDS = 7 * 24 * 60 * 60
 MAX_ACK_RETENTION_SECONDS = 365 * 24 * 60 * 60
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+SQLITE_LOCK_RETRY_SECONDS = 0.01
 _SAFE_ERROR_CLASSES = {
     "connection-error",
     "delivery-error",
@@ -58,15 +60,19 @@ class CompletionOutbox:
         self.compact()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(
+            self.path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS, isolation_level=None
+        )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SECONDS * 1000}"
+        )
         connection.execute("PRAGMA synchronous=FULL")
         return connection
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            self._enable_wal(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS producer (
@@ -113,6 +119,38 @@ class CompletionOutbox:
                     "SELECT acknowledged_retention_seconds FROM producer WHERE singleton = 1"
                 ).fetchone()["acknowledged_retention_seconds"]
             )
+
+    @staticmethod
+    def _enable_wal(connection: sqlite3.Connection) -> None:
+        """Establish WAL once, tolerating a concurrent first opener.
+
+        Changing journal mode needs an exclusive SQLite lock and, unlike
+        ordinary statements, can report ``SQLITE_BUSY`` immediately despite
+        the connection's busy timeout.  Once either opener establishes WAL,
+        later connections only perform the read-only mode check.
+        """
+
+        deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_SECONDS
+        while True:
+            try:
+                current = connection.execute("PRAGMA journal_mode").fetchone()
+                if current is not None and str(current[0]).lower() == "wal":
+                    return
+                configured = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+                if configured is not None and str(configured[0]).lower() == "wal":
+                    return
+                raise sqlite3.OperationalError(
+                    "SQLite did not enable WAL journal mode"
+                )
+            except sqlite3.OperationalError as error:
+                code = getattr(error, "sqlite_errorcode", None)
+                if (
+                    code is None
+                    or code & 0xFF not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+                time.sleep(SQLITE_LOCK_RETRY_SECONDS)
 
     @property
     def stream_id(self) -> str:

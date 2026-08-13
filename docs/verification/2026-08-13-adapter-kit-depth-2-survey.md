@@ -1,6 +1,6 @@
 # ActionQ adapter-kit migration: Depth-2 lifecycle survey
 
-This is a read-only `verify-state-protocols` survey of the ActionQ 0.1.20
+This is a `verify-state-protocols` survey of the ActionQ 0.1.21
 adapter-kit migration, based on pre-change Git revision `1126233`. It checks
 whether the packaging and catalog refactor changes action lifecycle, claim,
 settlement, or schema-transition semantics. It does not claim those protocols
@@ -30,11 +30,13 @@ tests are `tests/test_claim_authority.py`,
 
 ## Disposition
 
-The product diff is limited to `actionq.vuoro`'s pure schema-builder import and
-fresh catalog-data copying, the immutable adapter-kit dependency, version and
-release metadata, catalog/release tests, and documentation. It does not modify
-`actionq/db.py`, `actionq/application.py`, `actionq/schema.py`, any migration,
-or the CLI/server/daemon authority paths. Therefore the transition
+The adapter migration remains limited to `actionq.vuoro`'s pure schema-builder
+import and fresh catalog-data copying plus its immutable dependency. The 0.1.21
+corrective release also changes the local completion outbox's SQLite connection
+initialization: WAL establishment is now a bounded, lock-aware initialization
+operation instead of a journal-mode write on every connection. It does not
+modify `actionq/db.py`, `actionq/application.py`, `actionq/schema.py`, any
+migration, or the CLI/server/daemon authority paths. Therefore the transition
 preconditions, commit boundaries, event writes, claim receipt and lease checks,
 cancellation fencing, migration history, and runtime-role compatibility logic
 are unchanged by construction.
@@ -55,3 +57,25 @@ existing bounded scenarios. Catalog equality and the frozen canonical hash are
 `example-tested`. Unknown outcomes after a lost database response and the
 documented fairness limits remain unchanged; this survey makes no stronger
 consistency claim.
+
+## 0.1.21 corrective-release evidence
+
+The immutable `v0.1.20` release run `31710553476` exposed the same first-open
+race on Python 3.11 and 3.12: two outbox constructors attempted
+`PRAGMA journal_mode=WAL`, and one received `SQLITE_BUSY` before recording an
+event. The bounded Depth-2 regression uses two actors and a deterministic
+barrier after both observe the pre-WAL state. One actor establishes WAL; the
+other is forced through the lock-error path and must recover by observing the
+winning mode change. The production path applies the same 30-second bound used
+for SQLite writes, rejects non-lock errors, and keeps all subsequent connection
+opens free of journal-mode writes.
+
+The original eight-worker, 24-event gap-free/unique allocation test passed 100
+consecutive invocations. The PostgreSQL-backed workspace run completed 558
+passing tests and 5 environment-specific skips; its sole failure was the
+expected stale candidate-digest rejection before evidence rebinding. All eight
+durable owner histories were then separately re-executed and rebound to the
+corrective candidate, and the closed-bundle validator passed. This evidence
+establishes only bounded first-open recovery and the existing allocation
+guarantees; it does not claim tolerance of filesystem, process, or
+permanent-lock failures.
