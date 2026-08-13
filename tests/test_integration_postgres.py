@@ -376,7 +376,7 @@ def _install_exact_v3(schema: str) -> None:
         conn.execute(
             f'INSERT INTO "{schema}".schema_migrations '
             "(domain, version, name, checksum) VALUES (%s, %s, %s, %s)",
-            (schema_contract.DOMAIN, migration.version, migration.name, migration.checksum),
+            (schema_contract.DOMAIN, migration.version, migration.name, migration.sha256),
         )
     conn.execute(f'REVOKE CREATE ON SCHEMA "{schema}" FROM PUBLIC')
     conn.execute(f'REVOKE CREATE ON SCHEMA "{schema}" FROM {RUNTIME_ROLE}')
@@ -417,7 +417,7 @@ def _install_exact_v7(conn, schema: str) -> None:
         conn.execute(
             f'INSERT INTO "{schema}".schema_migrations '
             "(domain, version, name, checksum) VALUES (%s, %s, %s, %s)",
-            (schema_contract.DOMAIN, migration.version, migration.name, migration.checksum),
+            (schema_contract.DOMAIN, migration.version, migration.name, migration.sha256),
         )
     conn.commit()
 
@@ -640,7 +640,7 @@ def test_v3_bridge_fails_closed_on_partial_checksum_and_post_v3_shape(runner_env
     migration_conn.execute(
         f'UPDATE "{schema}".schema_migrations SET checksum=%s '
         "WHERE domain=%s AND version=3",
-        (schema_contract.load_migrations()[2].checksum, schema_contract.DOMAIN),
+        (schema_contract.load_migrations()[2].sha256, schema_contract.DOMAIN),
     )
     migration_conn.execute(
         f'ALTER TABLE "{schema}".actions ADD COLUMN cancel_request_id UUID'
@@ -1160,7 +1160,7 @@ def test_runtime_contract_rejects_future_schema_without_running_ddl(runner_env):
             schema_contract.DOMAIN,
             schema_contract.MAX_SCHEMA_VERSION + 1,
             "future.sql",
-            migration.checksum,
+            migration.sha256,
         ),
     )
     conn.commit()

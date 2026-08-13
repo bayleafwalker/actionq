@@ -7,12 +7,20 @@ issue DDL and work with a role that can only read the migration ledger.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 from dataclasses import asdict, dataclass
 from importlib import resources
 from typing import Any
+
+from vuoro_schema_runtime import (
+    MigrationAsset,
+    compatibility_report,
+    identifier,
+    quote_identifier,
+    sha256_text,
+    validate_contiguous_migrations,
+)
 
 from . import db
 
@@ -223,12 +231,9 @@ class SchemaMigrationError(db.ActionQError):
     """A deployment migration could not establish the expected schema."""
 
 
-@dataclass(frozen=True)
-class Migration:
-    version: int
-    name: str
-    sql: str
-    checksum: str
+# Preserve ActionQ's existing domain-module type name while using the shared,
+# database-independent immutable migration asset.
+Migration = MigrationAsset
 
 
 @dataclass(frozen=True)
@@ -250,19 +255,19 @@ def _migration_root():
     return resources.files("actionq").joinpath("migrations")
 
 
-def load_migrations() -> tuple[Migration, ...]:
-    migrations: list[Migration] = []
+def load_migrations() -> tuple[MigrationAsset, ...]:
+    migrations: list[MigrationAsset] = []
     for path in sorted(_migration_root().iterdir(), key=lambda item: item.name):
         match = _MIGRATION_RE.fullmatch(path.name)
         if match is None:
             continue
         raw = path.read_text(encoding="utf-8")
         migrations.append(
-            Migration(
+            MigrationAsset(
                 version=int(match.group("version")),
                 name=path.name,
                 sql=raw,
-                checksum=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                sha256=sha256_text(raw),
             )
         )
     versions = [migration.version for migration in migrations]
@@ -271,11 +276,19 @@ def load_migrations() -> tuple[Migration, ...]:
         raise SchemaMigrationError(
             f"migration assets must contain exactly versions {expected}; found {versions}"
         )
-    return tuple(migrations)
+    try:
+        return validate_contiguous_migrations(migrations)
+    except ValueError as exc:
+        raise SchemaMigrationError(str(exc)) from exc
 
 
-def _render(migration: Migration, schema: str) -> str:
-    quoted_schema = f'"{db.schema_name(schema)}"'
+def _render(migration: MigrationAsset, schema: str) -> str:
+    # ActionQ's released assets use {{schema}}, not the shared runtime's
+    # __SCHEMA__ token. Keep this byte-preserving local renderer while sharing
+    # the identifier contract.
+    validated_schema = db.schema_name(schema)
+    identifier(validated_schema, "schema")
+    quoted_schema = quote_identifier(validated_schema, "schema")
     rendered = migration.sql.replace("{{schema}}", quoted_schema)
     if "{{schema}}" in rendered:
         raise SchemaMigrationError(f"unresolved schema placeholder in {migration.name}")
@@ -308,16 +321,42 @@ def _ledger_exists(conn, schema: str) -> bool:
     return bool(row and _row_value(row, "relation"))
 
 
-def _applied_migrations(conn, schema: str) -> dict[int, str]:
+def _applied_migrations(conn, schema: str) -> dict[int, tuple[str, str]]:
     rows = conn.execute(
-        f"SELECT version, checksum FROM {db.qname(schema, MIGRATION_TABLE)} "
+        f"SELECT version, name, checksum FROM {db.qname(schema, MIGRATION_TABLE)} "
         "WHERE domain = %s ORDER BY version",
         (DOMAIN,),
     ).fetchall()
     return {
-        int(_row_value(row, "version")): str(_row_value(row, "checksum", 1))
+        int(_row_value(row, "version")): (
+            str(_row_value(row, "name", 1)),
+            str(_row_value(row, "checksum", 2)),
+        )
         for row in rows
     }
+
+
+def _ledger_report(
+    migrations: tuple[MigrationAsset, ...],
+    applied: dict[int, tuple[str, str]],
+):
+    """Return the shared pure verdict for ActionQ's execution-domain rows.
+
+    Database selection remains local and explicitly domain-filtered. Dummy
+    matching roles keep this helper limited to the immutable ledger verdict;
+    ActionQ's stronger live principal checks remain authoritative below.
+    """
+
+    return compatibility_report(
+        migrations,
+        applied,
+        schema="actionq_ledger_verdict",
+        domain_api_version=API_VERSION,
+        minimum_schema_version=MIN_SCHEMA_VERSION,
+        maximum_schema_version=MAX_SCHEMA_VERSION,
+        current_role="actionq_ledger_verifier",
+        configured_role="actionq_ledger_verifier",
+    )
 
 
 def _require_schema8_dispatch_root_quiescence(conn, schema: str) -> None:
@@ -1128,13 +1167,15 @@ def check_compatibility(
             detail="migration ledger is absent; run the deployment migration entrypoint",
         )
 
+    migrations = load_migrations()
     applied = _applied_migrations(conn, schema)
     observed = max(applied, default=0)
-    expected = {migration.version: migration.checksum for migration in load_migrations()}
+    expected = {migration.version: (migration.name, migration.sha256) for migration in migrations}
+    ledger_report = _ledger_report(migrations, applied)
     if not applied:
         state = "uninitialized"
         detail = "migration ledger contains no execution-domain versions"
-    elif observed > MAX_SCHEMA_VERSION:
+    elif "schema_too_new" in ledger_report.reasons:
         state = "too-new"
         detail = (
             f"schema version {observed} exceeds supported maximum "
@@ -1146,13 +1187,14 @@ def check_compatibility(
             f"schema version {observed} is below supported minimum "
             f"{MIN_SCHEMA_VERSION}"
         )
-    elif any(
-        version not in expected or applied[version] != expected[version]
-        for version in applied
-    ):
+    elif "migration_ledger_drift" in ledger_report.reasons:
         state = "checksum-mismatch"
         detail = "an applied migration checksum does not match the packaged asset"
-    elif set(applied) not in (set(expected), set(range(1, PRE_MIGRATION_BRIDGE_VERSION + 1))):
+    elif (
+        "migration_ledger_not_contiguous" in ledger_report.reasons
+        or set(applied)
+        not in (set(expected), set(range(1, PRE_MIGRATION_BRIDGE_VERSION + 1)))
+    ):
         state = "incomplete"
         detail = (
             f"applied migration versions {sorted(applied)} do not match "
@@ -1455,15 +1497,24 @@ def migrate(
         )
         applied = _applied_migrations(conn, schema)
         known = {migration.version: migration for migration in migrations}
-        unknown = sorted(set(applied) - set(known))
-        if unknown:
+        ledger_report = _ledger_report(migrations, applied)
+        if "schema_too_new" in ledger_report.reasons:
+            unknown = sorted(set(applied) - set(known))
             raise SchemaMigrationError(
                 f"database contains migration versions newer than this release: {unknown}"
             )
-        for version, checksum in applied.items():
-            if known[version].checksum != checksum:
+        if "migration_ledger_not_contiguous" in ledger_report.reasons:
+            raise SchemaMigrationError("database migration ledger versions are not contiguous")
+        if "migration_ledger_drift" in ledger_report.reasons:
+            version = next(
+                version
+                for version, recorded in sorted(applied.items())
+                if version not in known
+                or recorded != (known[version].name, known[version].sha256)
+            )
+            if version in known:
                 raise SchemaMigrationError(
-                    f"applied migration {version} checksum differs from packaged asset"
+                    f"applied migration {version} checksum or name differs from packaged asset"
                 )
         for migration in migrations:
             if migration.version in applied:
@@ -1499,7 +1550,7 @@ def migrate(
             conn.execute(
                 f"INSERT INTO {db.qname(schema, MIGRATION_TABLE)} "
                 "(domain, version, name, checksum) VALUES (%s, %s, %s, %s)",
-                (DOMAIN, migration.version, migration.name, migration.checksum),
+                (DOMAIN, migration.version, migration.name, migration.sha256),
             )
             applied_now.append(migration.version)
 

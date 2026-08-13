@@ -65,6 +65,13 @@ handlers, registration order, authorization, provenance, lifecycle, or
 compatibility behavior; all of those remain in `actionq.vuoro` and the ActionQ
 application core.
 
+ActionQ also pins `vuoro-schema-runtime` 0.1.0 for immutable migration assets,
+content digests, identifier quoting, contiguous-asset validation, and the pure
+migration-ledger verdict. ActionQ still owns database access, its released
+`{{schema}}` SQL renderer, execution-domain ledger selection, schema-3 bridge,
+schema-8 dispatch fence, shape and authority checks, grants, migrations, and
+the public compatibility record.
+
 Served mutation actors come from authenticated identity, require idempotency
 keys, and return durable accepted/rejected Actionq decision references. Runner
 effects remain machine-local; the service accepts session evidence and exposes

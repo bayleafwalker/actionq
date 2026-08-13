@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from actionq import db, schema, server
 from actionq.cli import cli
+from vuoro_schema_runtime import MigrationAsset
 
 
 class _Rows:
@@ -122,9 +125,14 @@ class FakeSchemaConnection:
         if normalized.startswith("CREATE TABLE IF NOT EXISTS \"aq\".\"schema_migrations\""):
             self.ledger_exists = True
             return _Rows()
-        if normalized.startswith("SELECT version, checksum"):
+        if normalized.startswith("SELECT version, name, checksum"):
+            names = {migration.version: migration.name for migration in schema.load_migrations()}
             return _Rows(
-                {"version": version, "checksum": checksum}
+                {
+                    "version": version,
+                    "name": names.get(version, "future.sql"),
+                    "checksum": checksum,
+                }
                 for version, checksum in sorted(self.applied.items())
             )
         if normalized.startswith("SELECT COUNT(*) AS dispatch_roots"):
@@ -446,7 +454,7 @@ class FakeSchemaConnection:
 
 
 def _packaged_checksums() -> dict[int, str]:
-    return {migration.version: migration.checksum for migration in schema.load_migrations()}
+    return {migration.version: migration.sha256 for migration in schema.load_migrations()}
 
 
 def test_migration_assets_are_contiguous_and_render_only_validated_schema():
@@ -459,6 +467,66 @@ def test_migration_assets_are_contiguous_and_render_only_validated_schema():
     assert len(schema._statements(rendered)) == 9
     with pytest.raises(db.ActionQError):
         schema._render(migrations[0], "unsafe-name")
+
+
+def test_shared_runtime_preserves_exact_actionq_migration_assets() -> None:
+    migrations = schema.load_migrations()
+    asset_root = Path(__file__).parents[1] / "actionq" / "migrations"
+
+    assert schema.Migration is MigrationAsset
+    assert all(isinstance(migration, MigrationAsset) for migration in migrations)
+    assert [migration.sha256 for migration in migrations] == [
+        "3551f71fc3516e30e3e98181c1d74f03dcf2db0e25046465390a75f73e230096",
+        "b11c502eeb80b8c3555b43deffc0cd31d59353e4c04170f63932ad6085c5e100",
+        "eb253555f00990f77bbe8015e2db5520c7f52fff9468ce8a5bc65f0a15ee9ac8",
+        "51c4f2f76528e9cbe5b9d131d217973ef38d7113642bb2a5ce888a9e6c7201b0",
+        "37ee95f27c60a3aae026d572b7d8c5f149bc5cc0ce427945ea57c3337878b586",
+        "b3a9edfcddb421c196893d6f906d8773a37a5660212da35750a0df7d85d7b9be",
+        "87cae21b94854fa221fb33a24d2ae8d56c94beccb710e6e71b2150f02058a5fe",
+        "770cbbed520d5f789a87349dcc25c7f474f60038dd7ea77d3d910e4ceed30a90",
+        "5725d5b260e89655f87a0ee24dda1f0ca9832a5b80b6ce58d47ca4dbe22d1471",
+        "de129bdeb9360f4f2ed65fd4bc74bbea2753584c1d03ff746b59a293b0c9cb93",
+        "cb2e8d388b27c4ff2486bdaadaeec75df45c875319d7e34b4391dd64e5653f56",
+    ]
+    assert all(
+        migration.sha256
+        == hashlib.sha256(migration.sql.encode("utf-8")).hexdigest()
+        for migration in migrations
+    )
+    assert [migration.sql.encode("utf-8") for migration in migrations] == [
+        asset.read_bytes() for asset in sorted(asset_root.glob("*.sql"))
+    ]
+
+
+@pytest.mark.parametrize("schema_name", ["aq", "vuoro_dev_execution", "a"])
+def test_shared_identifier_contract_preserves_local_renderer_bytes(
+    schema_name: str,
+) -> None:
+    for migration in schema.load_migrations():
+        expected = migration.sql.replace("{{schema}}", f'"{schema_name}"')
+        actual = schema._render(migration, schema_name)
+
+        assert actual.encode("utf-8") == expected.encode("utf-8")
+        assert "{{schema}}" not in actual
+
+
+def test_execution_ledger_read_remains_domain_filtered() -> None:
+    conn = FakeSchemaConnection(ledger_exists=True, applied=_packaged_checksums())
+
+    schema.check_compatibility(conn, "aq", require_runtime_principal=False)
+
+    ledger_reads = [
+        (statement, params)
+        for statement, params in conn.executed
+        if statement.startswith("SELECT version, name, checksum")
+    ]
+    assert ledger_reads == [
+        (
+            'SELECT version, name, checksum FROM "aq"."schema_migrations" '
+            "WHERE domain = %s ORDER BY version",
+            (schema.DOMAIN,),
+        )
+    ]
 
 
 def test_v3_migration_comment_is_attached_to_valid_sql_statement():
