@@ -1,0 +1,119 @@
+name: Release ActionQ wheel
+
+# An ActionQ vX.Y.Z tag intentionally triggers this wheel release and the
+# existing publish-server-image workflow. The two artifacts share one source
+# tag while retaining independent build, validation, and attestation jobs.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  attestations: write
+  contents: write
+  id-token: write
+
+jobs:
+  tests:
+    name: Release gate (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout ActionQ at the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Checkout verification contracts
+        uses: actions/checkout@v4
+        with:
+          repository: bayleafwalker/agentops
+          ref: cebcf9162fb97e7074838b49299b1d32666347be
+          path: agentops-contracts
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+      - name: Put PostgreSQL tools on PATH
+        run: echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
+      - name: Synchronize frozen workspace dependencies
+        run: uv sync --frozen --all-packages --all-extras
+      - name: Run the full PostgreSQL-backed suite
+        env:
+          AGENTOPS_SESSION_ARTIFACT_VALIDATOR: ${{ github.workspace }}/agentops-contracts/templates/dispatch/scripts/validate_session_mechanization_artifacts.py
+        run: uv run --all-packages --extra dev pytest -q
+
+  publish:
+    name: Build, attest, and publish the ActionQ wheel
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ActionQ at the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Synchronize frozen workspace dependencies
+        run: uv sync --frozen --all-packages --all-extras
+      - name: Build exactly one ActionQ release wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          uv build --wheel --package actionq --out-dir dist
+          shopt -s nullglob
+          wheels=(dist/actionq-*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "expected exactly one ActionQ wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+      - name: Validate wheel metadata, tag, and immutable dependencies
+        run: uv run python verification/validate_release_contract.py dist/actionq-*.whl --tag "$GITHUB_REF_NAME"
+      - name: Record deterministic wheel identity
+        id: wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel=(dist/actionq-*.whl)
+          wheel_name="$(basename "${wheel[0]}")"
+          sha256="$(sha256sum "${wheel[0]}" | awk '{print $1}')"
+          {
+            echo "path=${wheel[0]}"
+            echo "name=$wheel_name"
+            echo "sha256=$sha256"
+          } >> "$GITHUB_OUTPUT"
+      - name: Attest the exact release wheel
+        uses: actions/attest@v4
+        with:
+          subject-path: "${{ steps.wheel.outputs.path }}"
+      - name: Create the draft GitHub release with the wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          wheel="${{ steps.wheel.outputs.path }}"
+          wheel_name="${{ steps.wheel.outputs.name }}"
+          sha256="${{ steps.wheel.outputs.sha256 }}"
+          notes=$(printf 'tag: %s\ndistribution: actionq\nwheel: %s\nsha256: %s\n' \
+            "$tag" "$wheel_name" "$sha256")
+          gh release create "$tag" \
+            --verify-tag \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "$tag — actionq — $wheel_name — sha256:$sha256" \
+            --notes "$notes" \
+            "$wheel"
+      - name: Publish the GitHub release after attestation and draft creation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

@@ -7,16 +7,24 @@ standalone Actionq distribution free of a service-shell dependency.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 from typing import Any, Callable
+
+from vuoro_adapter_kit import (
+    CatalogRegistry,
+    SCHEMA_DIALECT,
+    SCHEMA_FEATURES as _ADAPTER_SCHEMA_FEATURES,
+    object_schema,
+)
 
 from . import db
 from .application import ActionQApplication, InvocationProvenance
 from actionq_contracts import DISPATCH_STOP_REASONS, DISPATCH_TERMINAL_STATUSES
 
 
-SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+SCHEMA_FEATURES = list(_ADAPTER_SCHEMA_FEATURES)
 API_VERSION = "v1"
 
 
@@ -24,21 +32,7 @@ def _transport(value: Any) -> Any:
     return json.loads(db.to_json(value))
 
 
-def _object(
-    properties: dict[str, Any],
-    *,
-    required: tuple[str, ...] = (),
-    additional: bool = False,
-) -> dict[str, Any]:
-    schema: dict[str, Any] = {
-        "$schema": SCHEMA_DIALECT,
-        "type": "object",
-        "properties": properties,
-        "additionalProperties": additional,
-    }
-    if required:
-        schema["required"] = list(required)
-    return schema
+_object = object_schema
 
 
 _NULLABLE_STRING = {"type": ["string", "null"]}
@@ -236,8 +230,8 @@ def _definition(
     return {
         "name": name,
         "owning_domain": "execution",
-        "input_schema": input_schema,
-        "result_schema": result_schema,
+        "input_schema": deepcopy(input_schema),
+        "result_schema": deepcopy(result_schema),
         "required_authority": authority,
         "execution_semantics": semantics,
         "idempotency": idempotency,
@@ -246,7 +240,7 @@ def _definition(
             "replacement": None,
             "sunset_at": None,
         },
-        "required_client_schema_features": ["json-schema-draft-2020-12"],
+        "required_client_schema_features": list(SCHEMA_FEATURES),
     }
 
 
@@ -881,7 +875,7 @@ def compatibility_record(
 
 
 def register_operations(
-    registry: Any,
+    registry: CatalogRegistry,
     *,
     application: ActionQApplication | None = None,
     definition_factory: Callable[..., Any] | None = None,
@@ -903,6 +897,8 @@ def register_operations(
 __all__ = [
     "API_VERSION",
     "AdapterOperation",
+    "SCHEMA_DIALECT",
+    "SCHEMA_FEATURES",
     "build_operations",
     "catalog_metadata",
     "compatibility_record",

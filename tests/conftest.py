@@ -83,19 +83,28 @@ def daemon_test_result_cas(tmp_path: Path, request, monkeypatch):
     Tests for the fail-closed root boundary opt out with the marker below.
     """
     if request.node.get_closest_marker("real_daemon_result_cas"):
+        yield
         return
     from actionq.daemon import Daemon
     from actionq_runner import FilesystemCAS
 
-    root = tmp_path / "daemon-result-cas"
+    root = Path("/dev/shm") / f"actionq-daemon-test-cas-{uuid.uuid4().hex}"
     root.mkdir(mode=0o700)
 
     def test_cas(self):
         if self.config.artifact_root is None:
+            # Real ActionctlClient doubles settle through a subprocess. Point
+            # that subprocess at the same test-only CAS that the daemon used
+            # to write the verified result packet; otherwise the full-suite
+            # harness supplies bytes to one root and verifies another.
+            if hasattr(self.client, "artifact_root"):
+                self.client.artifact_root = root
             return FilesystemCAS(root, allow_unsafe_test_root=True)
         return FilesystemCAS(self.config.artifact_root, allow_unsafe_test_root=True)
 
     monkeypatch.setattr(Daemon, "_cas", test_cas)
+    yield
+    shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture
