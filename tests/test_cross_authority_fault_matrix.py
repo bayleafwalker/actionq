@@ -346,7 +346,9 @@ def test_scope_kernel_verification_failure_releases_sprint_claim_before_fenced_f
         stored = db.get_action(conn, schema, action["id"])
         events = [_text(event["event_type"]) for event in db.action_events(conn, schema, action["id"])]
     assert _text(stored["status"]) == "failed"
-    assert "branch-ahead-of-base" in stored["failure_reason"]
+    # The durable action row exposes only the frozen privacy-safe stop-reason
+    # vocabulary; the detailed verifier reason remains in private evidence.
+    assert stored["failure_reason"] == "verification-failed"
     assert events.index("settlement.sprint_claim_released") < events.index("action_failed")
     sys.path.insert(0, str(SPRINTCTL_ROOT))
     from sprintctl import db as sprint_db

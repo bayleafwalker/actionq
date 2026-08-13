@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 import uuid
@@ -12,6 +15,7 @@ from actionq.application import ActionQApplication
 from actionq_contracts import CANDIDATE_VERIFICATION_SPEC_V1, sha256_digest
 from actionq.vuoro import (
     SCHEMA_DIALECT,
+    SCHEMA_FEATURES,
     build_operations,
     catalog_metadata,
     compatibility_record,
@@ -39,10 +43,16 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
     names = [definition["name"] for definition in catalog]
 
     assert len(names) == len(set(names))
-    assert set(names) == {
+    assert names == [
         "execution.action.enqueue",
+        "execution.dispatch.enqueue",
+        "execution.action.create-immutable-candidate",
         "execution.action.list",
         "execution.action.show",
+        "execution.group.realize",
+        "execution.group.stop-new-claims",
+        "execution.group.show",
+        "execution.group.list",
         "execution.action.claim",
         "execution.action.renew",
         "execution.action.settle",
@@ -58,21 +68,16 @@ def test_execution_catalog_is_domain_owned_and_runtime_only():
         "execution.session-completion.list",
         "execution.session-completion.replay",
         "execution.session-completion.health",
-        "execution.dispatch.enqueue",
         "execution.dispatch.enqueue.v1",
-        "execution.action.create-immutable-candidate",
         "execution.dispatch.list",
-        "execution.group.realize",
-        "execution.group.stop-new-claims",
-        "execution.group.show",
-        "execution.group.list",
-    }
+    ]
     assert not any("migrate" in name for name in names)
     for definition in catalog:
         assert definition["owning_domain"] == "execution"
         assert definition["name"].startswith("execution.")
         assert definition["input_schema"]["$schema"] == SCHEMA_DIALECT
         assert definition["result_schema"]["$schema"] == SCHEMA_DIALECT
+        assert definition["required_client_schema_features"] == SCHEMA_FEATURES
         if definition["execution_semantics"] != "read":
             assert definition["idempotency"] == "required"
 
@@ -108,6 +113,50 @@ def test_registry_composition_accepts_an_injected_protocol_definition_factory():
         definition["name"] for definition in catalog_metadata()
     ]
     assert all(callable(handler) for _definition, handler in registry.registered)
+
+
+def test_catalog_wire_hash_and_registration_definitions_are_exact():
+    catalog = catalog_metadata()
+    payload = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode()
+
+    assert len(catalog) == 26
+    assert hashlib.sha256(payload).hexdigest() == (
+        "8d434e8b347e804c90e48a6598304be84b12f2a61ebc2dbed00a26053239a778"
+    )
+
+    class Definition:
+        def __init__(self, **values):
+            self.values = values
+
+    class Registry:
+        def __init__(self):
+            self.registered = []
+
+        def register(self, definition, handler):
+            self.registered.append((definition, handler))
+
+    registry = Registry()
+    register_operations(registry, definition_factory=Definition)
+    assert [definition.values for definition, _handler in registry.registered] == catalog
+
+
+def test_catalog_nested_data_and_shared_builder_inputs_are_mutation_isolated():
+    first = catalog_metadata()
+    first[0]["input_schema"]["properties"]["action_type"]["minLength"] = 99
+    first[0]["required_client_schema_features"].append("test-feature")
+
+    second = catalog_metadata()
+    assert second[0]["input_schema"]["properties"]["action_type"]["minLength"] == 1
+    assert second[0]["required_client_schema_features"] == SCHEMA_FEATURES
+
+
+def test_runtime_dependency_is_pinned_to_immutable_release_wheel():
+    pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text()
+    assert (
+        "vuoro-adapter-kit @ https://github.com/bayleafwalker/vuoro/releases/"
+        "download/vuoro-adapter-kit-v0.1.0/vuoro_adapter_kit-0.1.0-py3-none-any.whl"
+        "#sha256=0037898a4c9f01720a42302365b0172ecd203732070326ea2abdf549a44bf0c2"
+    ) in pyproject
 
 
 @pytest.fixture

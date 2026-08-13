@@ -58,6 +58,13 @@ metadata, JSON Schemas, handlers, and the execution compatibility record for
 Vuoro composition. It does not add migrations or database access to the
 transport-only Vuoro client.
 
+ActionQ depends on the exact, digest-pinned `vuoro-adapter-kit` 0.1.0 GitHub
+Release wheel for pure Draft 2020-12 object-schema construction and the shared
+schema feature constants. The kit does not own ActionQ's 26 operation schemas,
+handlers, registration order, authorization, provenance, lifecycle, or
+compatibility behavior; all of those remain in `actionq.vuoro` and the ActionQ
+application core.
+
 Served mutation actors come from authenticated identity, require idempotency
 keys, and return durable accepted/rejected Actionq decision references. Runner
 effects remain machine-local; the service accepts session evidence and exposes

@@ -5,6 +5,12 @@ compatibility record for the Vuoro `execution` domain. Vuoro supplies the
 authenticated transport envelope and registry; it does not import database
 functions or reproduce Actionq lifecycle rules.
 
+The immutable `vuoro-adapter-kit` 0.1.0 wheel owns only pure Draft 2020-12
+object-schema building and the shared schema dialect/feature constants.
+ActionQ retains every operation schema, `AdapterOperation`, `_definition`,
+handler and served wrapper, registration order, authorization decision,
+invocation provenance rule, compatibility check, and lifecycle transition.
+
 The composition entry points are `actionq.vuoro.register_operations` and
 `actionq.vuoro.compatibility_record`. Importing either module does not connect
 to PostgreSQL, run a migration, or start a service. Every handler opens a
@@ -16,20 +22,37 @@ role compatibility check used by `actionctl` and `actionq-server`.
 | Operation | Authority | Semantics | Idempotency |
 | --- | --- | --- | --- |
 | `execution.action.enqueue` | `execution.enqueue` | enqueue | required |
-| `execution.action.list` | `execution.read` | read | forbidden |
-| `execution.action.show` | `execution.read` | read | forbidden |
+| `execution.dispatch.enqueue` | `execution.enqueue` | enqueue | required |
+| `execution.action.create-immutable-candidate` | `execution.candidate-action.create` | enqueue | required |
+| `execution.action.list` | `execution.read` | read | not-allowed |
+| `execution.action.show` | `execution.read` | read | not-allowed |
+| `execution.group.realize` | `execution.group.manage` | write | required |
+| `execution.group.stop-new-claims` | `execution.group.manage` | write | required |
+| `execution.group.show` | `execution.read` | read | not-allowed |
+| `execution.group.list` | `execution.read` | read | not-allowed |
 | `execution.action.claim` | `execution.claim` | write | required |
 | `execution.action.renew` | `execution.claim` | write | required |
+| `execution.action.settle` | `execution.transition` | write | required |
 | `execution.action.complete` | `execution.transition` | write | required |
 | `execution.action.fail` | `execution.transition` | write | required |
 | `execution.action.reject` | `execution.transition` | write | required |
 | `execution.action.cancel` | `execution.transition` | write | required |
 | `execution.action.sweep` | `execution.sweep` | admin | required |
-| `execution.event.list` | `execution.read` | read | forbidden |
-| `execution.session.list` | `execution.read` | read | forbidden |
+| `execution.event.list` | `execution.read` | read | not-allowed |
+| `execution.session.list` | `execution.read` | read | not-allowed |
 | `execution.session.record` | `execution.session.report` | write | required |
-| `execution.dispatch.enqueue` | `execution.dispatch.enqueue` | enqueue | required |
-| `execution.dispatch.list` | `execution.read` | read | forbidden |
+| `execution.session-completion.ingest` | `execution.session-completion.ingest` | write | required |
+| `execution.session-completion.list` | `execution.session-completion.read` | read | not-allowed |
+| `execution.session-completion.replay` | `execution.session-completion.read` | read | not-allowed |
+| `execution.session-completion.health` | `execution.session-completion.read` | read | not-allowed |
+| `execution.dispatch.enqueue.v1` | `execution.dispatch.enqueue` | enqueue | required |
+| `execution.dispatch.list` | `execution.read` | read | not-allowed |
+
+The table is the exact 26-operation registration order. Its canonical JSON
+catalog hash is
+`8d434e8b347e804c90e48a6598304be84b12f2a61ebc2dbed00a26053239a778`.
+The adapter-kit migration does not add, remove, reorder, or alter any catalog
+operation.
 
 The transport identity supplies the actor and environment. Claim and renewal
 inputs therefore do not accept a caller-provided worker, and dispatch inputs do
