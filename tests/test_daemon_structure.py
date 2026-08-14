@@ -7,14 +7,16 @@ from actionq.daemon_runtime import Daemon as RuntimeDaemon
 from actionq.daemon_audit import DaemonAuditMixin
 from actionq.daemon_claim import DaemonClaimMixin
 from actionq.daemon_lifecycle import DaemonLifecycleMixin
+from actionq.daemon_routing import DaemonRoutingMixin
 from actionq.daemon_runner import DaemonRunnerMixin
 
 
 def test_daemon_compatibility_surface_exports_runtime_and_clients():
     assert Daemon.__mro__[1] is RuntimeDaemon
-    assert RuntimeDaemon.__mro__[1:5] == (
+    assert RuntimeDaemon.__mro__[1:6] == (
         DaemonLifecycleMixin,
         DaemonRunnerMixin,
+        DaemonRoutingMixin,
         DaemonClaimMixin,
         DaemonAuditMixin,
     )
@@ -28,5 +30,6 @@ def test_daemon_compatibility_surface_exports_runtime_and_clients():
 def test_daemon_methods_live_in_focused_boundaries():
     assert RuntimeDaemon.run_forever.__module__ == DaemonLifecycleMixin.__module__
     assert RuntimeDaemon._start_child.__module__ == DaemonRunnerMixin.__module__
+    assert RuntimeDaemon._context_candidates_request.__module__ == DaemonRoutingMixin.__module__
     assert RuntimeDaemon._takeup_take.__module__ == DaemonClaimMixin.__module__
     assert RuntimeDaemon._publish_audit.__module__ == DaemonAuditMixin.__module__

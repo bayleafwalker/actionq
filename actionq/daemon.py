@@ -14,6 +14,7 @@ from . import daemon_runtime as _runtime
 from . import daemon_audit as _audit
 from . import daemon_claim as _claim
 from . import daemon_lifecycle as _lifecycle
+from . import daemon_routing as _routing
 from . import daemon_runner as _runner
 from .daemon_config import *
 from .daemon_config import _audit_refs, _is_shared_sprint_backend, _now
@@ -33,7 +34,7 @@ def _sync_runtime_namespace() -> None:
     ):
         if name in globals():
             value = globals()[name]
-            for module in (_runtime, _audit, _claim, _lifecycle, _runner):
+            for module in (_runtime, _audit, _claim, _lifecycle, _routing, _runner):
                 setattr(module, name, value)
 
 
