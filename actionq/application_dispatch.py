@@ -5,6 +5,7 @@ from __future__ import annotations
 from .application_core import *
 from .application_core import (
     _DISPATCH_V2_FIELDS, _HARNESSES, _KIND_TO_ACTION_TYPE, _OUTPUT_EXPECTATIONS,
+    _PRIORITIES,
     CANONICALIZATION_VERSION,
 )
 
@@ -202,6 +203,5 @@ class DispatchService:
             result = self._read(read)
             if result["events"] or wait_seconds == 0 or time.monotonic() >= deadline: return result
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-
 
 
