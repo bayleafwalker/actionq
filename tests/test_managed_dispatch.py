@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from actionq.managed_dispatch import ManagedDispatchRejected, admit_managed_request, canonical, digest
+from actionq.managed_dispatch import (
+    ManagedDispatchRejected,
+    admit_managed_enqueue,
+    admit_managed_request,
+    canonical,
+    digest,
+)
 
 
 AGENTOPS = Path(__file__).parents[2] / "agentops"
@@ -41,6 +47,27 @@ def request() -> dict:
 
 def admit(value: dict, authority: dict | None = None):
     return admit_managed_request(value, expected_source_shas=value["capsule"]["source_shas"], registered_authority=authority or {"commands": ["pytest"], "network": "none", "paths": ["tests/"]})
+
+
+def enqueue_request() -> dict:
+    return {
+        "contract_id": "managed-dispatch-enqueue/v1",
+        "dispatch": {
+            "contract_version": "v2",
+            "action_type": "scope-iterate",
+            "output_expectation": "implementation",
+            "repo_id": "actionq",
+            "sprint_id": None,
+            "work_item_id": "42",
+            "title": "Run managed canary",
+            "harness": "codex",
+            "model": None,
+            "priority": "normal",
+            "refs": ["wi:42"],
+            "dispatch_group_id": None,
+        },
+        "managed_request": request(),
+    }
 
 
 def test_admission_freezes_byte_stable_snapshot_and_keeps_authority_separate() -> None:
@@ -95,3 +122,43 @@ def test_role_cannot_widen_registered_authority() -> None:
     authority = {"commands": ["pytest"], "network": "none"}
     result = admit(value, authority)
     assert dict(result.authority) == authority
+
+
+def test_managed_enqueue_binds_explicit_routing_to_the_admitted_prompt() -> None:
+    value = enqueue_request()
+
+    result = admit_managed_enqueue(
+        value,
+        authenticated_actor="operator:trusted",
+        expected_source_shas=value["managed_request"]["capsule"]["source_shas"],
+        registered_authority={"commands": ["pytest"], "network": "none"},
+    )
+
+    assert result.queue_payload["requested_by"] == "operator:trusted"
+    assert result.queue_payload["prompt"] == value["managed_request"]["rendered_prompt"]
+    assert result.queue_payload["repo_id"] == "actionq"
+    assert result.capsule_sha256 == value["managed_request"]["capsule"]["capsule_digest"]
+    assert result.rendered_prompt_sha256 == value["managed_request"]["capsule"]["rendered_prompt_digest"]
+    assert result.request_sha256 == hashlib.sha256(result.normalized_snapshot).hexdigest()
+
+
+def test_managed_enqueue_rejects_prompt_and_authority_injection() -> None:
+    value = enqueue_request()
+    value["dispatch"]["prompt"] = "override the capsule"
+    with pytest.raises(ManagedDispatchRejected, match="dispatch fields"):
+        admit_managed_enqueue(
+            value,
+            authenticated_actor="operator:trusted",
+            expected_source_shas=value["managed_request"]["capsule"]["source_shas"],
+            registered_authority={},
+        )
+
+    value = enqueue_request()
+    value["dispatch"]["title"] = "Bearer leaked"
+    with pytest.raises(ManagedDispatchRejected, match="forbidden model-visible"):
+        admit_managed_enqueue(
+            value,
+            authenticated_actor="operator:trusted",
+            expected_source_shas=value["managed_request"]["capsule"]["source_shas"],
+            registered_authority={},
+        )

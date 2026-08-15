@@ -16,6 +16,7 @@ from typing import Any, Mapping
 
 
 REQUEST_VERSION = "managed-dispatch-request/v1"
+ENQUEUE_VERSION = "managed-dispatch-enqueue/v1"
 CAPSULE_VERSION = "managed-dispatch-capsule/v1"
 RENDERER_VERSION = "agentops-managed-capsule/1"
 FORBIDDEN_KEY = re.compile(r"(?:credential|bearer|token|claim_(?:proof|receipt)|capability_handle|broker_(?:path|socket)|provider_secret|secret)", re.I)
@@ -33,6 +34,47 @@ class ManagedAdmission:
     capsule_sha256: str
     rendered_prompt_sha256: str
     authority: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ManagedEnqueueAdmission:
+    """A managed request bound to explicit, authenticated queue routing.
+
+    The capsule is never allowed to choose a repository, action, harness, or
+    model.  Conversely, the caller cannot supply a substitute prompt: the
+    admitted capsule's rendered bytes are the only queue prompt.
+
+    This is an admission/binding record only.  Persisting it and delivering it
+    to a runner are separate ActionQ lifecycle phases.
+    """
+
+    normalized_snapshot: bytes
+    request_sha256: str
+    capsule_sha256: str
+    rendered_prompt_sha256: str
+    queue_payload: Mapping[str, Any]
+
+
+_ENQUEUE_FIELDS = {
+    "contract_id",
+    "dispatch",
+    "managed_request",
+}
+
+_DISPATCH_FIELDS = {
+    "contract_version",
+    "action_type",
+    "output_expectation",
+    "repo_id",
+    "sprint_id",
+    "work_item_id",
+    "title",
+    "harness",
+    "model",
+    "priority",
+    "refs",
+    "dispatch_group_id",
+}
 
 
 def canonical(value: Any) -> bytes:
@@ -120,4 +162,58 @@ def admit_managed_request(
         capsule_sha256=capsule["capsule_digest"],
         rendered_prompt_sha256=capsule["rendered_prompt_digest"],
         authority=authority,
+    )
+
+
+def admit_managed_enqueue(
+    envelope: dict[str, Any],
+    *,
+    authenticated_actor: str,
+    expected_source_shas: Mapping[str, str],
+    registered_authority: Mapping[str, Any],
+) -> ManagedEnqueueAdmission:
+    """Validate a managed envelope and derive its immutable v2 queue payload.
+
+    ``authenticated_actor`` is supplied by the served identity boundary, not
+    by the model-visible envelope.  The returned payload is compatible with
+    :meth:`DispatchService._normalize_dispatch_v2`; importing that validator
+    lazily keeps this low-level contract independent of application assembly.
+    """
+    if not isinstance(envelope, dict) or set(envelope) != _ENQUEUE_FIELDS:
+        raise ManagedDispatchRejected("managed enqueue fields are invalid")
+    if envelope.get("contract_id") != ENQUEUE_VERSION:
+        raise ManagedDispatchRejected("managed enqueue contract mismatch")
+    if not isinstance(authenticated_actor, str) or not authenticated_actor.strip():
+        raise ManagedDispatchRejected("authenticated actor is required")
+    dispatch = envelope.get("dispatch")
+    if not isinstance(dispatch, dict) or set(dispatch) != _DISPATCH_FIELDS:
+        raise ManagedDispatchRejected("managed enqueue dispatch fields are invalid")
+    managed_request = envelope.get("managed_request")
+    if not isinstance(managed_request, dict):
+        raise ManagedDispatchRejected("managed enqueue request is invalid")
+
+    # Validate the complete visible input before constructing queue state.
+    _deny_model_secrets(envelope)
+    admitted = admit_managed_request(
+        managed_request,
+        expected_source_shas=expected_source_shas,
+        registered_authority=registered_authority,
+    )
+    queue_payload = {
+        **dispatch,
+        "prompt": managed_request["rendered_prompt"],
+        "requested_by": authenticated_actor,
+    }
+    # Keep v2's exact type/enum contract in one place; it is not an authority
+    # decision and it cannot override the capsule-derived prompt above.
+    from .application_dispatch import DispatchService
+
+    normalized_payload, _raw = DispatchService._normalize_dispatch_v2(queue_payload)
+    snapshot = canonical(envelope)
+    return ManagedEnqueueAdmission(
+        normalized_snapshot=snapshot,
+        request_sha256=hashlib.sha256(snapshot).hexdigest(),
+        capsule_sha256=admitted.capsule_sha256,
+        rendered_prompt_sha256=admitted.rendered_prompt_sha256,
+        queue_payload=MappingProxyType(dict(normalized_payload)),
     )
