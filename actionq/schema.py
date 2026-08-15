@@ -1071,6 +1071,7 @@ def _unversioned_v1_shape_issues(issues: tuple[str, ...] | list[str]) -> list[st
         "constraint-missing-or-invalid:action-resource-",
         "constraint-missing-or-invalid:action_resource_",
         "index-missing-or-invalid:action-resource-",
+        "column-missing:managed_dispatch_envelopes.",
     )
     return [
         issue for issue in issues
@@ -1112,6 +1113,7 @@ def _schema3_bridge_shape_issues(conn, schema: str) -> tuple[str, ...]:
         "action_resources",
         "action_resource_changes",
         "action_resource_sessions",
+        "managed_dispatch_envelopes",
     )
     rows = conn.execute(
         """

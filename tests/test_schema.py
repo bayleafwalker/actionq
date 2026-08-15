@@ -675,6 +675,7 @@ def test_unversioned_v1_adoption_allows_only_expected_later_relation_absence():
             "column-missing:actions.claim_receipt",
             "column-missing:dispatch_requests.request_ref",
             "column-missing:dispatch_observation_watermarks.last_observed_event_id",
+            "column-missing:managed_dispatch_envelopes.action_id",
             "constraint-missing-or-invalid:dispatch-requests-request-ref-unique",
             "constraint-missing-or-invalid:dispatch_requests.operation",
             "constraint-missing-or-invalid:dispatch_observation_watermarks.last_observed_event_id",
@@ -701,6 +702,19 @@ def test_schema3_bridge_accepts_absent_post_v3_watermark_relation():
 
     assert result.compatible is True
     assert result.observed_schema_version == 3
+
+
+def test_schema3_bridge_accepts_absent_post_v12_managed_envelope_relation():
+    conn = FakeSchemaConnection(
+        ledger_exists=True,
+        applied={version: checksum for version, checksum in _packaged_checksums().items() if version <= 3},
+        watermark_relation=False,
+    )
+    conn.managed_dispatch_envelope_relation = False
+
+    result = schema.check_compatibility(conn, "aq")
+
+    assert result.compatible is True
 
 
 @pytest.mark.parametrize(
