@@ -78,31 +78,48 @@ class ContextClient(Protocol):
     def fetch_item(self, project: ProjectConfig, *, item_id: int) -> dict[str, Any]: ...
 
 
-class ClaimClient(Protocol):
-    def start(
-        self, project: ProjectConfig, *, item_id: int, actor: str, ttl_seconds: int, branch: str | None
+class ReservationClient(Protocol):
+    """Credential-free Sprintctl reservation operations.
+
+    These operations coordinate ActionQ execution but never authorize it. The
+    ActionQ claim receipt remains the execution authority and is renewed by the
+    coordinator client separately.
+    """
+
+    def reserve(
+        self, project: ProjectConfig, *, item_id: int, actor: str, role: str,
+        session_id: str, correlation_ref: str | None,
     ) -> dict[str, Any]: ...
 
-    def renew(
-        self, project: ProjectConfig, *, claim_id: int, claim_token: str,
-        actor: str, ttl_seconds: int, runtime_session_id: str,
+    def touch(
+        self, project: ProjectConfig, *, reservation_id: int, session_id: str,
+        correlation_ref: str | None,
     ) -> dict[str, Any]: ...
 
     def release(
-        self, project: ProjectConfig, *, claim_id: int, claim_token: str, actor: str,
+        self, project: ProjectConfig, *, reservation_id: int, actor: str,
     ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
-class SprintClaimLease:
-    """In-memory-only authority proof for the current supervised session."""
+class SprintReservation:
+    """In-memory reference to the current advisory reservation.
+
+    A reservation contains no bearer proof. Only its identifier and public
+    coordination metadata are retained so the daemon can touch and release
+    the row during the supervised ActionQ session.
+    """
 
     project: ProjectConfig
-    claim_id: int
-    claim_token: str
+    reservation_id: int
     actor: str
-    ttl_seconds: int
     runtime_session_id: str
+
+
+# Compatibility names for integrations that supplied the old constructor
+# keyword. The implementation and wire calls are reservation-only.
+ClaimClient = ReservationClient
+SprintClaimLease = SprintReservation
 
 
 class AuditClient(Protocol):
@@ -320,66 +337,76 @@ class SprintctlContextClient:
         return item
 
 
-class SprintctlClaimClient:
-    """Pre-start claim acquisition for an explicit, ``claim_eligible``
-    context-candidates target (item #1116). This is the only path in this
-    module that mutates sprintctl item/claim state before a child session
-    starts; it fails closed -- callers must not start the child when
-    ``start`` raises.
+class SprintctlReservationClient:
+    """Credential-free reservation client for an explicit target.
+
+    The caller may require a successful reservation as an operational
+    visibility precondition, but the returned row is never treated as an
+    ownership capability and overlaps are accepted by Sprintctl.
     """
 
     def __init__(self, executable: str):
         self.executable = executable
 
-    def start(
-        self, project: ProjectConfig, *, item_id: int, actor: str, ttl_seconds: int, branch: str | None
+    def reserve(
+        self, project: ProjectConfig, *, item_id: int, actor: str, role: str,
+        session_id: str, correlation_ref: str | None,
     ) -> dict[str, Any]:
-        args = [self.executable, "claim", "start", "--item-id", str(item_id), "--actor", actor,
-                "--ttl", str(ttl_seconds), "--json"]
-        if branch:
-            args.extend(["--branch", branch])
+        args = [self.executable, "reservation", "reserve", "--item-id", str(item_id),
+                "--actor", actor, "--role", role, "--session-id", session_id, "--json"]
+        if correlation_ref:
+            args.extend(["--correlation-ref", correlation_ref])
         environment = os.environ.copy()
         environment.update(project.env or {})
         completed = subprocess.run(args, cwd=project.path, env=environment, text=True, capture_output=True,
                                    check=False, timeout=30)
         if completed.returncode:
-            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim start failed"
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl reservation reserve failed"
             raise RuntimeError(detail)
-        return json.loads(completed.stdout)
+        result = json.loads(completed.stdout)
+        return result.get("reservation", result) if isinstance(result, dict) else result
 
-    def renew(
-        self, project: ProjectConfig, *, claim_id: int, claim_token: str,
-        actor: str, ttl_seconds: int, runtime_session_id: str,
+    def touch(
+        self, project: ProjectConfig, *, reservation_id: int, session_id: str,
+        correlation_ref: str | None,
     ) -> dict[str, Any]:
         args = [
-            self.executable, "claim", "heartbeat", "--id", str(claim_id),
-            "--claim-token", claim_token, "--actor", actor, "--ttl", str(ttl_seconds),
-            "--runtime-session-id", runtime_session_id, "--json",
+            self.executable, "reservation", "touch", "--id", str(reservation_id),
+            "--session-id", session_id, "--json",
         ]
+        if correlation_ref:
+            args.extend(["--correlation-ref", correlation_ref])
         environment = os.environ.copy()
         environment.update(project.env or {})
         completed = subprocess.run(args, cwd=project.path, env=environment, text=True,
                                    capture_output=True, check=False, timeout=30)
         if completed.returncode:
-            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim heartbeat failed"
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl reservation touch failed"
             raise RuntimeError(detail)
-        return json.loads(completed.stdout)
+        result = json.loads(completed.stdout)
+        return result.get("reservation", result) if isinstance(result, dict) else result
 
     def release(
-        self, project: ProjectConfig, *, claim_id: int, claim_token: str, actor: str,
+        self, project: ProjectConfig, *, reservation_id: int, actor: str,
     ) -> dict[str, Any]:
         args = [
-            self.executable, "claim", "release", "--id", str(claim_id),
-            "--claim-token", claim_token, "--actor", actor,
+            self.executable, "reservation", "release", "--id", str(reservation_id),
+            "--actor", actor, "--json",
         ]
         environment = os.environ.copy()
         environment.update(project.env or {})
         completed = subprocess.run(args, cwd=project.path, env=environment, text=True,
                                    capture_output=True, check=False, timeout=30)
         if completed.returncode:
-            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl claim release failed"
+            detail = completed.stderr.strip() or completed.stdout.strip() or "sprintctl reservation release failed"
             raise RuntimeError(detail)
-        return {"claim_id": claim_id, "status": "released"}
+        result = json.loads(completed.stdout)
+        return result.get("reservation", result) if isinstance(result, dict) else result
+
+
+# Keep the old import/constructor name available to older callers while
+# exposing only the reservation wire contract.
+SprintctlClaimClient = SprintctlReservationClient
 
 
 class AuditctlClient:

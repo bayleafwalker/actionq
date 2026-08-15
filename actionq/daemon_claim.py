@@ -1,4 +1,4 @@
-"""Sprint claim and context-client boundary used by the daemon."""
+"""Sprint reservation and context-client boundary used by the daemon."""
 
 from __future__ import annotations
 
@@ -66,18 +66,21 @@ from .daemon_config import _now
 
 class DaemonClaimMixin:
     @staticmethod
-    def _claim_ref(lease: SprintClaimLease | None) -> dict[str, Any] | None:
-        """Return audit-safe claim identity; opaque proof never leaves memory."""
-        if lease is None:
+    def _reservation_ref(reservation: SprintReservation | None) -> dict[str, Any] | None:
+        """Return the public reservation identity for audit payloads."""
+        if reservation is None:
             return None
-        return {"claim_id": lease.claim_id, "runtime_session_id": lease.runtime_session_id}
+        return {
+            "reservation_id": reservation.reservation_id,
+            "runtime_session_id": reservation.runtime_session_id,
+        }
 
-    def _after_sprint_claim_release(self, lease: SprintClaimLease) -> None:
+    def _after_sprint_reservation_release(self, reservation: SprintReservation) -> None:
         """Lifecycle seam used by the fault harness to model a process crash.
 
         Production deliberately has no side effect here.  The boundary is
-        explicit because Sprintctl release and ActionQ terminal settlement
-        are separate authorities and cannot be one transaction.
+        explicit because Sprintctl reservation release and ActionQ terminal
+        settlement are separate authorities and cannot be one transaction.
         """
 
     def _takeup_take(self, project: ProjectConfig | None, session_id: str, pid: int) -> dict[str, Any]:

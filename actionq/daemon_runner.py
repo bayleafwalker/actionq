@@ -66,10 +66,15 @@ from .daemon_config import _audit_refs, _is_shared_sprint_backend, _now
 
 class DaemonRunnerMixin:
     def _runnerctl_json(self, *args: str, input_value: dict[str, Any] | None = None) -> Any:
+        environment = os.environ.copy()
+        if self.config.runner_identity_registry_path is not None:
+            environment["ACTIONQ_RUNNER_IDENTITY_REGISTRY"] = str(
+                self.config.runner_identity_registry_path
+            )
         completed = subprocess.run(
             [self.config.runnerctl_bin, *args],
             input=(json.dumps(input_value, sort_keys=True) if input_value is not None else None),
-            text=True, capture_output=True, check=False,
+            text=True, capture_output=True, check=False, env=environment,
         )
         if completed.returncode:
             raise RuntimeError(completed.stderr.strip() or "actionq-runner publication command failed")
@@ -523,14 +528,24 @@ class DaemonRunnerMixin:
                         raise RoutingError("configured worker_user does not exist") from exc
                     if worker_uid == os.geteuid():
                         raise RoutingError("worker_user must differ from the trusted supervisor identity")
-                if action_config.runner == "harness" and not (action.get("prompt") or action_config.prompt):
+                managed_envelope = action.get("managed_dispatch_envelope")
+                managed_prompt = (
+                    managed_envelope.get("managed_request", {}).get("rendered_prompt")
+                    if isinstance(managed_envelope, dict)
+                    and isinstance(managed_envelope.get("managed_request"), dict)
+                    else None
+                )
+                if action_config.runner == "harness" and not (
+                    action.get("prompt") or action_config.prompt
+                    or (isinstance(managed_prompt, str) and managed_prompt)
+                ):
                     raise RoutingError("runner 'harness' requires an explicit or action-class prompt")
                 if action_config.runner == "scope-iterate":
                     if action_config.scope_iterate is None:
                         raise RoutingError("runner 'scope-iterate' requires an explicit scope_iterate policy")
                     if not self.config.context.enabled or not self.config.context.auto_claim:
                         raise RoutingError(
-                            "runner 'scope-iterate' requires context.enabled and context.auto_claim"
+                            "runner 'scope-iterate' requires context.enabled and context.auto_claim (advisory reservation)"
                         )
                     if action.get("target_ref") is None:
                         raise RoutingError("runner 'scope-iterate' requires an exact target_ref")
@@ -552,7 +567,7 @@ class DaemonRunnerMixin:
                 if project is None or action_config.scope_iterate is None:
                     raise RoutingError("runner 'oci-scope-iterate' requires project and scope_iterate policy")
                 if not self.config.context.enabled or not self.config.context.auto_claim:
-                    raise RoutingError("runner 'oci-scope-iterate' requires exact-target context claims")
+                    raise RoutingError("runner 'oci-scope-iterate' requires an exact-target context reservation")
                 if action.get("target_ref") is None:
                     raise RoutingError("runner 'oci-scope-iterate' requires an exact target_ref")
                 if not action_config.command:
@@ -592,10 +607,10 @@ class DaemonRunnerMixin:
         # Tier-1 deterministic context injection (item #1116): a bounded,
         # ranked context-candidates packet is requested before the child
         # starts, and is always fetched best-effort/fail-open. A pre-start
-        # claim is only ever attempted for an explicit target sprintctl
-        # itself marked claim_eligible -- never for advisory/inferred
-        # candidates -- and that attempt fails closed (see
-        # ``_context_claim_acquire``): a failure here must stop the action
+        # reservation is only ever attempted for an explicit target sprintctl
+        # itself marked reservation_admissible -- never for
+        # advisory/inferred candidates -- and that attempt fails closed (see
+        # ``_context_reservation_acquire``): a failure here must stop the action
         # before any child process starts.
         context_result = self._context_candidates_request(project, action)
         prepared_scope: PreparedScopeIterate | None = None
@@ -608,7 +623,7 @@ class DaemonRunnerMixin:
                 target_item = self.context_client.fetch_item(
                     project, item_id=target_item_id
                 )
-                target_item = {**target_item, "claim_eligible": True}
+                target_item = {**target_item, "reservation_admissible": True}
                 prepared_scope = ScopeIterateKernel().prepare(
                     ScopeIterateRequest(
                         action_id=action_id,
@@ -622,15 +637,15 @@ class DaemonRunnerMixin:
             except Exception as exc:
                 self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
                 return
-        claim_result = self._context_claim_acquire(
+        reservation_result = self._context_reservation_acquire(
             project, context_result, session_id, ttl_seconds,
             branch=prepared_scope.branch if prepared_scope else None,
             exact_target=(action_config.runner == "scope-iterate"),
         )
         self.client.emit("session.dispatch", action_id=action_id, actor=self.actor,
                          payload={**payload, "audit_dispatch": audit_dispatch,
-                                 "context": context_result, "context_claim": claim_result})
-        if claim_result is not None and claim_result.get("status") == "failed":
+                                 "context": context_result, "context_reservation": reservation_result})
+        if reservation_result is not None and reservation_result.get("status") == "failed":
             self._settle_result(action, claim_receipt=claim_receipt, terminal_status="blocked", stop_reason="start-failed")
             return
         # Best-effort starting git state for this project (#1115 crash-
@@ -680,6 +695,10 @@ class DaemonRunnerMixin:
             caller_harness=routing.caller_harness if routing else None,
             catalog_workaround=routing.catalog_workaround if routing else None,
         )
+        # Persist the claimed session before child creation. If the daemon or
+        # runner dies in the narrow start window, recovery still has a durable
+        # claim incarnation to settle instead of leaving the action orphaned.
+        self._write_state(record)
         output_path = (
             self._output_path(session_id)
             if action_config.runner in {"command", "harness", "scope-iterate", "oci-scope-iterate"}
@@ -752,9 +771,9 @@ class DaemonRunnerMixin:
             self.client.emit("session.started", action_id=action_id, actor=self.actor,
                              payload={**payload, "pid": record.pid, "started_at": record.started_at,
                                      "sprint_takeup": takeup, "audit_start": audit_start})
-            sprint_claim_lease = self._sprint_claim_leases.get(session_id)
+            sprint_reservation = self._sprint_reservations.get(session_id)
             outcome, exit_code = self._wait_for_child(
-                action_id, payload, record, claim_receipt, runner_auth_token, sprint_claim_lease,
+                action_id, payload, record, claim_receipt, runner_auth_token, sprint_reservation,
                 project, audit_actor, audit_refs,
             )
             record.updated_at = _now()
@@ -801,26 +820,29 @@ class DaemonRunnerMixin:
             settlement_error: str | None = None
             self.client.emit(
                 "settlement.pending", action_id=action_id, actor=self.actor,
-                payload={**payload, "outcome": outcome, "sprint_claim": self._claim_ref(sprint_claim_lease)},
+                payload={**payload, "outcome": outcome, "sprint_reservation": self._reservation_ref(sprint_reservation)},
             )
-            if sprint_claim_lease is not None:
+            if sprint_reservation is not None:
                 try:
-                    self.claim_client.release(
-                        sprint_claim_lease.project, claim_id=sprint_claim_lease.claim_id,
-                        claim_token=sprint_claim_lease.claim_token, actor=sprint_claim_lease.actor,
+                    self.reservation_client.release(
+                        sprint_reservation.project,
+                        reservation_id=sprint_reservation.reservation_id,
+                        actor=sprint_reservation.actor,
                     )
                 except Exception as exc:
-                    settlement_error = f"sprint claim release failed: {exc}"
+                    # Reservation release is advisory cleanup. It must remain
+                    # visible, but it cannot veto ActionQ's authoritative
+                    # settlement or turn into a claim-loss signal.
                     self.client.emit(
-                        "settlement.sprint_claim_release_failed", action_id=action_id, actor=self.actor,
-                        payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease), "detail": str(exc)},
+                        "settlement.sprint_reservation_release_failed", action_id=action_id, actor=self.actor,
+                        payload={**payload, "sprint_reservation": self._reservation_ref(sprint_reservation), "detail": str(exc)},
                     )
                 else:
                     self.client.emit(
-                        "settlement.sprint_claim_released", action_id=action_id, actor=self.actor,
-                        payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease)},
+                        "settlement.sprint_reservation_released", action_id=action_id, actor=self.actor,
+                        payload={**payload, "sprint_reservation": self._reservation_ref(sprint_reservation)},
                     )
-                    self._after_sprint_claim_release(sprint_claim_lease)
+                    self._after_sprint_reservation_release(sprint_reservation)
             exited = {**payload, "pid": record.pid, "outcome": outcome, "exit_code": exit_code, "exited_at": _now(),
                      "sprint_takeup_release": released, "audit_exit": audit_exit,
                      "usage_limit_paused": usage_limit_reason is not None,
@@ -832,7 +854,7 @@ class DaemonRunnerMixin:
                 # claimant owns that decision.
                 self.client.emit(
                     "settlement.actionq_skipped_claim_lost", action_id=action_id, actor=self.actor,
-                    payload={**payload, "sprint_claim": self._claim_ref(sprint_claim_lease)},
+                    payload={**payload, "sprint_reservation": self._reservation_ref(sprint_reservation)},
                 )
             elif outcome == "cancelled":
                 # The acknowledgement already performed the terminal mutation.
@@ -891,7 +913,7 @@ class DaemonRunnerMixin:
                     pass
             raise
         finally:
-            self._sprint_claim_leases.pop(session_id, None)
+            self._sprint_reservations.pop(session_id, None)
             self._child = None
             cleanup_ok = True
             if action_config.runner == "oci-scope-iterate":
@@ -1209,7 +1231,7 @@ class DaemonRunnerMixin:
         record: SessionRecord,
         claim_receipt: str,
         runner_auth_token: str,
-        sprint_claim_lease: SprintClaimLease | None,
+        sprint_reservation: SprintReservation | None,
         project: ProjectConfig | None = None,
         audit_actor: str | None = None,
         audit_refs: Sequence[str] = (),
@@ -1270,15 +1292,28 @@ class DaemonRunnerMixin:
                     self.client.renew(action_id, worker=self.config.runner_id,
                                       timeout_minutes=self.config.default_timeout_minutes,
                                       claim_receipt=claim_receipt)
-                    if sprint_claim_lease is not None:
-                        self.claim_client.renew(
-                            sprint_claim_lease.project,
-                            claim_id=sprint_claim_lease.claim_id,
-                            claim_token=sprint_claim_lease.claim_token,
-                            actor=sprint_claim_lease.actor,
-                            ttl_seconds=sprint_claim_lease.ttl_seconds,
-                            runtime_session_id=sprint_claim_lease.runtime_session_id,
-                        )
+                    if sprint_reservation is not None:
+                        try:
+                            self.reservation_client.touch(
+                                sprint_reservation.project,
+                                reservation_id=sprint_reservation.reservation_id,
+                                session_id=sprint_reservation.runtime_session_id,
+                                correlation_ref=f"actionq:{sprint_reservation.runtime_session_id}",
+                            )
+                        except Exception as reservation_exc:
+                            # Touch is a visibility hint, not a heartbeat or
+                            # authority proof. ActionQ execution continues;
+                            # the failed touch remains operator-visible.
+                            self.client.emit(
+                                "session.reservation_touch_failed",
+                                action_id=action_id,
+                                actor=self.actor,
+                                payload={
+                                    **payload,
+                                    "reservation_id": sprint_reservation.reservation_id,
+                                    "detail": str(reservation_exc),
+                                },
+                            )
                 except Exception as exc:
                     # Renewal is authority, unlike a session heartbeat.  Once
                     # it fails, this worker must not keep executing or settle.
@@ -1295,5 +1330,3 @@ class DaemonRunnerMixin:
             time.sleep(0.05)
         exit_code = self._child.returncode
         return ("completed" if exit_code == 0 else "failed"), int(exit_code)
-
-

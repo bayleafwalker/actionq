@@ -75,6 +75,7 @@ class DaemonLifecycleMixin:
         audit_client: AuditClient | None = None,
         reload_config: Callable[[], tuple[DaemonConfig, dict[str, ActionConfig], dict[str, ProjectConfig]]] | None = None,
         context_client: ContextClient | None = None,
+        reservation_client: ReservationClient | None = None,
         claim_client: ClaimClient | None = None,
     ):
         self.config, self.actions, self.client = config, actions, client
@@ -82,8 +83,15 @@ class DaemonLifecycleMixin:
         self.takeup_client = takeup_client or SprintctlTakeupClient(config.takeup.sprintctl_bin)
         self.audit_client = audit_client or AuditctlClient(config.audit.auditctl_bin)
         self.context_client = context_client or SprintctlContextClient(config.context.sprintctl_bin)
-        self.claim_client = claim_client or SprintctlClaimClient(config.context.sprintctl_bin)
-        self._sprint_claim_leases: dict[str, SprintClaimLease] = {}
+        self.reservation_client = (
+            reservation_client
+            or claim_client
+            or SprintctlReservationClient(config.context.sprintctl_bin)
+        )
+        # Deprecated compatibility alias for callers that still pass/read the
+        # old attribute. All calls below use the reservation contract.
+        self.claim_client = self.reservation_client
+        self._sprint_reservations: dict[str, SprintReservation] = {}
         self.daemon_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"
         self.actor = f"actionq-daemon:{self.daemon_id}"
         self._shutdown = False
@@ -326,5 +334,4 @@ class DaemonLifecycleMixin:
             claimed = self.run_once()
             if not claimed:
                 time.sleep(self.config.poll_interval_seconds)
-
 

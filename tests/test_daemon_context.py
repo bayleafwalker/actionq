@@ -1,11 +1,11 @@
 """Tier-1 deterministic context injection at session start (item #1116).
 
 Exercises ``Daemon._context_candidates_request`` /
-``Daemon._context_claim_acquire`` wiring in ``_run_action``: a bounded
+``Daemon._context_reservation_acquire`` wiring in ``_run_action``: a bounded
 sprintctl ``context-candidates`` packet is requested before the child starts
-(best-effort, fail-open), and a pre-start claim is only ever attempted for an
-explicit target sprintctl itself marked ``claim_eligible`` -- never for an
-advisory/inferred candidate -- with that attempt failing closed. See
+(best-effort, fail-open), and a pre-start reservation is only ever attempted
+for an explicit target sprintctl itself marked ``reservation_admissible`` --
+never for an advisory/inferred candidate -- with that attempt failing closed. See
 ``sprintctl/docs/ops-upgrade-plan.md`` Tier 1 and
 ``agentops/docs/plans/agentops/session-mechanization-plan.md`` Tier 1.
 """
@@ -53,29 +53,29 @@ class FakeClaim:
     def __init__(self, fail: bool = False, response=None):
         self.calls = []
         self.fail = fail
-        self.response = response if response is not None else {"claim_id": 900, "claim_token": "test-sprint-proof"}
-        self.renew_calls = []
+        self.response = response if response is not None else {"id": 900, "conflict": False}
+        self.touch_calls = []
         self.release_calls = []
-        self.renew_error = None
+        self.touch_error = None
         self.release_error = None
 
-    def start(self, project, *, item_id, actor, ttl_seconds, branch):
-        self.calls.append((project, item_id, actor, ttl_seconds, branch))
+    def reserve(self, project, *, item_id, actor, role, session_id, correlation_ref):
+        self.calls.append((project, item_id, actor, role, session_id, correlation_ref))
         if self.fail:
-            raise RuntimeError("sprintctl claim start: item already active")
+            raise RuntimeError("sprintctl reservation reserve: backend unavailable")
         return self.response
 
-    def renew(self, project, *, claim_id, claim_token, actor, ttl_seconds, runtime_session_id):
-        self.renew_calls.append((project, claim_id, claim_token, actor, ttl_seconds, runtime_session_id))
-        if self.renew_error is not None:
-            raise self.renew_error
-        return {"claim_id": claim_id, "status": "active"}
+    def touch(self, project, *, reservation_id, session_id, correlation_ref):
+        self.touch_calls.append((project, reservation_id, session_id, correlation_ref))
+        if self.touch_error is not None:
+            raise self.touch_error
+        return {"id": reservation_id, "state": "active"}
 
-    def release(self, project, *, claim_id, claim_token, actor):
-        self.release_calls.append((project, claim_id, claim_token, actor))
+    def release(self, project, *, reservation_id, actor):
+        self.release_calls.append((project, reservation_id, actor))
         if self.release_error is not None:
             raise self.release_error
-        return {"claim_id": claim_id, "status": "released"}
+        return {"id": reservation_id, "state": "released"}
 
 
 def _remote_project(tmp_path: Path, sprint_id: int = 7) -> ProjectConfig:
@@ -85,7 +85,7 @@ def _remote_project(tmp_path: Path, sprint_id: int = 7) -> ProjectConfig:
 def _packet(*, explicit_item_id=None, found=False, eligible_rank1=False, extra_candidates=()):
     candidates = list(extra_candidates)
     if explicit_item_id is not None and found:
-        candidates.insert(0, {"item_id": explicit_item_id, "rank": 1, "claim_eligible": eligible_rank1})
+        candidates.insert(0, {"item_id": explicit_item_id, "rank": 1, "reservation_admissible": eligible_rank1})
     return {
         "contract_version": "1",
         "explicit_target": ({"item_id": explicit_item_id, "found": found} if explicit_item_id is not None else None),
@@ -110,7 +110,7 @@ def test_context_disabled_by_default_never_calls_context_or_claim(tmp_path: Path
     assert claim.calls == []
     dispatch_payload = client.events[0][3]
     assert dispatch_payload["context"] is None
-    assert dispatch_payload["context_claim"] is None
+    assert dispatch_payload["context_reservation"] is None
     assert client.completed and client.completed[0][0] == 40
 
 
@@ -239,13 +239,14 @@ def test_scope_iterate_claims_exact_target_branch_and_settles_verified_commit(tm
     assert claim.calls[0][1] == 5
     assert context.item_calls[0][1] == 5
     assert "Create the governed smoke artifact." in captured["prompt"]
-    assert claim.calls[0][4] == "agent/scope-iterate/142"
+    assert claim.calls[0][3] == "execution"
+    assert claim.calls[0][4] == client.events[0][3]["session_id"]
     assert len(claim.release_calls) == 1
     assert client.completed
     assert client.settled[0][1]["terminal_status"] == "completed"
     assert client.settled[0][1]["attempt_id"] == client.events[0][3]["session_id"]
     event_types = [event[0] for event in client.events]
-    assert event_types.index("settlement.sprint_claim_released") < len(event_types)
+    assert event_types.index("settlement.sprint_reservation_released") < len(event_types)
 
 
 def test_scope_iterate_rejects_context_target_mismatch_before_claim(tmp_path: Path):
@@ -284,7 +285,7 @@ def test_non_explicit_candidates_are_advisory_only_no_claim(tmp_path: Path):
     client = FakeClient({"id": 42, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
     packet = _packet(
         explicit_item_id=5, found=False,
-        extra_candidates=[{"item_id": 99, "rank": 2, "claim_eligible": False}],
+        extra_candidates=[{"item_id": 99, "rank": 2, "reservation_admissible": False}],
     )
     context, claim = FakeContext(packet), FakeClaim()
     daemon = Daemon(
@@ -301,17 +302,17 @@ def test_non_explicit_candidates_are_advisory_only_no_claim(tmp_path: Path):
     assert claim.calls == []
     dispatch_payload = client.events[0][3]
     assert dispatch_payload["context"] == {"attempted": True, "status": "ok", "packet": packet}
-    assert dispatch_payload["context_claim"] is None
+    assert dispatch_payload["context_reservation"] is None
     event_types = [event[0] for event in client.events]
     assert "session.started" in event_types
     assert client.completed and client.completed[0][0] == 42
 
 
-def test_explicit_eligible_target_acquires_pre_start_claim(tmp_path: Path):
+def test_explicit_admissible_target_acquires_pre_start_reservation(tmp_path: Path):
     client = FakeClient({"id": 43, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
     packet = _packet(explicit_item_id=5, found=True, eligible_rank1=True)
     context = FakeContext(packet)
-    claim = FakeClaim(response={"claim_id": 901, "claim_token": "test-sprint-proof"})
+    claim = FakeClaim(response={"id": 901, "conflict": True, "conflict_severity": "warning"})
     daemon = Daemon(
         DaemonConfig(
             session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED",
@@ -323,13 +324,17 @@ def test_explicit_eligible_target_acquires_pre_start_claim(tmp_path: Path):
 
     assert daemon.run_once() is True
     assert len(claim.calls) == 1
-    _project, item_id, actor, ttl_seconds, branch = claim.calls[0]
+    _project, item_id, actor, role, session_id, correlation_ref = claim.calls[0]
     assert item_id == 5
     assert actor == f"actionq:{client.events[0][3]['session_id']}"
-    assert ttl_seconds == 1800
-    assert branch is None
+    assert role == "execution"
+    assert session_id == client.events[0][3]["session_id"]
+    assert correlation_ref == f"actionq:{session_id}"
     dispatch_payload = client.events[0][3]
-    assert dispatch_payload["context_claim"] == {"attempted": True, "status": "ok", "item_id": 5, "claim_id": 901}
+    assert dispatch_payload["context_reservation"] == {
+        "attempted": True, "status": "ok", "item_id": 5, "reservation_id": 901,
+        "conflict": True, "conflict_severity": "warning", "conflicting_reservations": [],
+    }
     assert client.completed and client.completed[0][0] == 43
 
 
@@ -355,7 +360,7 @@ def test_claim_acquisition_failure_fails_closed_before_child_starts(tmp_path: Pa
     assert client.failed[0][1] == "start-failed"
     assert not client.completed
     assert daemon._child is None
-    assert client.events[0][3]["context_claim"]["status"] == "failed"
+    assert client.events[0][3]["context_reservation"]["status"] == "failed"
     # The failure happens before ``_start_child``/``_write_state`` are ever
     # reached, so no session-state file gets created at all -- there is no
     # "started then cleared" cycle to observe here, unlike the takeup
@@ -363,10 +368,10 @@ def test_claim_acquisition_failure_fails_closed_before_child_starts(tmp_path: Pa
     assert not daemon.config.session_state_path.exists()
 
 
-def test_claim_without_opaque_proof_fails_closed_before_child_starts(tmp_path: Path):
+def test_reservation_without_public_id_fails_closed_before_child_starts(tmp_path: Path):
     client = FakeClient({"id": 47, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
     context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
-    claim = FakeClaim(response={"claim_id": 902})
+    claim = FakeClaim(response={"conflict": False})
     daemon = Daemon(
         DaemonConfig(session_state_path=tmp_path / "state.json", pause_file=tmp_path / "PAUSED", context=ContextConfig(enabled=True)),
         {"scope-iterate": ActionConfig(fake_duration_seconds=0.01)}, client,
@@ -378,7 +383,7 @@ def test_claim_without_opaque_proof_fails_closed_before_child_starts(tmp_path: P
     assert client.failed and client.failed[0][1] == "start-failed"
 
 
-def test_supervision_renews_sprint_claim_without_emitting_its_proof(tmp_path: Path):
+def test_supervision_touches_sprint_reservation_without_emitting_credentials(tmp_path: Path):
     client = FakeClient({"id": 48, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
     context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
     claim = FakeClaim()
@@ -392,17 +397,17 @@ def test_supervision_renews_sprint_claim_without_emitting_its_proof(tmp_path: Pa
     )
 
     assert daemon.run_once() is True
-    assert claim.renew_calls
+    assert claim.touch_calls
     assert claim.release_calls
     rendered_events = repr(client.events)
-    assert "test-sprint-proof" not in rendered_events
+    assert "claim_token" not in rendered_events
 
 
-def test_sprint_claim_renewal_loss_stops_child_and_prevents_completion(tmp_path: Path):
+def test_sprint_reservation_touch_loss_does_not_stop_actionq_execution(tmp_path: Path):
     client = FakeClient({"id": 49, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
     context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
     claim = FakeClaim()
-    claim.renew_error = RuntimeError("sprintctl claim proof rejected")
+    claim.touch_error = RuntimeError("sprintctl reservation touch unavailable")
     daemon = Daemon(
         DaemonConfig(
             heartbeat_interval_seconds=0.01, session_state_path=tmp_path / "state.json",
@@ -413,17 +418,13 @@ def test_sprint_claim_renewal_loss_stops_child_and_prevents_completion(tmp_path:
     )
 
     assert daemon.run_once() is True
-    assert claim.renew_calls
-    assert not client.completed
+    assert claim.touch_calls
+    assert client.completed
     assert not client.failed
-    pauses = [event for event in client.events if event[0] == "session.paused"]
-    assert pauses and pauses[-1][3]["reason"] == "claim-authority-lost"
-    assert "settlement.actionq_skipped_claim_lost" in [
-        event[0] for event in client.events
-    ]
+    assert "session.reservation_touch_failed" in [event[0] for event in client.events]
 
 
-def test_sprint_claim_release_failure_journals_and_fails_queue_settlement(tmp_path: Path):
+def test_sprint_reservation_release_failure_is_visible_but_does_not_block_settlement(tmp_path: Path):
     client = FakeClient({"id": 50, "action_type": "scope-iterate", "project": "demo", "target_ref": "5"})
     context = FakeContext(_packet(explicit_item_id=5, found=True, eligible_rank1=True))
     claim = FakeClaim()
@@ -436,11 +437,11 @@ def test_sprint_claim_release_failure_journals_and_fails_queue_settlement(tmp_pa
 
     assert daemon.run_once() is True
     assert claim.release_calls
-    assert not client.completed
-    assert client.failed and client.failed[0][1] == "settlement-failed"
+    assert client.completed
+    assert not client.failed
     event_types = [event[0] for event in client.events]
     assert "settlement.pending" in event_types
-    assert "settlement.sprint_claim_release_failed" in event_types
+    assert "settlement.sprint_reservation_release_failed" in event_types
     assert client.events[-1][0] == "session.exited"
 
 
@@ -480,7 +481,7 @@ def test_auto_claim_disabled_skips_claim_even_when_eligible(tmp_path: Path):
 
     assert daemon.run_once() is True
     assert claim.calls == []
-    assert client.events[0][3]["context_claim"] is None
+    assert client.events[0][3]["context_reservation"] is None
     assert client.completed and client.completed[0][0] == 46
 
 

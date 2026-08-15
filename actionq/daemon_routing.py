@@ -36,9 +36,9 @@ class DaemonRoutingMixin:
 
         Always fails open: an unreachable or erroring sprintctl only yields a
         "failed" advisory result here and never blocks or fails the action by
-        itself -- only a claim decision derived from a *successfully
-        fetched*, explicit, ``claim_eligible`` target can gate session start
-        (see ``_context_claim_acquire``). Returns ``None`` only when the
+        itself -- only a reservation decision derived from a *successfully
+        fetched*, explicit, ``reservation_admissible`` target can gate session
+        start (see ``_context_reservation_acquire``). Returns ``None`` only when the
         feature is fully disabled by config, so callers/tests can
         distinguish "not configured" from "attempted and skipped/failed".
         """
@@ -61,7 +61,7 @@ class DaemonRoutingMixin:
         except Exception as exc:
             return {"attempted": True, "status": "failed", "error": str(exc)}
 
-    def _context_claim_acquire(
+    def _context_reservation_acquire(
         self,
         project: ProjectConfig | None,
         context_result: dict[str, Any] | None,
@@ -71,16 +71,17 @@ class DaemonRoutingMixin:
         branch: str | None = None,
         exact_target: bool = False,
     ) -> dict[str, Any] | None:
-        """Pre-start claim acquisition for an explicit, eligible target only.
+        """Pre-start reservation for an explicit, admissible target only.
 
-        Only ever attempts a claim for the context packet's
+        Only ever attempts a reservation for the context packet's
         ``explicit_target`` -- and only when it was both found and marked
-        ``claim_eligible`` by sprintctl itself (rank 1; sprintctl never marks
-        an inferred/advisory candidate eligible). This never inspects or acts
-        on ranks 2-5. Returns ``None`` when no claim was attempted (feature
-        disabled, no context, no explicit eligible target); returns a
-        ``status: "failed"`` result when an attempted claim fails -- callers
-        must treat that as fail-closed and not start the child session.
+        ``reservation_admissible`` by sprintctl itself (rank 1; sprintctl
+        never marks an inferred/advisory candidate admissible). This never
+        inspects or acts on ranks 2-5. Returns ``None`` when no reservation
+        was attempted (feature disabled, no context, no explicit admissible
+        target); returns a ``status: "failed"`` result when an attempted
+        reservation fails -- callers must treat that as fail-closed and not
+        start the child session.
         """
         if not self.config.context.auto_claim or context_result is None:
             return None
@@ -91,37 +92,39 @@ class DaemonRoutingMixin:
         if not explicit_target or not explicit_target.get("found"):
             return None
         eligible = any(
-            candidate.get("rank") == 1 and candidate.get("claim_eligible")
+            candidate.get("rank") == 1 and candidate.get("reservation_admissible")
             for candidate in packet.get("candidates") or []
         )
         if not eligible:
             return None
         item_id = explicit_target["item_id"]
-        if exact_target and not branch:
-            return {
-                "attempted": False, "status": "failed", "item_id": item_id,
-                "error": "scope-iterate exact target claim requires its prepared branch",
-            }
         actor = f"actionq:{session_id}"
         try:
             assert project is not None
-            claim = self.claim_client.start(project, item_id=item_id, actor=actor,
-                                             ttl_seconds=ttl_seconds, branch=branch)
-            claim_id = claim.get("claim_id")
-            if claim_id is None and isinstance(claim.get("claim"), dict):
-                claim_id = claim["claim"].get("claim_id")
-            claim_token = claim.get("claim_token")
-            if claim_token is None and isinstance(claim.get("claim"), dict):
-                claim_token = claim["claim"].get("claim_token")
-            if claim_id is None or not claim_token:
-                raise RuntimeError("sprintctl claim start did not return claim id and opaque token")
-            self._sprint_claim_leases[session_id] = SprintClaimLease(
-                project=project, claim_id=int(claim_id), claim_token=str(claim_token),
-                actor=actor, ttl_seconds=ttl_seconds, runtime_session_id=session_id,
+            reservation = self.reservation_client.reserve(
+                project, item_id=item_id, actor=actor, role="execution",
+                session_id=session_id, correlation_ref=f"actionq:{session_id}",
             )
-            return {"attempted": True, "status": "ok", "item_id": item_id, "claim_id": claim_id}
+            reservation_id = reservation.get("id")
+            if reservation_id is None:
+                raise RuntimeError("sprintctl reservation reserve did not return reservation id")
+            self._sprint_reservations[session_id] = SprintReservation(
+                project=project, reservation_id=int(reservation_id), actor=actor,
+                runtime_session_id=session_id,
+            )
+            return {
+                "attempted": True, "status": "ok", "item_id": item_id,
+                "reservation_id": int(reservation_id),
+                "conflict": bool(reservation.get("conflict", False)),
+                "conflict_severity": reservation.get("conflict_severity", "none"),
+                "conflicting_reservations": reservation.get("conflicting_reservations", []),
+            }
         except Exception as exc:
             return {"attempted": True, "status": "failed", "item_id": item_id, "error": str(exc)}
+
+    # Compatibility seam for older tests/integrations; it now performs only a
+    # credential-free reservation.
+    _context_claim_acquire = _context_reservation_acquire
 
     @staticmethod
     def _exact_target_item(
@@ -142,13 +145,10 @@ class DaemonRoutingMixin:
                 candidate for candidate in packet.get("candidates") or []
                 if int(candidate.get("item_id", -1)) == requested
                 and candidate.get("rank") == 1
-                and candidate.get("claim_eligible") is True
+                and candidate.get("reservation_admissible") is True
             ),
             None,
         )
         if eligible is None:
-            raise RuntimeError(f"exact target item {requested} is not claim eligible")
+            raise RuntimeError(f"exact target item {requested} is not reservation admissible")
         return explicit.get("item") or eligible.get("item") or explicit
-
-
-

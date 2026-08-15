@@ -90,11 +90,12 @@ class ContextConfig:
     See ``sprintctl/docs/ops-upgrade-plan.md`` Tier 1 and
     ``agentops/docs/plans/agentops/session-mechanization-plan.md`` Tier 1:
     a bounded, ranked ``context-candidates`` packet is requested before the
-    child session starts. ``auto_claim`` gates whether a *found*,
-    ``claim_eligible`` explicit target (sprintctl's rank 1 only -- never an
-    inferred/advisory candidate) causes a pre-start ``claim start``; the
-    packet fetch itself is always best-effort/fail-open regardless of
-    ``auto_claim``.
+    child session starts. ``auto_claim`` is the retained configuration key for
+    whether a *found*, ``reservation_admissible`` explicit target (sprintctl's
+    rank 1 only -- never an inferred/advisory candidate) causes a pre-start
+    advisory reservation. It no longer creates a claim capability or bearer
+    token; the packet fetch itself is always best-effort/fail-open regardless
+    of ``auto_claim``.
     """
 
     enabled: bool = False
@@ -118,6 +119,7 @@ class DaemonConfig:
     actionctl_bin: str = "actionctl"
     runnerctl_bin: str = "actionq-runner"
     runner_private_key_path: Path = Path("~/.local/state/actionq/runner-identity.pem")
+    runner_identity_registry_path: Path | None = None
     runner_id: str = "runner:devbox"
     enforce_worker_isolation: bool = True
     # Explicit durable CAS root for both runner publications and the
@@ -284,6 +286,10 @@ def load_config(path: Path) -> tuple[DaemonConfig, dict[str, ActionConfig], dict
         runner_private_key_path=Path(global_raw.get(
             "runner_private_key_path", DaemonConfig.runner_private_key_path
         )).expanduser(),
+        runner_identity_registry_path=(
+            Path(str(global_raw["runner_identity_registry_path"])).expanduser()
+            if global_raw.get("runner_identity_registry_path") else None
+        ),
         runner_id=str(global_raw.get("runner_id", "runner:devbox")),
         enforce_worker_isolation=bool(global_raw.get("enforce_worker_isolation", True)),
         artifact_root=(

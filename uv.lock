@@ -11,7 +11,7 @@ members = [
 
 [[package]]
 name = "actionq"
-version = "0.1.22"
+version = "0.1.28"
 source = { editable = "." }
 dependencies = [
     { name = "actionq-contracts" },
@@ -46,7 +46,7 @@ source = { editable = "packages/actionq-contracts" }
 
 [[package]]
 name = "actionq-runner"
-version = "0.3.2"
+version = "0.3.4"
 source = { editable = "packages/actionq-runner" }
 dependencies = [
     { name = "actionq-contracts" },

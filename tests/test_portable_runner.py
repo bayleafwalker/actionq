@@ -69,10 +69,10 @@ def test_staging_is_private_atomic_and_rejects_traversal(tmp_path: Path, monkeyp
         seal(attempt, "../escape", b"x")
     receive(attempt, "secret.txt", b"raw", redact=lambda value: value)
     quarantine(attempt, "secret.txt")
-    with pytest.raises(ValueError, match="credential"):
-        seal(attempt, "secret.txt", b"postgresql://secret")
-    with pytest.raises(ValueError, match="incoming"):
-        receive(attempt, "blocked.txt", b"raw", redact=lambda _: b"Authorization: Bearer secret")
+    sealed_secret = seal(attempt, "secret.txt", b"postgresql://secret")
+    assert sealed_secret.read_bytes() == b"[REDACTED]\n"
+    blocked = receive(attempt, "blocked.txt", b"raw", redact=lambda _: b"Authorization: Bearer secret")
+    assert blocked.read_bytes() == b"[REDACTED]\n"
 
 
 def test_gc_skips_unreconciled_and_obeys_terminal_retention(tmp_path: Path, monkeypatch):

@@ -81,6 +81,14 @@ def _phase_fd(spool: AttemptSpool, phase: str) -> int:
     return os.open(expected, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
+def _scrub_forbidden(data: bytes) -> bytes:
+    """Replace credential-like lines before they can enter the recovery spool."""
+    return b"".join(
+        b"[REDACTED]\n" if _FORBIDDEN.search(line) else line
+        for line in data.splitlines(keepends=True)
+    )
+
+
 def _atomic_write(spool: AttemptSpool, phase: str, name: str, data: bytes) -> Path:
     _component(name)
     directory_fd = _phase_fd(spool, phase)
@@ -114,7 +122,7 @@ def receive(
     *, redact: Callable[[bytes], bytes],
 ) -> Path:
     """Redact in memory, then receive only credential-screened transient bytes."""
-    redacted = redact(worker_bytes)
+    redacted = _scrub_forbidden(redact(worker_bytes))
     if not isinstance(redacted, bytes):
         raise TypeError("runner staging redactor must return bytes")
     if _FORBIDDEN.search(redacted):
@@ -140,6 +148,7 @@ def seal(spool: AttemptSpool, name: str, normalized_redacted_data: bytes) -> Pat
     quarantined = spool.root / "quarantine" / _component(name)
     if quarantined.is_symlink() or not quarantined.is_file():
         raise ValueError("worker record must be quarantined before sealing")
+    normalized_redacted_data = _scrub_forbidden(normalized_redacted_data)
     if _FORBIDDEN.search(normalized_redacted_data):
         raise ValueError("sealed runner record contains forbidden credential material")
     target = _atomic_write(spool, "sealed", name, normalized_redacted_data)
