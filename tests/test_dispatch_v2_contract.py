@@ -4,13 +4,15 @@ import json
 import socket
 import threading
 from http.server import HTTPServer
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 from actionq import db
 from actionq.application import ActionQApplication, InvocationProvenance
 from actionq import server
+from actionq import application_dispatch
+from actionq.managed_dispatch import ManagedEnqueueAdmission
 from actionq.vuoro import build_operations, catalog_metadata
 
 
@@ -138,6 +140,47 @@ def test_v2_enqueue_sets_its_floor_from_the_explicit_root_event_not_minimum_hist
 
     watermark = next(params for statement, params in conn.executed if "INSERT INTO \"aq\".\"dispatch_observation_watermarks\"" in statement)
     assert watermark == (7, 44, 44)
+
+
+def test_managed_enqueue_persists_an_immutable_envelope_with_its_v2_root(monkeypatch):
+    class Connection:
+        def __init__(self):
+            self.executed = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return _Transaction()
+
+        def execute(self, statement, params=None):
+            self.executed.append((" ".join(str(statement).split()), params))
+            return _Rows()
+
+    payload = _request()
+    admission = ManagedEnqueueAdmission(
+        normalized_snapshot=b'{"managed":true}\n',
+        request_sha256="a" * 64,
+        capsule_sha256="b" * 64,
+        rendered_prompt_sha256="c" * 64,
+        queue_payload=MappingProxyType(payload),
+    )
+    conn = Connection()
+    provenance = InvocationProvenance(actor="compiler:test", environment="dev", request_id="r", catalog_revision="c", idempotency_key="managed-key", authorized_repositories=("actionq",))
+    app = ActionQApplication(schema="aq", authorizer=lambda *_args: True)
+    app.connection = lambda: conn
+    monkeypatch.setattr(application_dispatch, "admit_managed_enqueue", lambda *_args, **_kwargs: admission)
+    monkeypatch.setattr(db, "enqueue", lambda *_args, **_kwargs: {"id": 8})
+    monkeypatch.setattr(db, "insert_event", lambda *_args, **_kwargs: {"id": 45})
+
+    result = app.enqueue_managed_dispatch({}, provenance=provenance, expected_source_shas={}, registered_authority={})
+
+    assert result["action_id"] == 8
+    envelope_insert = next(params for statement, params in conn.executed if 'INSERT INTO "aq"."managed_dispatch_envelopes"' in statement)
+    assert envelope_insert == (8, "a" * 64, b'{"managed":true}\n', "b" * 64, "c" * 64)
 
 
 def test_http_identity_is_fail_closed_and_never_uses_spoofed_actor_headers(monkeypatch):

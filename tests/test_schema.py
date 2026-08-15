@@ -485,9 +485,10 @@ def test_shared_runtime_preserves_exact_actionq_migration_assets() -> None:
         "87cae21b94854fa221fb33a24d2ae8d56c94beccb710e6e71b2150f02058a5fe",
         "770cbbed520d5f789a87349dcc25c7f474f60038dd7ea77d3d910e4ceed30a90",
         "5725d5b260e89655f87a0ee24dda1f0ca9832a5b80b6ce58d47ca4dbe22d1471",
-        "de129bdeb9360f4f2ed65fd4bc74bbea2753584c1d03ff746b59a293b0c9cb93",
-        "cb2e8d388b27c4ff2486bdaadaeec75df45c875319d7e34b4391dd64e5653f56",
-    ]
+            "de129bdeb9360f4f2ed65fd4bc74bbea2753584c1d03ff746b59a293b0c9cb93",
+            "cb2e8d388b27c4ff2486bdaadaeec75df45c875319d7e34b4391dd64e5653f56",
+            "f963084183fd6839cbf37b71b51fc0d262b3b183ad3a41ca197e07c049000e20",
+        ]
     assert all(
         migration.sha256
         == hashlib.sha256(migration.sql.encode("utf-8")).hexdigest()

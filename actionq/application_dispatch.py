@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Mapping
+
 from .application_core import *
 from .application_core import (
     _DISPATCH_V2_FIELDS, _HARNESSES, _KIND_TO_ACTION_TYPE, _OUTPUT_EXPECTATIONS,
     _PRIORITIES,
     CANONICALIZATION_VERSION,
 )
+from .managed_dispatch import admit_managed_enqueue
 
 
 class DispatchService:
@@ -153,6 +156,55 @@ class DispatchService:
                 )
                 return {"action_id": action["id"], "status": "pending", "request_ref": request_ref, "request_sha256": digest}
 
+    def enqueue_managed_dispatch(
+        self,
+        envelope: dict[str, Any],
+        *,
+        provenance: InvocationProvenance,
+        expected_source_shas: Mapping[str, str],
+        registered_authority: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically persist an admitted capsule beside its v2 queue root."""
+        if not provenance.idempotency_key:
+            raise db.ActionQError("served managed dispatch enqueue requires an idempotency key")
+        admitted = admit_managed_enqueue(
+            envelope,
+            authenticated_actor=provenance.actor,
+            expected_source_shas=expected_source_shas,
+            registered_authority=registered_authority,
+        )
+        normalized, raw = self._normalize_dispatch_v2(dict(admitted.queue_payload))
+        self._authorize(provenance, f"execution.dispatch.repo:{normalized['repo_id']}", "enqueue")
+        digest = hashlib.sha256(raw).hexdigest()
+        with self.connection() as conn:
+            with conn.transaction():
+                lock = "\x1f".join(("execution.dispatch.enqueue", provenance.actor, provenance.environment, provenance.idempotency_key))
+                conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock,))
+                prior = conn.execute(
+                    f"SELECT d.action_id, d.request_ref, d.request_sha256, d.normalized_snapshot, m.envelope_snapshot FROM {db.qname(self.schema, 'dispatch_requests')} d LEFT JOIN {db.qname(self.schema, 'managed_dispatch_envelopes')} m ON m.action_id=d.action_id WHERE d.identity=%s AND d.environment=%s AND d.operation=%s AND d.idempotency_key=%s",
+                    (provenance.actor, provenance.environment, "execution.dispatch.enqueue", provenance.idempotency_key),
+                ).fetchone()
+                if prior:
+                    if bytes(prior["normalized_snapshot"]) != raw or prior["envelope_snapshot"] is None or bytes(prior["envelope_snapshot"]) != admitted.normalized_snapshot:
+                        raise db.ActionQError("idempotency-key-conflict")
+                    return {"action_id": prior["action_id"], "status": "pending", "request_ref": prior["request_ref"], "request_sha256": prior["request_sha256"]}
+                action = db.enqueue(conn, self.schema, action_type="scope-iterate", project=normalized["repo_id"], target_ref=normalized["work_item_id"], source_refs=normalized["refs"], priority=50 if normalized["priority"] == "high" else 100, parent_id=None, created_by=provenance.actor, provenance=provenance.as_event_payload(operation="execution.dispatch.enqueue"))
+                request_ref = "req:" + uuid.uuid4().hex
+                conn.execute(
+                    f"INSERT INTO {db.qname(self.schema, 'dispatch_requests')} (action_id, request_ref, normalized_snapshot, schema_version, canonicalization_version, request_sha256, identity, environment, operation, idempotency_key) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (action["id"], request_ref, raw, "v2", CANONICALIZATION_VERSION, digest, provenance.actor, provenance.environment, "execution.dispatch.enqueue", provenance.idempotency_key),
+                )
+                conn.execute(
+                    f"INSERT INTO {db.qname(self.schema, 'managed_dispatch_envelopes')} (action_id, envelope_sha256, envelope_snapshot, capsule_sha256, rendered_prompt_sha256) VALUES (%s,%s,%s,%s,%s)",
+                    (action["id"], admitted.request_sha256, admitted.normalized_snapshot, admitted.capsule_sha256, admitted.rendered_prompt_sha256),
+                )
+                event = db.insert_event(conn, self.schema, action_id=action["id"], event_type="managed-dispatch.admitted", actor=provenance.actor, payload={"request_ref": request_ref, "managed_request_sha256": admitted.request_sha256, "capsule_sha256": admitted.capsule_sha256, "rendered_prompt_sha256": admitted.rendered_prompt_sha256, "provenance": provenance.as_event_payload(operation="execution.dispatch.enqueue")})
+                conn.execute(
+                    f"INSERT INTO {db.qname(self.schema, 'dispatch_observation_watermarks')} (action_id, first_retained_event_id, last_observed_event_id) VALUES (%s, %s, %s)",
+                    (action["id"], event["id"], event["id"]),
+                )
+                return {"action_id": action["id"], "status": "pending", "request_ref": request_ref, "request_sha256": digest}
+
     def dispatch_action_snapshot(self, action_id: int, *, provenance: InvocationProvenance) -> dict[str, Any]:
         def read(conn):
             with conn.transaction():
@@ -203,5 +255,3 @@ class DispatchService:
             result = self._read(read)
             if result["events"] or wait_seconds == 0 or time.monotonic() >= deadline: return result
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-
-

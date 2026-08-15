@@ -28,7 +28,7 @@ from . import db
 DOMAIN = "execution"
 API_VERSION = "v1"
 MIN_SCHEMA_VERSION = 1
-MAX_SCHEMA_VERSION = 11
+MAX_SCHEMA_VERSION = 12
 PRE_MIGRATION_BRIDGE_VERSION = 3
 MIGRATION_TABLE = "schema_migrations"
 _MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
@@ -88,6 +88,14 @@ _COLUMN_SHAPE = {
         "first_retained_event_id": ("bigint", "NO", None),
         "last_observed_event_id": ("bigint", "NO", None),
         "watermark_updated_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "managed_dispatch_envelopes": {
+        "action_id": ("bigint", "NO", None),
+        "envelope_sha256": ("text", "NO", None),
+        "envelope_snapshot": ("bytea", "NO", None),
+        "capsule_sha256": ("text", "NO", None),
+        "rendered_prompt_sha256": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
     },
     "action_resources": {
         "resource_ref": ("text", "NO", None),
@@ -176,6 +184,7 @@ _REQUIRED_CONSTRAINT_COUNTS = {
     "events": {"p": 1, "f": 1},
     "dispatch_requests": {"p": 1, "f": 1, "u": 2, "c": 3},
     "dispatch_observation_watermarks": {"p": 1, "f": 1, "c": 2},
+    "managed_dispatch_envelopes": {"p": 1, "f": 1, "c": 3},
     "action_resources": {"p": 1, "f": 1, "u": 3, "c": 5},
     "action_resource_changes": {"p": 1, "f": 1, "c": 3},
     "action_resource_sessions": {"p": 1, "f": 1, "c": 1},
@@ -1305,6 +1314,11 @@ def _grant_runtime_privileges(conn, schema: str, runtime_role: str | None) -> No
             schema_identifier,
             sql.Identifier("dispatch_observation_watermarks"),
             role_identifier,
+        )
+    )
+    conn.execute(
+        sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
+            schema_identifier, sql.Identifier("managed_dispatch_envelopes"), role_identifier
         )
     )
     for table in ("action_resources", "action_resource_changes", "action_resource_sessions"):
