@@ -80,10 +80,10 @@ def test_release_workflow_runs_full_tests_before_one_gated_build() -> None:
 
 
 @pytest.mark.skipif(
-    not list((ROOT / "dist").glob("actionq-0.1.23-*.whl")),
+    not list((ROOT / "dist").glob("actionq-0.1.24-*.whl")),
     reason="release wheel is built by the release workflow",
 )
 def test_built_wheel_satisfies_release_contract() -> None:
-    wheels = sorted((ROOT / "dist").glob("actionq-0.1.23-*.whl"))
+    wheels = sorted((ROOT / "dist").glob("actionq-0.1.24-*.whl"))
     assert len(wheels) == 1
-    validate_wheel(wheels[0], tag="v0.1.23")
+    validate_wheel(wheels[0], tag="v0.1.24")

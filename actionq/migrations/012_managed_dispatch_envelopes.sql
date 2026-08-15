@@ -1,5 +1,5 @@
 -- Immutable managed-enqueue envelope attached 1:1 to its ordinary v2 root.
--- The runtime can read and append it once; it cannot alter a capsule after
+-- The runtime can read and append it once, but cannot alter a capsule after
 -- admission or obtain a prompt through a mutable event projection.
 CREATE TABLE IF NOT EXISTS {{schema}}.managed_dispatch_envelopes (
     action_id BIGINT PRIMARY KEY REFERENCES {{schema}}.actions(id) ON DELETE RESTRICT,

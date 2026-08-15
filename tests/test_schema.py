@@ -487,7 +487,7 @@ def test_shared_runtime_preserves_exact_actionq_migration_assets() -> None:
         "5725d5b260e89655f87a0ee24dda1f0ca9832a5b80b6ce58d47ca4dbe22d1471",
             "de129bdeb9360f4f2ed65fd4bc74bbea2753584c1d03ff746b59a293b0c9cb93",
             "cb2e8d388b27c4ff2486bdaadaeec75df45c875319d7e34b4391dd64e5653f56",
-            "f963084183fd6839cbf37b71b51fc0d262b3b183ad3a41ca197e07c049000e20",
+            "443326a6e8a76ada34c8633c8b94808152253dbbc4bd6e1e83158cf545fa03ec",
         ]
     assert all(
         migration.sha256
