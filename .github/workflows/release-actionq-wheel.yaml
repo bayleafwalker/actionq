@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bayleafwalker/agentops
-          ref: cebcf9162fb97e7074838b49299b1d32666347be
+          ref: 67b9ec347ce781923907896efe03796a0df5d364
           path: agentops-contracts
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -45,6 +45,7 @@ jobs:
       - name: Run the full PostgreSQL-backed suite
         env:
           AGENTOPS_SESSION_ARTIFACT_VALIDATOR: ${{ github.workspace }}/agentops-contracts/templates/dispatch/scripts/validate_session_mechanization_artifacts.py
+          ACTIONQ_AGENTOPS_ROOT: ${{ github.workspace }}/agentops-contracts
         run: uv run --all-packages --extra dev pytest -q
 
   publish:

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ from actionq.managed_dispatch import (
 )
 
 
-AGENTOPS = Path(__file__).parents[2] / "agentops"
+AGENTOPS = Path(os.environ.get("ACTIONQ_AGENTOPS_ROOT", Path(__file__).parents[2] / "agentops"))
 RENDERER_PATH = AGENTOPS / "templates/dispatch/scripts/render_managed_capsule.py"
 SPEC = importlib.util.spec_from_file_location("managed_capsule_renderer", RENDERER_PATH)
 assert SPEC and SPEC.loader
