@@ -119,6 +119,44 @@ _DISPATCH_V2_INPUT_SCHEMA = _object(
     },
     required=("contract_version", "action_type", "output_expectation", "repo_id", "sprint_id", "work_item_id", "title", "prompt", "harness", "model", "priority", "refs", "dispatch_group_id"),
 )
+_MANAGED_DISPATCH_INPUT_SCHEMA = _object(
+    {
+        "contract_id": {"const": "managed-dispatch-enqueue/v1"},
+        "dispatch": _object(
+            {
+                "contract_version": {"const": "v2"}, "action_type": {"const": "scope-iterate"},
+                "output_expectation": {"enum": ["plan", "audit-event", "draft-work-items", "sprint-proposal", "implementation", "review"]},
+                "repo_id": {"type": "string", "minLength": 1, "pattern": "^(?!ALL$).+"},
+                "sprint_id": {"type": ["integer", "null"], "minimum": 1},
+                "work_item_id": {"type": ["string", "null"], "minLength": 1}, "title": {"type": "string", "minLength": 1},
+                "harness": {"enum": ["claude", "codex", "copilot-cli", "codestral"]},
+                "model": {"type": ["string", "null"], "minLength": 1}, "priority": {"enum": ["normal", "high"]},
+                "refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "dispatch_group_id": {"type": ["string", "null"], "minLength": 1},
+            },
+            required=("contract_version", "action_type", "output_expectation", "repo_id", "sprint_id", "work_item_id", "title", "harness", "model", "priority", "refs", "dispatch_group_id"),
+        ),
+        "managed_request": _object(
+            {
+                "schema_version": {"const": "managed-dispatch-request/v1"},
+                "capsule": {"type": "object"}, "rendered_prompt": {"type": "string", "minLength": 1},
+                "doctor_report": {"type": "object"}, "doctor_report_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "provenance": _object(
+                    {
+                        "renderer_version": {"const": "agentops-managed-capsule/1"},
+                        "source_shas": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"}},
+                        "capsule_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                        "role_preset_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                        "rendered_prompt_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    },
+                    required=("renderer_version", "source_shas", "capsule_digest", "role_preset_digest", "rendered_prompt_digest"),
+                ),
+            },
+            required=("schema_version", "capsule", "rendered_prompt", "doctor_report", "doctor_report_digest", "provenance"),
+        ),
+    },
+    required=("contract_id", "dispatch", "managed_request"),
+)
 _DISPATCH_RESULT_SCHEMA = _object(
     {
         "contract_id": {"const": "dispatch-result/v1"},
@@ -318,6 +356,10 @@ def build_operations(
     # explicitly below so callers cannot silently select it.
     name = "execution.dispatch.enqueue"
     operations.append(AdapterOperation(_definition(name, input_schema=_DISPATCH_V2_INPUT_SCHEMA, result_schema=_DISPATCH_V2_RESULT_SCHEMA, authority="execution.enqueue", semantics="enqueue", idempotency="required"), served(name, lambda a, p, actor: app.enqueue_dispatch_v2({**a, "requested_by": actor}, provenance=p))))
+
+    if app.managed_dispatch_policy is not None:
+        name = "execution.managed-dispatch.enqueue"
+        operations.append(AdapterOperation(_definition(name, input_schema=_MANAGED_DISPATCH_INPUT_SCHEMA, result_schema=_DISPATCH_V2_RESULT_SCHEMA, authority="execution.enqueue", semantics="enqueue", idempotency="required"), served(name, lambda a, p, _actor: app.enqueue_managed_dispatch(a, provenance=p))))
 
     name = "execution.action.create-immutable-candidate"
     operations.append(

@@ -143,6 +143,25 @@ def test_harness_runner_resolves_caller_and_records_lifecycle_provenance(tmp_pat
     assert client.completed and not client.failed
 
 
+def test_harness_runner_uses_the_claimed_managed_envelope_prompt(tmp_path: Path):
+    client = FakeClient({
+        "id": 44,
+        "action_type": "scope-iterate",
+        "project": "demo",
+        "prompt": "untrusted mutable action prompt",
+        "managed_dispatch_envelope": {
+            "managed_request": {"rendered_prompt": "Run only the managed canary checks."},
+        },
+    })
+    daemon = _daemon(tmp_path, client, _fake_codex(tmp_path))
+
+    assert daemon.run_once() is True
+
+    capture = json.loads((tmp_path / "capture.json").read_text(encoding="utf-8"))
+    assert capture["stdin"] == "Run only the managed canary checks."
+    assert client.completed and not client.failed
+
+
 def test_harness_runner_applies_catalog_workaround_and_records_only_named_provenance(tmp_path: Path):
     client = FakeClient({"id": 43, "action_type": "scope-iterate", "project": "demo"})
     daemon = _daemon(

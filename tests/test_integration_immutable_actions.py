@@ -1,6 +1,8 @@
 """Disposable-PostgreSQL histories for #2035 immutable compiler bindings."""
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 
 import pytest
@@ -104,6 +106,46 @@ def test_claim_fails_closed_when_authoritative_request_bytes_are_corrupt(immutab
         db.claim(conn, name, worker="worker:one", timeout_minutes=30)
     conn.rollback()
     assert db.get_action(conn, name, created["action_id"])["status"] == "pending"
+
+
+def test_claim_delivers_only_a_verified_managed_envelope_and_rolls_back_tampering(immutable_db):
+    conn, name = immutable_db
+
+    def enqueue_managed(prompt: str, *, prompt_digest: str | None = None) -> int:
+        action = db.enqueue(
+            conn, name, action_type="scope-iterate", project="demo", target_ref=None,
+            source_refs=[], priority=100, parent_id=None, created_by="operator:test",
+        )
+        snapshot = json.dumps(
+            {"managed_request": {"rendered_prompt": prompt}},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        conn.execute(
+            f"""INSERT INTO {db.qname(name, 'managed_dispatch_envelopes')}
+                (action_id, envelope_sha256, envelope_snapshot, capsule_sha256, rendered_prompt_sha256)
+                VALUES (%s,%s,%s,%s,%s)""",
+            (
+                action["id"], hashlib.sha256(snapshot).hexdigest(), snapshot, "a" * 64,
+                prompt_digest or hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            ),
+        )
+        return int(action["id"])
+
+    valid_id = enqueue_managed("Run the managed canary.")
+    conn.commit()
+    claimed = db.claim(conn, name, worker="worker:one", timeout_minutes=30)
+    conn.commit()
+    assert claimed["id"] == valid_id
+    assert claimed["managed_dispatch_envelope"] == {
+        "managed_request": {"rendered_prompt": "Run the managed canary."}
+    }
+
+    tampered_id = enqueue_managed("Do not run this.", prompt_digest="0" * 64)
+    conn.commit()
+    with pytest.raises(db.ActionQError, match="managed dispatch rendered prompt mismatch"):
+        db.claim(conn, name, worker="worker:one", timeout_minutes=30)
+    conn.rollback()
+    assert db.get_action(conn, name, tampered_id)["status"] == "pending"
 
 
 def test_role_inputs_and_mutable_action_projection_are_fenced(immutable_db, postgres_urls):

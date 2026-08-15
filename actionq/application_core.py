@@ -17,6 +17,7 @@ import time
 import uuid
 
 from . import db
+from .managed_dispatch import ManagedDispatchPolicy
 from .action_resource import ActionResourceOwner, ResourceNotFound, serialize_envelope
 from .runner_auth import VerifiedRunner, verify_runner_proof
 from .cas import _DaemonCAS
@@ -119,6 +120,7 @@ class ActionQCore:
         cas_factory: Callable[[Path], Any] | None = None,
         completion_ingest_connection_factory: Callable[[], Any] | None = None,
         completion_read_connection_factory: Callable[[], Any] | None = None,
+        managed_dispatch_policy: ManagedDispatchPolicy | None = None,
     ) -> None:
         self.schema = db.schema_name(schema)
         self._connection_factory = connection_factory
@@ -129,6 +131,7 @@ class ActionQCore:
         self._cas_factory = cas_factory or _DaemonCAS
         self._completion_ingest_connection_factory = completion_ingest_connection_factory
         self._completion_read_connection_factory = completion_read_connection_factory
+        self.managed_dispatch_policy = managed_dispatch_policy
 
     def _verified_result_store(self, result_ref: str) -> Any:
         if self.artifact_root is None:
@@ -541,4 +544,3 @@ class ActionQCore:
                     # authenticated response, never in history or replay.
                     response["result"] = result
                 return response
-

@@ -704,13 +704,19 @@ class DaemonRunnerMixin:
         )
         try:
             try:
+                managed_prompt = None
+                managed_envelope = action.get("managed_dispatch_envelope")
+                if managed_envelope is not None:
+                    managed_prompt = managed_envelope["managed_request"]["rendered_prompt"]
+                    if not isinstance(managed_prompt, str):
+                        raise RoutingError("managed dispatch envelope prompt is invalid")
                 self._child = self._start_child(
                     action_config,
                     project=evidence_project,
                     routing=routing,
                     prompt=(
                         prepared_scope.prompt if prepared_scope is not None
-                        else (str(action["prompt"]) if action.get("prompt") else action_config.prompt)
+                        else (managed_prompt if managed_prompt is not None else (str(action["prompt"]) if action.get("prompt") else action_config.prompt))
                     ),
                     output_path=output_path,
                     envelope=envelope,
@@ -1289,6 +1295,5 @@ class DaemonRunnerMixin:
             time.sleep(0.05)
         exit_code = self._child.returncode
         return ("completed" if exit_code == 0 else "failed"), int(exit_code)
-
 
 

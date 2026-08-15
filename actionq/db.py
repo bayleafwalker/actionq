@@ -1182,11 +1182,13 @@ def claim(
     timeout_minutes: int,
     provenance: dict[str, Any] | None = None,
 ) -> dict:
-    if _runtime_schema_version(conn, schema) == 3:
+    schema_version = _runtime_schema_version(conn, schema)
+    if schema_version == 3:
         return _claim_schema3(
             conn, schema, worker=worker, timeout_minutes=timeout_minutes,
             provenance=provenance,
         )
+    managed_envelopes_enabled = schema_version is not None and schema_version >= 12
     runner_auth_token = secrets.token_urlsafe(32)
     with conn.transaction():
         candidate_ids = conn.execute(
@@ -1216,6 +1218,7 @@ def claim(
         row = None
         selected = None
         selected_envelope = None
+        selected_managed_envelope = None
         selected_immutable_grant = None
 
         class SkipClaimCandidate(Exception):
@@ -1270,6 +1273,30 @@ def claim(
                             or contract_canonical_bytes(envelope) != bytes(snapshot)
                         ):
                             raise ActionQError("stored execution group envelope failed integrity validation")
+                    managed_envelope = None
+                    if managed_envelopes_enabled:
+                        managed = conn.execute(
+                            f"SELECT envelope_sha256, envelope_snapshot, rendered_prompt_sha256 FROM {qname(schema, 'managed_dispatch_envelopes')} WHERE action_id=%s",
+                            (candidate["id"],),
+                        ).fetchone()
+                        if managed is not None:
+                            snapshot = managed["envelope_snapshot"]
+                            if isinstance(snapshot, memoryview):
+                                snapshot = snapshot.tobytes()
+                            snapshot = bytes(snapshot)
+                            if hashlib.sha256(snapshot).hexdigest() != managed["envelope_sha256"]:
+                                raise ActionQError("managed dispatch envelope digest mismatch")
+                            try:
+                                managed_envelope = json.loads(snapshot.decode("utf-8"))
+                                prompt = managed_envelope["managed_request"]["rendered_prompt"]
+                            except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                                raise ActionQError("managed dispatch envelope is invalid") from exc
+                            if (
+                                not isinstance(prompt, str)
+                                or hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                                != managed["rendered_prompt_sha256"]
+                            ):
+                                raise ActionQError("managed dispatch rendered prompt mismatch")
                     immutable_grant = _validate_immutable_claim(conn, schema, int(candidate["id"]))
                     row = conn.execute(
                         f"""UPDATE {qname(schema, 'actions')}
@@ -1287,6 +1314,7 @@ def claim(
             if row is not None:
                 selected = candidate
                 selected_envelope = envelope
+                selected_managed_envelope = managed_envelope
                 selected_immutable_grant = immutable_grant
                 break
         if row is None:
@@ -1313,6 +1341,8 @@ def claim(
     # names the ActionQ-minted incarnation ``attempt_id``.  Keep both fields
     # in the claim response so consumers can assert the binding explicitly.
     result["attempt_id"] = result["claim_attempt_id"]
+    if selected_managed_envelope is not None:
+        result["managed_dispatch_envelope"] = selected_managed_envelope
     if selected is not None and selected["group_id"] is not None:
         result["execution_group_id"] = str(selected["group_id"])
         result["execution_envelope_digest"] = selected["envelope_digest"]

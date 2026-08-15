@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 from types import MappingProxyType
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -19,6 +20,7 @@ REQUEST_VERSION = "managed-dispatch-request/v1"
 ENQUEUE_VERSION = "managed-dispatch-enqueue/v1"
 CAPSULE_VERSION = "managed-dispatch-capsule/v1"
 RENDERER_VERSION = "agentops-managed-capsule/1"
+POLICY_VERSION = "actionq-managed-dispatch-policy/v1"
 FORBIDDEN_KEY = re.compile(r"(?:credential|bearer|token|claim_(?:proof|receipt)|capability_handle|broker_(?:path|socket)|provider_secret|secret)", re.I)
 FORBIDDEN_VALUE = re.compile(r"(?:\bBearer\s+[A-Za-z0-9._~+/-]+=*|claim[_-]?token|capability[_-]?handle|/var/run/[^\s]+)", re.I)
 
@@ -53,6 +55,50 @@ class ManagedEnqueueAdmission:
     capsule_sha256: str
     rendered_prompt_sha256: str
     queue_payload: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ManagedDispatchPolicy:
+    """Release-pinned inputs trusted by the served admission boundary.
+
+    This policy is deployment-owned and intentionally separate from a capsule:
+    a caller can present only bytes that match these exact source revisions.
+    It never contains a provider credential or a model-visible capability.
+    """
+
+    expected_source_shas: Mapping[str, str]
+    registered_authority: Mapping[str, Any]
+
+
+def load_managed_dispatch_policy(path: str | Path) -> ManagedDispatchPolicy:
+    """Load one strict, immutable-policy document from a deployment mount."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ManagedDispatchRejected("managed dispatch policy is unreadable") from exc
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema_version", "expected_source_shas", "registered_authority"
+    } or raw.get("schema_version") != POLICY_VERSION:
+        raise ManagedDispatchRejected("managed dispatch policy fields or schema version are invalid")
+    source_shas = raw["expected_source_shas"]
+    authority = raw["registered_authority"]
+    if (
+        not isinstance(source_shas, dict)
+        or not source_shas
+        or not all(
+            isinstance(name, str) and name
+            and isinstance(revision, str)
+            and re.fullmatch(r"[0-9a-f]{7,64}", revision)
+            for name, revision in source_shas.items()
+        )
+        or not isinstance(authority, dict)
+    ):
+        raise ManagedDispatchRejected("managed dispatch policy is invalid")
+    _deny_model_secrets(authority, "$.registered_authority")
+    return ManagedDispatchPolicy(
+        expected_source_shas=MappingProxyType(dict(source_shas)),
+        registered_authority=MappingProxyType(deepcopy(authority)),
+    )
 
 
 _ENQUEUE_FIELDS = {

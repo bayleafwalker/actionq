@@ -12,7 +12,7 @@ from actionq import db
 from actionq.application import ActionQApplication, InvocationProvenance
 from actionq import server
 from actionq import application_dispatch
-from actionq.managed_dispatch import ManagedEnqueueAdmission
+from actionq.managed_dispatch import ManagedDispatchPolicy, ManagedEnqueueAdmission
 from actionq.vuoro import build_operations, catalog_metadata
 
 
@@ -201,6 +201,32 @@ def test_vuoro_context_carries_only_trusted_repository_authorization():
     # The handler will fail closed without the injected application authorizer;
     # this proves the public catalog does not admit caller requested_by instead.
     assert "requested_by" not in operation.definition["input_schema"]["properties"]
+
+
+def test_vuoro_exposes_managed_enqueue_only_when_release_policy_is_injected(monkeypatch):
+    assert "execution.managed-dispatch.enqueue" not in {
+        item.definition["name"] for item in build_operations()
+    }
+    policy = ManagedDispatchPolicy(
+        expected_source_shas={"agentops": "a" * 40},
+        registered_authority={"commands": ["pytest"], "network": "none"},
+    )
+    app = ActionQApplication(schema="aq", authorizer=lambda *_args: True, managed_dispatch_policy=policy)
+    calls = []
+    app.enqueue_managed_dispatch = lambda envelope, *, provenance: calls.append((envelope, provenance)) or {"action_id": 8, "status": "pending", "request_ref": "req:" + "a" * 32, "request_sha256": "b" * 64}
+    operation = next(item for item in build_operations(app) if item.definition["name"] == "execution.managed-dispatch.enqueue")
+    assert "prompt" not in operation.definition["input_schema"]["properties"]["dispatch"]["properties"]
+    assert operation.definition["input_schema"]["additionalProperties"] is False
+
+    envelope = {"contract_id": "managed-dispatch-enqueue/v1", "dispatch": {}, "managed_request": {}}
+    context = SimpleNamespace(
+        identity=SimpleNamespace(actor="operator:trusted", environment="dev", authorized_repositories=("actionq",)),
+        request_id="r", catalog_revision="c", basis_revision=None, idempotency_key="managed-key",
+    )
+    result = operation.handler(envelope, context)
+    assert result["action_id"] == 8
+    assert calls[0][0] == envelope
+    assert calls[0][1].actor == "operator:trusted"
 
 
 def test_v2_snapshot_and_changes_are_allowlisted_and_recover_from_all_pruned_history():

@@ -161,12 +161,18 @@ class DispatchService:
         envelope: dict[str, Any],
         *,
         provenance: InvocationProvenance,
-        expected_source_shas: Mapping[str, str],
-        registered_authority: Mapping[str, Any],
+        expected_source_shas: Mapping[str, str] | None = None,
+        registered_authority: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically persist an admitted capsule beside its v2 queue root."""
         if not provenance.idempotency_key:
             raise db.ActionQError("served managed dispatch enqueue requires an idempotency key")
+        policy = self.managed_dispatch_policy
+        if expected_source_shas is None or registered_authority is None:
+            if policy is None:
+                raise db.ActionQError("managed dispatch admission policy is not configured")
+            expected_source_shas = policy.expected_source_shas
+            registered_authority = policy.registered_authority
         admitted = admit_managed_enqueue(
             envelope,
             authenticated_actor=provenance.actor,

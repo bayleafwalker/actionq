@@ -10,10 +10,12 @@ import pytest
 
 from actionq.managed_dispatch import (
     ManagedDispatchRejected,
+    POLICY_VERSION,
     admit_managed_enqueue,
     admit_managed_request,
     canonical,
     digest,
+    load_managed_dispatch_policy,
 )
 
 
@@ -98,6 +100,27 @@ def test_expected_source_sha_mismatch_is_rejected() -> None:
     value = request()
     with pytest.raises(ManagedDispatchRejected, match="source SHA"):
         admit_managed_request(value, expected_source_shas={"agentops": "deadbeef"}, registered_authority={})
+
+
+def test_deployment_policy_requires_strict_release_pins(tmp_path: Path) -> None:
+    policy_path = tmp_path / "managed-policy.json"
+    policy_path.write_text(json.dumps({
+        "schema_version": POLICY_VERSION,
+        "expected_source_shas": {"agentops": "a" * 40, "actionq": "b" * 40},
+        "registered_authority": {"commands": ["pytest"], "network": "none"},
+    }), encoding="utf-8")
+
+    policy = load_managed_dispatch_policy(policy_path)
+    assert dict(policy.expected_source_shas) == {"agentops": "a" * 40, "actionq": "b" * 40}
+    assert dict(policy.registered_authority) == {"commands": ["pytest"], "network": "none"}
+
+    policy_path.write_text(json.dumps({
+        "schema_version": POLICY_VERSION,
+        "expected_source_shas": {"agentops": "not-a-revision"},
+        "registered_authority": {},
+    }), encoding="utf-8")
+    with pytest.raises(ManagedDispatchRejected, match="policy is invalid"):
+        load_managed_dispatch_policy(policy_path)
 
 
 @pytest.mark.parametrize("field", ["claim_token", "claim_receipt", "capability_handle", "broker_path", "provider_secret"])
