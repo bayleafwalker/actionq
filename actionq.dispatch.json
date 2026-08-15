@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repo_id": "actionq",
   "authority_repo_uuid": "7155f083-7902-4522-88fa-ac0a3703ece3",
   "adoption_level": "guidance-only",
@@ -29,6 +29,38 @@
       ".agents/overlays/actionq.state-protocols.md",
       ".agents/overlays/actionq.hybrid-worker.md"
     ]
+  },
+  "instruction_set": {
+    "schema_version": 1,
+    "discovery": "native",
+    "sources": [
+      {
+        "id": "actionq-agents",
+        "path": "AGENTS.md",
+        "kind": "AGENTS.md",
+        "digest": "da8c2a34d6397ff9710e69eae62384e0553662422e367b2ab9c1c1fbbee2dce7",
+        "source_rev": "git:33e990324e69eb59bdca778c5e9cdba70baf07a4",
+        "refs": [],
+        "rules": [],
+        "hooks": [],
+        "line_budget": 120
+      }
+    ],
+    "applicability": {
+      "paths": ["README.md", "actionq/", "tests/", "docs/", "verification/", ".agents/"],
+      "roles": ["planner", "worker", "reviewer"]
+    },
+    "entrypoints": {
+      "architecture": ["README.md", "actionq/", "docs/"],
+      "plan": ["docs/plans/", ".agents/overlays/"],
+      "runbook": ["docs/operations/", "docs/protocols/", "examples/"]
+    },
+    "role_presets": {
+      "planner": { "model": "Sol", "behavior": "xhigh", "tool_mode": "read-only" },
+      "worker": { "model": "Luna", "behavior": "high", "tool_mode": "write" },
+      "reviewer": { "model": "Sol", "behavior": "xhigh", "tool_mode": "read-only" }
+    },
+    "provider_adapters": []
   },
   "scope": {
     "allowed_path_roots": [
