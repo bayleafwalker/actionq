@@ -73,7 +73,7 @@ def test_expected_source_sha_mismatch_is_rejected() -> None:
         admit_managed_request(value, expected_source_shas={"agentops": "deadbeef"}, registered_authority={})
 
 
-@pytest.mark.parametrize("field", ["claim_token", "capability_handle", "broker_path", "provider_secret"])
+@pytest.mark.parametrize("field", ["claim_token", "claim_receipt", "capability_handle", "broker_path", "provider_secret"])
 def test_model_visible_secret_field_is_rejected(field: str) -> None:
     value = request()
     value["capsule"]["role_preset"][field] = "raw"

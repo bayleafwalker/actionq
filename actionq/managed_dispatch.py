@@ -18,7 +18,7 @@ from typing import Any, Mapping
 REQUEST_VERSION = "managed-dispatch-request/v1"
 CAPSULE_VERSION = "managed-dispatch-capsule/v1"
 RENDERER_VERSION = "agentops-managed-capsule/1"
-FORBIDDEN_KEY = re.compile(r"(?:credential|bearer|token|claim_proof|capability_handle|broker_(?:path|socket)|provider_secret|secret)", re.I)
+FORBIDDEN_KEY = re.compile(r"(?:credential|bearer|token|claim_(?:proof|receipt)|capability_handle|broker_(?:path|socket)|provider_secret|secret)", re.I)
 FORBIDDEN_VALUE = re.compile(r"(?:\bBearer\s+[A-Za-z0-9._~+/-]+=*|claim[_-]?token|capability[_-]?handle|/var/run/[^\s]+)", re.I)
 
 
