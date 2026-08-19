@@ -415,7 +415,7 @@ def test_cli_inspection_never_compacts_or_overrides_persisted_policy(
 
 
 def test_generated_event_passes_canonical_agentops_validator(
-    tmp_path: Path, git_repo: Path
+    tmp_path: Path, git_repo: Path, session_artifact_validator: Path
 ) -> None:
     outbox_path = tmp_path / "outbox.sqlite3"
     wrapper = SessionWrapper(
@@ -432,7 +432,7 @@ def test_generated_event_passes_canonical_agentops_validator(
     completion_dir.mkdir()
     (completion_dir / "event.json").write_text(json.dumps(event), encoding="utf-8")
 
-    validator = Path(os.environ["AGENTOPS_SESSION_ARTIFACT_VALIDATOR"])
+    validator = session_artifact_validator
     completed = subprocess.run(
         [sys.executable, str(validator), "--root", str(tmp_path)],
         text=True,

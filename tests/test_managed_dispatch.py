@@ -22,11 +22,27 @@ from actionq.managed_dispatch import (
 
 AGENTOPS = Path(os.environ.get("ACTIONQ_AGENTOPS_ROOT", Path(__file__).parents[2] / "agentops"))
 RENDERER_PATH = AGENTOPS / "templates/dispatch/scripts/render_managed_capsule.py"
+SOURCE = AGENTOPS / "templates/dispatch/managed-capsule/source.fixture.json"
+
+# Skip this module, rather than exploding, when the sibling agentops checkout does
+# not carry the managed-capsule contracts. This used to be a bare import at module
+# scope, so a checkout sitting on a branch without those files raised
+# FileNotFoundError during COLLECTION and took the entire suite -- 700+ unrelated
+# tests -- down with it, reporting a missing path instead of the real situation.
+# A cross-repo fixture being absent is a setup fact about this machine, not a
+# defect in the code under test.
+if not RENDERER_PATH.is_file() or not SOURCE.is_file():
+    pytest.skip(
+        f"agentops managed-capsule contracts not found under {AGENTOPS}; "
+        "set ACTIONQ_AGENTOPS_ROOT to a checkout that has "
+        "templates/dispatch/scripts/render_managed_capsule.py",
+        allow_module_level=True,
+    )
+
 SPEC = importlib.util.spec_from_file_location("managed_capsule_renderer", RENDERER_PATH)
 assert SPEC and SPEC.loader
 RENDERER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RENDERER)
-SOURCE = AGENTOPS / "templates/dispatch/managed-capsule/source.fixture.json"
 
 
 def request() -> dict:

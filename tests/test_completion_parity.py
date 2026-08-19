@@ -179,7 +179,7 @@ def test_fake_daemon_records_after_child_exit_and_preserves_action_outcome(
 
 
 def test_daemon_completion_validates_with_canonical_agentops_contract(
-    tmp_path: Path,
+    tmp_path: Path, session_artifact_validator: Path
 ) -> None:
     daemon = _daemon(tmp_path)
     daemon._record_session_completion(_record(), outcome="completed", exit_code=0)
@@ -187,7 +187,7 @@ def test_daemon_completion_validates_with_canonical_agentops_contract(
     target = tmp_path / "session-completions"
     target.mkdir()
     (target / "daemon.json").write_text(json.dumps(event), encoding="utf-8")
-    validator = Path(os.environ["AGENTOPS_SESSION_ARTIFACT_VALIDATOR"])
+    validator = session_artifact_validator
     completed = subprocess.run(
         [sys.executable, str(validator), "--root", str(tmp_path)],
         text=True,

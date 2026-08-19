@@ -5,6 +5,13 @@ from .jsonrpc import JsonRpcError, JsonRpcTimeout, StdioJsonRpc
 from ..execution_boundary import BoundaryCheck, BoundaryReport, BoundaryViolation
 from ..context_policy import ContextPlan, verify_context_policy
 from ..execution_contract import Assurance, BindingStatus, ContextUsage, ModelBinding
+from .backends import (
+    REGISTRY,
+    AcpBackend,
+    Billing,
+    BindingChannel,
+    check_model_allowed,
+)
 from .v1 import (
     PROTOCOL_VERSION,
     AcpError,
@@ -15,6 +22,11 @@ from .v1 import (
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "REGISTRY",
+    "AcpBackend",
+    "Billing",
+    "BindingChannel",
+    "check_model_allowed",
     "Assurance",
     "BindingStatus",
     "ContextPlan",

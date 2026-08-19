@@ -304,3 +304,44 @@ class RoleAwareCliRunner(CliRunner):
 def actionq_cli_runner(monkeypatch):
     monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
     return RoleAwareCliRunner()
+
+
+def agentops_root() -> Path:
+    """Where the agentops contracts repo is checked out.
+
+    Same resolution as tests/test_managed_dispatch.py: the env var wins, and the
+    sibling checkout is the default, so a normal /projects/dev layout needs no
+    setup.
+    """
+    override = os.environ.get("ACTIONQ_AGENTOPS_ROOT")
+    if override:
+        return Path(override)
+    return Path(__file__).parents[2] / "agentops"
+
+
+@pytest.fixture
+def session_artifact_validator() -> Path:
+    """Path to agentops' session-artifact validator.
+
+    Previously read straight from AGENTOPS_SESSION_ARTIFACT_VALIDATOR, which CI
+    sets and a developer shell does not -- so these tests passed in CI and failed
+    locally, and the local failure got carried from handoff to handoff as
+    "pre-existing". Deriving it from the agentops root removes that divergence;
+    the env var still wins where it is set.
+
+    Skips, rather than fails, when the checkout is absent: a missing sibling repo
+    is a setup fact, not a defect in the code under test.
+    """
+    override = os.environ.get("AGENTOPS_SESSION_ARTIFACT_VALIDATOR")
+    validator = (
+        Path(override)
+        if override
+        else agentops_root()
+        / "templates/dispatch/scripts/validate_session_mechanization_artifacts.py"
+    )
+    if not validator.is_file():
+        pytest.skip(
+            f"agentops session-artifact validator not found at {validator}; "
+            "set ACTIONQ_AGENTOPS_ROOT or AGENTOPS_SESSION_ARTIFACT_VALIDATOR"
+        )
+    return validator
