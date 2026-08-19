@@ -26,9 +26,10 @@ from ..execution_contract import (
     RuntimeHandle,
 )
 from ..execution_boundary import (
+    BaselineState,
     BoundaryCheck,
     BoundaryReport,
-    snapshot_changed_paths,
+    snapshot_baseline,
     verify_after_completion,
     verify_before_dispatch,
 )
@@ -129,7 +130,7 @@ class AcpExecutionAdapter:
         self._count_tokens = count_tokens
         self._context_plan: ContextPlan | None = None
         self._binding: ModelBinding | None = None
-        self._baseline_paths: frozenset[str] = frozenset()
+        self._baseline: BaselineState = BaselineState()
         self._pinned_revision: str | None = None
         self._boundary_reports: list[BoundaryReport] = []
         self._rpc: StdioJsonRpc | None = None
@@ -199,7 +200,7 @@ class AcpExecutionAdapter:
             pre.raise_for_violations()
         if pre.ok:
             self._pinned_revision = _recorded_revision(pre, envelope.invariants.revision)
-            self._baseline_paths = snapshot_changed_paths(root)
+            self._baseline = snapshot_baseline(root)
 
         context_report, plan = verify_context_policy(
             envelope.context_policy, count_tokens=self._count_tokens
@@ -485,7 +486,7 @@ class AcpExecutionAdapter:
             raise AcpError("verify_completion() requires an opened execution")
         report = verify_after_completion(
             self._envelope.invariants,
-            baseline=self._baseline_paths,
+            baseline=self._baseline,
             expected_revision=self._pinned_revision,
         )
         self._boundary_reports.append(report)

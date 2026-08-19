@@ -416,7 +416,7 @@ rather than against the word `HEAD`.
 | Check | Catches |
 |---|---|
 | `revision.unchanged` | a harness that committed or moved `HEAD` |
-| `paths.permitted` | changes outside the allowlist, diffed against a pre-dispatch baseline so pre-existing dirt is not blamed on the execution |
+| `paths.permitted` | changes outside the allowlist, diffed against a pre-dispatch baseline that records each already-dirty path's **state**, so inherited dirt is excused while a further change to it is not |
 | `acceptance.target_present` | an acceptance target that was never produced |
 
 An **empty `permitted_paths` means no modification was authorised** and any change is a

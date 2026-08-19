@@ -13,7 +13,7 @@ import pytest
 from actionq_runner.execution_boundary import (
     BoundaryViolation,
     resolve_revision,
-    snapshot_changed_paths,
+    snapshot_baseline,
     verify_after_completion,
     verify_before_dispatch,
 )
@@ -84,7 +84,7 @@ def test_subdirectory_root_is_refused(repo: Path) -> None:
 
 
 def test_empty_allowlist_means_no_changes_are_permitted(repo: Path) -> None:
-    baseline = snapshot_changed_paths(repo)
+    baseline = snapshot_baseline(repo)
     (repo / "src" / "a.py").write_text("x = 2\n")
     report = verify_after_completion(
         ExecutionInvariants(root=str(repo), revision="HEAD"), baseline=baseline
@@ -94,7 +94,7 @@ def test_empty_allowlist_means_no_changes_are_permitted(repo: Path) -> None:
 
 
 def test_changes_inside_the_allowlist_pass(repo: Path) -> None:
-    baseline = snapshot_changed_paths(repo)
+    baseline = snapshot_baseline(repo)
     (repo / "src" / "a.py").write_text("x = 2\n")
     report = verify_after_completion(
         ExecutionInvariants(root=str(repo), revision="HEAD", permitted_paths=("src/*",)),
@@ -104,7 +104,7 @@ def test_changes_inside_the_allowlist_pass(repo: Path) -> None:
 
 
 def test_changes_outside_the_allowlist_are_caught(repo: Path) -> None:
-    baseline = snapshot_changed_paths(repo)
+    baseline = snapshot_baseline(repo)
     (repo / "src" / "a.py").write_text("x = 2\n")
     (repo / "README.md").write_text("tampered\n")
     report = verify_after_completion(
@@ -115,9 +115,55 @@ def test_changes_outside_the_allowlist_are_caught(repo: Path) -> None:
     assert "README.md" in report.violations[0].observed
 
 
+def test_agent_change_to_preexisting_dirty_disallowed_path_is_caught(repo: Path) -> None:
+    """The blind spot a path-set baseline had.
+
+    README.md is already dirty, so a name-only baseline would subtract it away and report
+    clean while the execution really did modify a forbidden file.
+    """
+    (repo / "README.md").write_text("dirty before we started\n")
+    baseline = snapshot_baseline(repo)
+    (repo / "README.md").write_text("the execution changed it again\n")
+
+    report = verify_after_completion(
+        ExecutionInvariants(root=str(repo), revision="HEAD", permitted_paths=("src/*",)),
+        baseline=baseline,
+    )
+    assert not report.ok
+    assert report.violations[0].name == "paths.permitted"
+    assert "README.md" in report.violations[0].observed
+
+
+def test_reverting_pre_existing_dirt_is_attributed_to_the_execution(repo: Path) -> None:
+    """A path that stops being dirty also changed. Absence from the diff is not innocence."""
+    original = (repo / "README.md").read_text()
+    (repo / "README.md").write_text("dirty before we started\n")
+    baseline = snapshot_baseline(repo)
+    (repo / "README.md").write_text(original)
+
+    report = verify_after_completion(
+        ExecutionInvariants(root=str(repo), revision="HEAD", permitted_paths=("src/*",)),
+        baseline=baseline,
+    )
+    assert not report.ok
+    assert "README.md" in report.violations[0].observed
+
+
+def test_deleting_a_pre_existing_dirty_file_is_caught(repo: Path) -> None:
+    (repo / "README.md").write_text("dirty before we started\n")
+    baseline = snapshot_baseline(repo)
+    (repo / "README.md").unlink()
+
+    report = verify_after_completion(
+        ExecutionInvariants(root=str(repo), revision="HEAD", permitted_paths=("src/*",)),
+        baseline=baseline,
+    )
+    assert not report.ok
+
+
 def test_pre_existing_dirt_is_not_blamed_on_the_execution(repo: Path) -> None:
     (repo / "README.md").write_text("dirty before we started\n")
-    baseline = snapshot_changed_paths(repo)
+    baseline = snapshot_baseline(repo)
     report = verify_after_completion(
         ExecutionInvariants(root=str(repo), revision="HEAD"), baseline=baseline
     )

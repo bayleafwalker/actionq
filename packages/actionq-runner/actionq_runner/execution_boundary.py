@@ -18,9 +18,11 @@ implementation of the same check is a second thing to get wrong.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from .execution_contract import ExecutionInvariants
 from .executor import _changed_paths
@@ -137,15 +139,73 @@ def verify_before_dispatch(invariants: ExecutionInvariants) -> BoundaryReport:
     return BoundaryReport(phase="before_dispatch", checks=tuple(checks))
 
 
-def snapshot_changed_paths(root: str | Path) -> frozenset[str]:
-    """Record pre-existing dirt so the post-check attributes only new changes."""
-    return frozenset(_changed_paths(Path(root)))
+def _fingerprint(root: Path, relative: str) -> str:
+    """Identify a path's *state*, enough to tell "unchanged" from "changed again".
+
+    Content plus presence and type. Provenance is not needed here -- the only question
+    the boundary asks is whether the final tree differs from the baseline at this path.
+    """
+    target = root / relative
+    if target.is_symlink():
+        return "symlink:" + str(Path(target).readlink())
+    if not target.exists():
+        return "absent"
+    if target.is_dir():
+        return "dir"
+    try:
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    except OSError:
+        return "unreadable"
+    return "file:" + digest
+
+
+@dataclass(frozen=True)
+class BaselineState:
+    """Pre-existing dirt, recorded by state rather than by name.
+
+    A bare set of paths cannot distinguish *inherited* dirt from a path the execution
+    dirtied **further**: subtracting the set removes the second case along with the first,
+    and the boundary reports clean while something really did happen. Recording a
+    fingerprint per already-dirty path closes that.
+    """
+
+    fingerprints: Mapping[str, str] = field(default_factory=dict)
+
+    def __contains__(self, relative: str) -> bool:
+        return relative in self.fingerprints
+
+    def unchanged(self, root: Path, relative: str) -> bool:
+        recorded = self.fingerprints.get(relative)
+        return recorded is not None and recorded == _fingerprint(root, relative)
+
+
+def snapshot_baseline(root: str | Path) -> BaselineState:
+    """Record pre-existing dirt *and its state*, before the execution runs."""
+    base = Path(root)
+    dirty = _changed_paths(base)
+    return BaselineState(fingerprints={p: _fingerprint(base, p) for p in dirty})
+
+
+def _attributable_changes(root: Path, baseline: BaselineState) -> set[str]:
+    """Paths this execution is answerable for.
+
+    Four cases, only the second of which is inherited:
+
+        newly dirty                          -> changed by the execution
+        previously dirty, same fingerprint   -> inherited dirt, not attributable
+        previously dirty, different state    -> changed by the execution
+        previously dirty, no longer dirty    -> reverted, changed by the execution
+    """
+    now = set(_changed_paths(root))
+    changed = {p for p in now if p not in baseline or not baseline.unchanged(root, p)}
+    changed |= {p for p in baseline.fingerprints if p not in now}
+    return changed
 
 
 def verify_after_completion(
     invariants: ExecutionInvariants,
     *,
-    baseline: frozenset[str] = frozenset(),
+    baseline: BaselineState | None = None,
     expected_revision: str | None = None,
 ) -> BoundaryReport:
     """Check the agent stayed inside what the envelope permitted.
@@ -175,7 +235,7 @@ def verify_after_completion(
             detail="the harness committed or moved HEAD" if head != pin else None,
         ))
 
-    changed = frozenset(_changed_paths(root)) - baseline
+    changed = _attributable_changes(root, baseline or BaselineState())
     disallowed = sorted(
         path for path in changed
         if not any(fnmatch.fnmatchcase(path, pattern) for pattern in invariants.permitted_paths)
