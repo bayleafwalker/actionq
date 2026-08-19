@@ -1,6 +1,6 @@
 # Proposal: ACP as the harness-facing execution protocol
 
-**Status:** accepted; v1 adapter implemented 2026-08-19 (Phase 3, partial — see *Implementation status* at the end)
+**Status:** accepted; v1 adapter + envelope enforcement implemented 2026-08-19 (Phase 3, partial — see *Implementation status* at the end)
 **Date:** 2026-08-19
 **Targets:** `docs/contracts/vuoro-execution-adapter.md`
 **Origin:** RTX 3090 local inference work; see `/projects/dev/local-inference/docs/10-execution-boundary.md`
@@ -375,14 +375,11 @@ process cwd.
   and `session/request_permission` are assumed from the spec, not confirmed.
 - **The acceptance test is not built.** Only the OpenCode leg exists. Fungibility remains
   a claim, not a measurement, until a second agent runs the same sealed envelope.
-- **The context policy is modelled but not enforced.** `ContextPolicy` is carried on the
+- **The context policy is modelled but not enforced.** (Envelope *invariants* are now
+  enforced — see below. Context policy is the remaining half.) `ContextPolicy` is carried on the
   envelope; nothing yet resolves WARM/COLD addresses or holds the HOT ceiling. That is the
   seam where `local-inference/benchmarks/regression/selective-retrieval.yaml` should be
   pointed once a provider exists.
-- **Invariants are declared, not checked.** `ExecutionInvariants` rejects an empty root or
-  revision, but nothing yet verifies the revision or permitted paths around the harness.
-  The proposal is explicit that these must be machine-checked before dispatch and after
-  completion; that verification is still to write.
 - **`session/load` / resume is unused.** Advertised as available; recovery policy is not
   implemented.
 - **ACP v2 remains unverified.** Unchanged by this work.
@@ -393,3 +390,70 @@ A trivial two-token prompt cost **7 771 input tokens** — OpenCode's system pro
 definitions, before any task content. That is a majority of the HOT tier (12 288) consumed
 as fixed harness overhead. Observed once, on one prompt; it wants characterising before the
 context policy is tuned against ACP.
+
+
+---
+
+# Envelope enforcement (2026-08-19, second slice)
+
+`actionq_runner/execution_boundary.py` — protocol-neutral, imports no ACP. The checks run
+*outside* whatever agent is executing, because a harness cannot be trusted to report that
+it was pointed at the wrong tree.
+
+## Before dispatch — while nothing is running
+
+| Check | Catches |
+|---|---|
+| `root.exists` | an envelope naming a tree that is not there |
+| `root.is_worktree` | a root that is not version-controlled, so nothing is attributable |
+| `root.is_worktree_top` | a *subdirectory* root, which would silently make the path allowlist relative to the wrong base |
+| `revision.pinned` / `revision.recorded` | a tree that is not on the revision the envelope froze |
+
+A pinned revision must match. The literal `HEAD` means "unpinned — resolve it once and hold
+the execution to that", so the post-check compares against what the tree actually was
+rather than against the word `HEAD`.
+
+## After completion — what the execution actually did
+
+| Check | Catches |
+|---|---|
+| `revision.unchanged` | a harness that committed or moved `HEAD` |
+| `paths.permitted` | changes outside the allowlist, diffed against a pre-dispatch baseline so pre-existing dirt is not blamed on the execution |
+| `acceptance.target_present` | an acceptance target that was never produced |
+
+An **empty `permitted_paths` means no modification was authorised** and any change is a
+violation. That is the fail-closed reading and it matches the frozen allowlist the portable
+runner already enforces — whose `_changed_paths` this module reuses rather than
+reimplementing.
+
+## In-protocol — the one piece of execution identity ACP can read back
+
+`session/list` reports each session's `cwd`. The adapter compares it to the envelope root
+(`session.root_readback`). It is the agent's self-report, labelled as such, and an agent
+without `session/list` is recorded as **unverifiable rather than passing** — the distinction
+that keeps a missing check from looking like a satisfied one.
+
+Measured: an explicit `session/new` cwd **beats a hostile inherited `PWD`**, so the ACP path
+does not reproduce the `opencode run` project-root bug (evidence A7). The adapter sets `PWD`
+anyway, and the read-back is the regression guard.
+
+## Failure mode
+
+Violations raise `BoundaryViolation` by default. `enforce_invariants=False` downgrades to
+observe-and-record — the report still lands in `boundary_reports` and in the
+`boundary.checked` event stream, so a violation is never invisible, only non-fatal.
+
+## Tests
+
+11 boundary tests, 11 adapter-level enforcement tests, 3 live. Each targets a way an
+execution can succeed while having operated on something other than what the envelope
+named: wrong revision, missing root, subdirectory root, harness that commits, changes
+outside the lane, pre-existing dirt misattributed, and an agent reporting the wrong tree.
+
+## Still not done
+
+- Context policy enforcement (WARM/COLD resolution, HOT ceiling). The regression fixture
+  `local-inference/benchmarks/regression/selective-retrieval.yaml` should be pointed here
+  once a provider exists.
+- Real permission and tool-call wire shapes remain unverified against a live harness.
+- The two-agent fungibility acceptance test.

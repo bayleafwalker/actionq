@@ -11,7 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from actionq_runner.acp import AcpError, AcpExecutionAdapter, ModelBindingError
+from actionq_runner.acp import (
+    AcpError,
+    AcpExecutionAdapter,
+    BoundaryViolation,
+    ModelBindingError,
+)
+from actionq_runner.execution_boundary import resolve_revision
 from actionq_runner.execution_contract import (
     BindingStatus,
     ContextAddress,
@@ -30,6 +36,11 @@ FAKE = [sys.executable, str(Path(__file__).parent / "fake_acp_agent.py")]
 def repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=tmp_path, check=True,
+    )
     return tmp_path
 
 
@@ -226,3 +237,95 @@ def test_close_is_idempotent_and_reopen_is_refused(repo: Path) -> None:
         b.open(envelope(repo))
         with pytest.raises(AcpError, match="already open"):
             b.open(envelope(repo))
+
+
+# -- execution boundary ----------------------------------------------------
+
+
+def test_wrong_revision_is_refused_before_the_agent_launches(repo: Path) -> None:
+    """The invariant fails while nothing is running, so no work is wasted or done wrong."""
+    with adapter() as a:
+        with pytest.raises(BoundaryViolation, match="revision.pinned"):
+            a.open(envelope(repo, invariants=ExecutionInvariants(
+                root=str(repo), revision="0" * 40)))
+
+
+def test_missing_root_is_refused(tmp_path: Path) -> None:
+    with adapter() as a:
+        with pytest.raises(BoundaryViolation, match="root.exists"):
+            a.open(envelope(tmp_path, invariants=ExecutionInvariants(
+                root=str(tmp_path / "absent"), revision="HEAD")))
+
+
+def test_pinned_revision_is_accepted(repo: Path) -> None:
+    head = resolve_revision(repo)
+    with adapter() as a:
+        a.open(envelope(repo, invariants=ExecutionInvariants(root=str(repo), revision=head)))
+        pre = a.boundary_reports[0]
+    assert pre.phase == "before_dispatch" and pre.ok
+
+
+def test_boundary_results_are_emitted_as_telemetry(repo: Path) -> None:
+    with adapter() as a:
+        a.open(envelope(repo))
+        checked = [e for e in a.events() if e.kind is EventKind.BOUNDARY_CHECKED]
+    assert checked, "boundary checks must be visible in the event stream"
+    assert checked[0].payload["phase"] == "before_dispatch"
+
+
+def test_completion_catches_a_change_outside_the_allowlist(repo: Path) -> None:
+    with adapter() as a:
+        a.open(envelope(repo))
+        a.prompt()
+        (repo / "README.md").write_text("the agent went outside its lane\n")
+        with pytest.raises(BoundaryViolation, match="paths.permitted"):
+            a.verify_completion()
+
+
+def test_completion_passes_when_changes_stay_inside(repo: Path) -> None:
+    inv = ExecutionInvariants(root=str(repo), revision="HEAD", permitted_paths=("notes.md",))
+    with adapter() as a:
+        a.open(envelope(repo, invariants=inv))
+        a.prompt()
+        (repo / "notes.md").write_text("allowed\n")
+        assert a.verify_completion().ok
+
+
+def test_enforcement_can_be_observed_without_being_fatal(repo: Path) -> None:
+    """Reporting mode still records the violation; it just does not raise."""
+    with adapter(enforce_invariants=False) as a:
+        a.open(envelope(repo, invariants=ExecutionInvariants(
+            root=str(repo), revision="0" * 40)))
+        pre = a.boundary_reports[0]
+    assert not pre.ok
+    assert pre.violations[0].name == "revision.pinned"
+
+
+def test_session_root_readback_is_checked(repo: Path) -> None:
+    with adapter() as a:
+        a.open(envelope(repo))
+        root_reports = [r for r in a.boundary_reports if r.phase == "session_root"]
+    assert root_reports and root_reports[0].ok
+
+
+def test_agent_running_in_the_wrong_tree_is_caught(repo: Path) -> None:
+    """The failure the PWD bug produced: plausible work, wrong repository."""
+    with adapter("wrong_root") as a:
+        with pytest.raises(BoundaryViolation, match="session.root_readback"):
+            a.open(envelope(repo))
+
+
+def test_agent_without_session_list_is_recorded_as_unverifiable(repo: Path) -> None:
+    """No read-back is not the same as a passing check, and must not be silent."""
+    with adapter("no_session_list") as a:
+        a.open(envelope(repo))
+        report = [r for r in a.boundary_reports if r.phase == "session_root"][0]
+    assert report.ok
+    assert report.checks[0].observed == "unavailable"
+    assert "unverifiable" in report.checks[0].detail
+
+
+def test_verify_completion_requires_an_open_execution() -> None:
+    a = adapter()
+    with pytest.raises(AcpError, match="requires an opened execution"):
+        a.verify_completion()

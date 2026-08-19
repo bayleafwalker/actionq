@@ -26,6 +26,7 @@ class EventKind(str, Enum):
     CANCELLATION_REQUESTED = "cancellation.requested"
     USAGE_REPORTED = "usage.reported"
     MODEL_BINDING = "model.binding"
+    BOUNDARY_CHECKED = "boundary.checked"
     PROTOCOL_UNMAPPED = "protocol.unmapped"
 
 

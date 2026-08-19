@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from actionq_runner.acp import AcpExecutionAdapter, ModelBindingError
+from actionq_runner.acp import AcpExecutionAdapter, BoundaryViolation, ModelBindingError
 from actionq_runner.execution_contract import (
     BindingStatus,
     EventKind,
@@ -35,6 +35,11 @@ pytestmark = pytest.mark.skipif(
 def repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=tmp_path, check=True,
+    )
     return tmp_path
 
 
@@ -97,3 +102,34 @@ def test_live_prompt_round_trip(repo: Path) -> None:
         assert EventKind.RUNTIME_STOPPED in kinds
         unmapped = [e.payload for e in a.events() if e.kind is EventKind.PROTOCOL_UNMAPPED]
         assert not unmapped, f"harness sent traffic the codec does not map: {unmapped}"
+
+
+def test_live_session_reports_the_root_we_named(repo: Path) -> None:
+    """The one piece of execution identity ACP can read back."""
+    with AcpExecutionAdapter(AGENT, agent="opencode") as a:
+        a.open(_envelope(repo))
+        root_reports = [r for r in a.boundary_reports if r.phase == "session_root"]
+        assert root_reports and root_reports[0].ok
+        assert root_reports[0].checks[0].observed == str(repo)
+
+
+def test_live_hostile_pwd_does_not_move_the_effective_root(repo: Path, monkeypatch) -> None:
+    """Regression guard for the `opencode run` project-root bug on the ACP path.
+
+    Measured 2026-08-19: an explicit session/new cwd wins over an inherited PWD. If a
+    future release regresses that, the root read-back is what notices.
+    """
+    monkeypatch.setenv("PWD", str(repo.parent))
+    with AcpExecutionAdapter(AGENT, agent="opencode") as a:
+        a.open(_envelope(repo))
+        root_reports = [r for r in a.boundary_reports if r.phase == "session_root"]
+    assert root_reports[0].ok
+
+
+def test_live_wrong_revision_never_launches_the_agent(repo: Path) -> None:
+    from actionq_runner.execution_contract import ExecutionInvariants
+
+    with AcpExecutionAdapter(AGENT, agent="opencode") as a:
+        with pytest.raises(BoundaryViolation, match="revision.pinned"):
+            a.open(_envelope(repo, invariants=ExecutionInvariants(
+                root=str(repo), revision="0" * 40)))

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Callable, Iterator
 
@@ -20,6 +21,13 @@ from ..execution_contract import (
     ModelBinding,
     PermissionDecision,
     RuntimeHandle,
+)
+from ..execution_boundary import (
+    BoundaryCheck,
+    BoundaryReport,
+    snapshot_changed_paths,
+    verify_after_completion,
+    verify_before_dispatch,
 )
 from .jsonrpc import JsonRpcError, StdioJsonRpc
 from .telemetry import normalize_inbound
@@ -102,6 +110,7 @@ class AcpExecutionAdapter:
         on_stderr: Callable[[str], None] | None = None,
         request_timeout: float = 60.0,
         require_verified_model: bool = False,
+        enforce_invariants: bool = True,
     ) -> None:
         if not command:
             raise ValueError("an ACP adapter requires a command to launch the agent")
@@ -111,7 +120,11 @@ class AcpExecutionAdapter:
         self._on_stderr = on_stderr
         self._timeout = request_timeout
         self._require_verified_model = require_verified_model
+        self._enforce = enforce_invariants
         self._binding: ModelBinding | None = None
+        self._baseline_paths: frozenset[str] = frozenset()
+        self._pinned_revision: str | None = None
+        self._boundary_reports: list[BoundaryReport] = []
         self._rpc: StdioJsonRpc | None = None
         self._capabilities: AgentCapabilities | None = None
         self._session_id: str | None = None
@@ -125,6 +138,11 @@ class AcpExecutionAdapter:
         if self._capabilities is None:
             raise AcpError("capabilities are unknown until open() has run initialize")
         return self._capabilities
+
+    @property
+    def boundary_reports(self) -> tuple[BoundaryReport, ...]:
+        """Every invariant check run around this execution, in order."""
+        return tuple(self._boundary_reports)
 
     @property
     def model_binding(self) -> ModelBinding | None:
@@ -146,6 +164,17 @@ class AcpExecutionAdapter:
             raise AcpError("adapter is already open")
         self._envelope = envelope
         root = envelope.invariants.root
+
+        # Before the agent exists. A harness cannot be trusted to report that it was
+        # pointed at the wrong tree, so the tree is checked while nothing is running.
+        pre = verify_before_dispatch(envelope.invariants)
+        self._boundary_reports.append(pre)
+        self._emit(EventKind.BOUNDARY_CHECKED, _report_payload(pre))
+        if self._enforce:
+            pre.raise_for_violations()
+        if pre.ok:
+            self._pinned_revision = _recorded_revision(pre, envelope.invariants.revision)
+            self._baseline_paths = snapshot_changed_paths(root)
 
         env = dict(os.environ)
         # OpenCode resolves its project from PWD, not the process cwd. Leaving an
@@ -191,6 +220,8 @@ class AcpExecutionAdapter:
             raise AcpError("session/new returned no sessionId")
         self._session_id = session_id
         self._emit(EventKind.RUNTIME_STARTED, {"session_id": session_id, "agent": self._agent})
+
+        self._verify_effective_root(root)
 
         if envelope.mode is not None:
             self._set_mode(envelope.mode)
@@ -303,6 +334,77 @@ class AcpExecutionAdapter:
                 return model
         return None
 
+    def _verify_effective_root(self, root: str) -> None:
+        """Confirm the session resolved to the tree the envelope named.
+
+        `session/list` reports each session's cwd, which is the one piece of execution
+        identity this protocol *can* read back. It is the agent's self-report, not an
+        independent observation, and is labelled as such -- but a self-report that
+        disagrees with the envelope is still a decisive signal, and the check is cheap.
+
+        Measured 2026-08-19: an explicit `session/new` cwd wins over a hostile inherited
+        PWD on OpenCode 1.18.18, so the ACP path does not reproduce the `opencode run`
+        project-root bug. This check is what would notice if that ever regressed.
+        """
+        assert self._rpc is not None
+        try:
+            listing = self._rpc.request("session/list", {}, timeout=self._timeout)
+        except JsonRpcError as error:
+            if not error.method_not_found:
+                raise
+            report = BoundaryReport(phase="session_root", checks=(
+                BoundaryCheck(
+                    name="session.root_readback",
+                    passed=True,
+                    expected=root,
+                    observed="unavailable",
+                    detail="agent exposes no session/list; effective root is unverifiable",
+                ),
+            ))
+            self._boundary_reports.append(report)
+            self._emit(EventKind.BOUNDARY_CHECKED, _report_payload(report))
+            return
+
+        mine = [
+            s for s in listing.get("sessions") or []
+            if s.get("sessionId") == self._session_id
+        ]
+        observed = mine[0].get("cwd") if mine else None
+        matches = observed is not None and Path(observed).resolve() == Path(root).resolve()
+        report = BoundaryReport(phase="session_root", checks=(
+            BoundaryCheck(
+                name="session.root_readback",
+                passed=matches,
+                expected=root,
+                observed=observed or "session not listed",
+                detail="agent self-report, not an independent observation",
+            ),
+        ))
+        self._boundary_reports.append(report)
+        self._emit(EventKind.BOUNDARY_CHECKED, _report_payload(report))
+        if self._enforce:
+            report.raise_for_violations()
+
+    def verify_completion(self) -> BoundaryReport:
+        """Check what the execution actually did to the tree, after it finished.
+
+        Call this once the turn has ended. It is separate from ``prompt`` because the
+        decision to accept a violation belongs to policy above this adapter, and because a
+        cancelled or crashed execution still needs the tree checked.
+        """
+        if self._envelope is None:
+            raise AcpError("verify_completion() requires an opened execution")
+        report = verify_after_completion(
+            self._envelope.invariants,
+            baseline=self._baseline_paths,
+            expected_revision=self._pinned_revision,
+        )
+        self._boundary_reports.append(report)
+        self._emit(EventKind.BOUNDARY_CHECKED, _report_payload(report))
+        if self._enforce:
+            report.raise_for_violations()
+        return report
+
     def prompt(self, text: str | None = None, *, timeout: float = 1800.0) -> ExecutionOutcome:
         """Submit the envelope's instruction and block until the turn ends."""
         if self._rpc is None or self._session_id is None or self._envelope is None:
@@ -388,6 +490,38 @@ class AcpExecutionAdapter:
             self._rpc.respond(message["id"], {"outcome": {"outcome": "cancelled"}})
             return
         self._rpc.respond(message["id"], {"outcome": {"outcome": "selected", "optionId": option}})
+
+
+def _report_payload(report: BoundaryReport) -> dict[str, Any]:
+    return {
+        "phase": report.phase,
+        "ok": report.ok,
+        "checks": [
+            {
+                "name": c.name,
+                "passed": c.passed,
+                "expected": c.expected,
+                "observed": c.observed,
+                "detail": c.detail,
+            }
+            for c in report.checks
+        ],
+    }
+
+
+def _recorded_revision(report: BoundaryReport, declared: str) -> str | None:
+    """The revision to hold the execution to afterwards.
+
+    A pinned revision is its own expectation. An unpinned `HEAD` is resolved once, before
+    dispatch, so the post-check compares against what the tree actually was rather than
+    against the word "HEAD".
+    """
+    if declared != "HEAD":
+        return declared
+    for check in report.checks:
+        if check.name == "revision.recorded" and check.passed:
+            return check.observed
+    return None
 
 
 def _model_options(session_result: dict[str, Any]) -> set[str]:

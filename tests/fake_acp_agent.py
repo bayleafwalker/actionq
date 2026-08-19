@@ -57,6 +57,13 @@ def main() -> None:
             })
         elif method == "session/new":
             reply(rid, {"sessionId": session_id, "configOptions": [dict(model_option)]})
+        elif method == "session/list":
+            if behaviour == "no_session_list":
+                fail(rid, -32601, "Method not found: session/list")
+            else:
+                cwd = "/somewhere/else/entirely" if behaviour == "wrong_root" else os.getcwd()
+                reply(rid, {"sessions": [{"sessionId": session_id, "cwd": cwd,
+                                          "title": "t", "updatedAt": "now"}]})
         elif method == "session/set_mode":
             reply(rid, {})
         elif method == "session/set_model":

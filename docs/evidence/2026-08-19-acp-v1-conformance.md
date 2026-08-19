@@ -170,6 +170,35 @@ directly with the tiered context policy (HOT = 12 288): the harness preamble con
 majority of the HOT tier before any task content is added. Worth measuring properly before
 the context policy is tuned against ACP.
 
+## A7 — the effective root *is* readable back, and a hostile PWD does not move it
+
+Added while implementing envelope enforcement.
+
+`session/list` returns each session's `cwd`:
+
+```json
+{"sessions":[{"sessionId":"ses_...","cwd":"/…/sandbox","title":"…","updatedAt":"…"}]}
+```
+
+So unlike the model (A2b), the effective root **can** be read back over ACP. It is the
+agent's self-report rather than an independent observation, and is labelled as such — but a
+self-report that disagrees with the envelope is still decisive, and the check costs one
+round trip.
+
+Tested directly against the original bug: with `--cwd` set to the sandbox and a **hostile
+`PWD`** pointing at `/projects/dev/actionq`, the session still reported the sandbox.
+
+```
+requested cwd : /…/scratchpad/acp/sandbox
+hostile PWD   : /projects/dev/actionq
+reported cwd  : /…/scratchpad/acp/sandbox      MATCH
+```
+
+**The ACP path does not reproduce the `opencode run` project-root bug.** An explicit
+`session/new` cwd wins. The adapter still sets `PWD` explicitly at spawn — belt and braces,
+since that costs nothing — and the root read-back is what would notice if this regressed. A
+live test pins the behaviour.
+
 ## What this does not establish
 
 - Tool-call and permission flows were not exercised — `plan` mode and a trivial prompt were
