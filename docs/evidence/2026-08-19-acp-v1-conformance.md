@@ -405,3 +405,227 @@ One codec drives OpenCode, Codex, Claude Code ACP and Gemini CLI with no vendor 
   the actual request, which is available for local models and not for hosted ones.
 - ACP v2's status remains **unverified**, exactly as the proposal flagged. Nothing here
   bears on it.
+
+---
+
+# Phase 4 addendum — Claude Code ACP, measured
+
+Captured 2026-08-19 from a plain shell (the nesting guard in A10 makes this impossible from
+inside a Claude Code session). Harness: `verification/capture_claude_acp.py` and
+`verification/probe_claude_acp_set_model.py`. Raw:
+`acp-agents/claude-code-acp-0.16.2.session-new.json` and `…set-model-probe.json`.
+
+## A12 — `session/new` exposes both a model roster and a mode vocabulary
+
+`@zed-industries/claude-code-acp@0.16.2` returns `models.availableModels` **and**
+`models.currentModelId` from `session/new`, so the existing `_model_options` reader finds
+them with no new code. Three ids, and they are **selectors, not model names**:
+
+| modelId | described as |
+|---|---|
+| `default` | Opus 4.6 · Most capable for complex work |
+| `sonnet` | Sonnet 4.5 · Best for everyday tasks |
+| `haiku` | Haiku 4.5 · Fastest for quick answers |
+
+`currentModelId` was `sonnet` at session creation — i.e. **a session begins bound to a model
+nobody chose**, which is A4 restated for this agent.
+
+Modes: `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`. Three of the five
+weaken permissions. A bogus modeId returns `-32603 Internal error` rather than a clean
+rejection, so mode validation exists but is not well-formed.
+
+## A13 — `session/set_model` returns success for *any* string, and cannot be read back
+
+This is the finding that governs whether Claude Code ACP can be wired at all.
+
+`session/set_model` exists — so the adapter's `method_not_found` fail-closed path never
+fires. It answered `{"result":{}}` to every one of these:
+
+| sent | in advertised list? | result |
+|---|---|---|
+| `sonnet` | yes | accepted |
+| `haiku` | yes | accepted |
+| `claude-sonnet-4-5` | no | **accepted** |
+| `gpt-5.6-sol[low]` | no (another vendor) | **accepted** |
+| `local3090/worker-fast` | no (a local profile) | **accepted** |
+| `definitely-not-a-model-9999` | no | **accepted** |
+| `""` (empty string) | no | **accepted** |
+
+And there is **no read-back**: `session/status` and `session/info` are both `-32601`.
+
+> **A successful `set_model` response from this agent is not evidence that anything was
+> bound.** It is not evidence that the id was even understood.
+
+This is worse than the missing `set_model` the plan anticipated. A missing method fails
+closed and loudly; this fails open and cheerfully, on a hosted model that bills. It is the
+same shape as the six in `local-inference` HANDOFF §3: the operation reports success, the
+result is plausible, and nothing at any layer says otherwise.
+
+## A14 — why: the ACP layer is a bridge that neither owns nor checks model selection
+
+Read from the published package rather than inferred.
+
+`claude-code-acp` is a thin translation shim over `@anthropic-ai/claude-agent-sdk`, which it
+**pins at 0.2.44**. Two consequences follow, and they answer two separate questions:
+
+1. **No validation.** `unstable_setSessionModel` (`dist/acp-agent.js:483`) checks only that
+   the session exists, then forwards the raw string to `query.setModel(params.modelId)`.
+   The bridge does not validate because selecting models is not its job — but the ACP client
+   is told `ok` regardless. Note the method's own name: `unstable_`.
+2. **The roster is as old as the pinned SDK.** `availableModels` is built
+   (`dist/acp-agent.js:920-938`) from the model list the bundled Claude Code CLI reports at
+   initialization, and those strings live in that SDK version's `cli.js`. 0.16.2 is the
+   **latest** published bridge, so this is not a stale pin on our side — the current bridge
+   ships a roster that predates the Claude 5 family. "The harness handles the model side" is
+   exactly right, and is precisely why the ACP surface cannot answer for it.
+
+A third detail, worth naming because it is a trap for anyone tempted to pass a newer id: the
+settings-to-model matcher (`dist/acp-agent.js:924-928`) matches **substrings in both
+directions** — `m.value.includes(settings.model) || settings.model.includes(m.value)`. A
+configured `sonnet-5` therefore matches the `sonnet` entry and silently resolves to
+**Sonnet 4.5**. Asking for a newer model by a longer name is a way to get an older one with
+no error.
+
+## A15 — `session/list` is machine-global, not connection-scoped
+
+The listing returned **50 sessions with a `nextCursor`, spanning 12 unrelated working
+directories**, including sessions belonging to other projects entirely and the very Claude
+Code session that was running at capture time. Entries carry `sessionId`, `cwd`, `updatedAt`
+and a `title` taken from the session's opening text.
+
+Two consequences:
+
+- It is **not** a usable root-verification channel (A11 correction 2 assumed a narrower
+  scope). A session appearing in the list says nothing about the connection asking.
+- It is an **information-exposure surface**: any ACP client that can reach this agent can
+  enumerate the titles and working directories of unrelated local Claude Code sessions.
+
+## A16 — what this means for wiring (SUPERSEDED by A17, kept for the record)
+
+The original A16 concluded: *"do not wire this as a routine execution backend — it solves no
+class of work `worker-fast` does not, it costs money, and it cannot confirm what it ran."*
+
+**Two of those three premises were wrong, and the third was too narrow.** Recorded rather than
+quietly edited, because the mistake is instructive.
+
+- *"Costs money"* assumed API pricing. Under a subscription the marginal cost of an execution
+  is ~zero. The scarce resource is not dollars, it is a bounded quantity of high-quality
+  reasoning.
+- *"Solves no class of work `worker-fast` does not"* misapplied the admission rule from
+  `local-inference`. That rule governs **which serving lane owns one 24 GB GPU**; it is sound
+  inside the serving tier and meaningless across tiers. `worker-fast` exists precisely so
+  frontier capacity is not spent on "inspect these seven files, make this bounded change,
+  return evidence". It was never a candidate to replace a frontier planner.
+- *"Cannot confirm what it ran"* was true of `session/set_model` (A13) and **false of the
+  agent as a whole** — see A17. Disqualifying one channel is not disqualifying the backend.
+
+The general error is worth naming: **an execution lane was being judged only as a queue
+consumer.** A frontier subscription's highest-value use is supervising, planning and
+synthesising over work it did not personally perform. A model that scores a lane solely on
+bounded-execution merit cannot see that, and will keep producing conclusions like the one
+above.
+
+## A17 — Claude Code *can* be bound verifiably, just not through `set_model`
+
+`settings.model` is read from `<cwd>/.claude/settings.json`, and `cwd` is already something
+`ExecutionEnvelope` controls — so per-execution binding needs no new transport.
+`getAvailableModels` resolves it against the roster, calls `query.setModel` with the
+**resolved** value, and `session/new` returns `models.currentModelId` (`dist/acp-agent.js:940`
+returns `currentModel.value`, the resolved entry, not an echo of the request).
+
+Measured (`acp-agents/claude-code-acp-0.16.2.settings-binding-probe.json`):
+
+| `settings.model` | `currentModelId` | advertised list became | reading |
+|---|---|---|---|
+| *(absent)* | `sonnet` | 3 entries | inherits the user's global settings — **not** a deterministic default |
+| `sonnet` / `haiku` / `default` | tracks exactly | 3 entries | binding works, verifiable before any prompt |
+| `sonnet-5` | **`sonnet`** | 4 entries (incl. `sonnet-5`) | substring match wins on the *earlier* entry |
+| `totally-unknown-model` | *echoes back* | 4 entries (incl. it) | **adopted, not rejected** |
+
+Two traps, and they need different defences — which is why `verify_bound_model` checks two
+things and not one:
+
+1. **The substring downgrade.** The matcher tests `m.value.includes(settings.model) ||
+   settings.model.includes(m.value)` and takes the first hit, so `sonnet-5` binds `sonnet`
+   (Sonnet 4.5) *even though an exact `sonnet-5` entry exists further down the list*. Asking
+   for a newer model by a longer name is a way to get an older one. Caught only by
+   **equality** between requested and reported.
+2. **The adopted unknown.** An unrecognised id is appended to the agent's own roster and
+   bound verbatim, so it round-trips cleanly and an equality-only check is satisfied by
+   something the backend never validated. Caught only by **advertised-membership**.
+
+Neither check subsumes the other. Together they give a binding that is verified at the
+harness boundary before a single token is billed.
+
+**Ceiling, stated so it is not rounded up:** this is `HARNESS_VERIFIED`, not
+`END_TO_END_VERIFIED`. `currentModelId` is the bridge's report of its own resolution. It is
+*responsive* — it changes with input and exposes mis-resolution, which is what makes it worth
+having — but it is not independent observation of the serving side. Only the local llama-swap
+lanes can reach that (A5), because only they are ours to inspect. Hosted models cannot, and
+claiming otherwise would be inventing attestation.
+
+## A18 — lanes are not only queue consumers
+
+Recorded in `acp/backends.py` rather than left as prose:
+
+- `BindingAssurance`: `NONE` → `REQUESTED` → `HARNESS_VERIFIED` → `END_TO_END_VERIFIED`.
+  A ladder, not a gate: a lower rung does not disqualify a lane, but a policy may require a
+  rung and the recorded value must never be rounded up. `opencode`/local is
+  `END_TO_END_VERIFIED`; `codex` and `claude-code` are `HARNESS_VERIFIED`; Claude's
+  `set_model` path alone would be `REQUESTED` and is not used.
+- `execution` / `supervision` / `interactive` as independent capabilities. Frontier
+  subscriptions are marked for supervision and interactive use, which is where their value
+  actually is.
+
+Consequence for A15, worth stating as a boundary rather than a caveat: **`session/list` must
+stay below the runner boundary.** It is machine-global, so it can never be equated with "my
+sessions". A coordinator owns the set of session handles it created or explicitly attached —
+never a listing it merely observed.
+
+## A19 — the qualification is the durable asset; ACP is one integration, not the funnel
+
+A16–A18 were written as if ACP were *the* way a backend participates. It is not, and the
+distinction decides what should be built.
+
+`actionq/harnesses/` already contains thin native adapters — `claude.py`, `codex.py`,
+`opencode.py`, `copilot.py` — that invoke each vendor CLI directly. For a purchased Claude
+subscription that is almost certainly the **least invasive trustworthy integration**: it keeps
+the provider's own session, context, tooling and first-party improvements, and it inherits
+model selection from the harness's native configuration rather than from a bridge that has
+already been measured as unreliable (A13).
+
+Routing Claude through ACP instead would trade those away for protocol uniformity. Uniformity
+is worth paying for where it buys something — one codec across four agents, no vendor branch
+in the contract (A10, A11) — and worth refusing where it costs native capability and buys
+only symmetry. **Claude is the second case.** The bridge is a compatibility layer over a
+harness that was bought precisely for its native behaviour.
+
+What this week's probing produced that *is* durable is not an ACP implementation. It is the
+qualification record:
+
+```text
+claude-code-acp 0.16.2
+  session/set_model     : accepts any string, no read-back        -> unusable for binding
+  cwd settings + new    : resolved value reported, mis-resolution
+                          detectable                              -> HARNESS_VERIFIED
+  advertised roster     : default | sonnet | haiku (SDK-pinned,
+                          predates the Claude 5 family)
+  unknown model ids     : adopted into the roster, not rejected
+  session/list          : machine-global; never "my sessions"
+  suitable for          : supervision, interactive, planning
+  unsuitable for        : any policy requiring END_TO_END_VERIFIED
+```
+
+That table is specific to this workflow, survives the adapter it was measured through, and is
+the thing to keep. `verification/capture_claude_acp.py`,
+`probe_claude_acp_set_model.py` and `probe_claude_acp_settings_binding.py` regenerate it in
+minutes against any future version — which is the point of owning qualification rather than
+owning execution.
+
+**Scope note on `acp/backends.py`:** the registry is ACP-scoped by construction and lives
+inside `acp/` for the same boundary reason as everything else there. The lane taxonomy it
+carries — `BindingAssurance`, and `execution`/`supervision`/`interactive` — is *not*
+ACP-specific and applies equally to a native-harness or attached lane. If a second integration
+path is registered, that taxonomy should move up beside the harness layer and `acp/` should
+keep only the ACP facts. It is not moved now because there is exactly one consumer, and
+guessing the shared shape from one example is how the wrong abstraction gets frozen in.

@@ -1,0 +1,47 @@
+{
+  "advertised": [
+    "default",
+    "sonnet",
+    "haiku"
+  ],
+  "agent": "@zed-industries/claude-code-acp@0.16.2",
+  "currentModelId": "sonnet",
+  "probes": {
+    "advertised-haiku": {
+      "accepted": true,
+      "modelId": "haiku",
+      "result": {}
+    },
+    "advertised-sonnet": {
+      "accepted": true,
+      "modelId": "sonnet",
+      "result": {}
+    },
+    "empty-string": {
+      "accepted": true,
+      "modelId": "",
+      "result": {}
+    },
+    "local-profile": {
+      "accepted": true,
+      "modelId": "local3090/worker-fast",
+      "result": {}
+    },
+    "obvious-garbage": {
+      "accepted": true,
+      "modelId": "definitely-not-a-model-9999",
+      "result": {}
+    },
+    "other-vendor": {
+      "accepted": true,
+      "modelId": "gpt-5.6-sol[low]",
+      "result": {}
+    },
+    "plausible-but-unlisted": {
+      "accepted": true,
+      "modelId": "claude-sonnet-4-5",
+      "result": {}
+    }
+  },
+  "verdict": "set_model accepts unadvertised model ids and cannot be read back; a success response is not evidence of binding"
+}
