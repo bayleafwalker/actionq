@@ -79,15 +79,25 @@ def test_registry_entries_are_version_pinned_when_fetched_per_run() -> None:
 def test_binding_channel_records_what_was_measured() -> None:
     assert REGISTRY["opencode"].binding_channel is BindingChannel.PROTOCOL
     assert REGISTRY["codex"].binding_channel is BindingChannel.PROTOCOL
-    # Finding A13: set_model returns success for literally any id and there is no
-    # read-back, so its success means nothing.
-    assert REGISTRY["claude-code"].binding_channel is BindingChannel.UNVALIDATED
+    # A13 disqualified session/set_model for Claude (success for any string, no
+    # read-back). A17 found a channel that does work: cwd-scoped settings, read
+    # back through session/new. The backend is bound -- just not that way.
+    assert REGISTRY["claude-code"].binding_channel is BindingChannel.SETTINGS
 
 
 def test_an_unvalidated_binding_is_never_trustworthy() -> None:
     assert binding_is_trustworthy(REGISTRY["opencode"])
     assert binding_is_trustworthy(REGISTRY["codex"])
-    assert not binding_is_trustworthy(REGISTRY["claude-code"])
+    # No shipped backend uses it, but the classification must stay refusable:
+    # this is what Claude's set_model path would be if anyone wired it.
+    unvalidated = AcpBackend(
+        name="hypothetical",
+        command=("true",),
+        billing=Billing.HOSTED,
+        model_namespaces=("x",),
+        binding_channel=BindingChannel.UNVALIDATED,
+    )
+    assert not binding_is_trustworthy(unvalidated)
 
 
 def test_the_probe_evidence_still_says_set_model_validates_nothing() -> None:
@@ -143,3 +153,62 @@ def test_claude_model_ids_match_the_captured_evidence() -> None:
         ]
     }
     assert set(REGISTRY["claude-code"].model_namespaces) == advertised
+
+
+def test_settings_binding_is_the_claude_channel_not_set_model() -> None:
+    # A13 killed set_model; A17 found a channel that works.
+    assert REGISTRY["claude-code"].binding_channel is BindingChannel.SETTINGS
+    assert binding_is_trustworthy(REGISTRY["claude-code"])
+
+
+def test_verify_bound_model_accepts_an_exact_advertised_match() -> None:
+    from actionq_runner.acp import verify_bound_model
+
+    verify_bound_model("sonnet", "sonnet", ["default", "sonnet", "haiku"])
+
+
+def test_verify_bound_model_catches_the_substring_downgrade() -> None:
+    """`sonnet-5` resolves to `sonnet` — asking for newer, getting older."""
+    from actionq_runner.acp import ModelResolutionError, verify_bound_model
+
+    with pytest.raises(ModelResolutionError):
+        verify_bound_model("sonnet-5", "sonnet", ["default", "sonnet", "haiku"])
+
+
+def test_verify_bound_model_rejects_an_unadvertised_id_that_round_trips() -> None:
+    """The dangerous case: an unknown id is adopted verbatim, so equality passes.
+
+    Claude Code appends an unrecognised configured model to its own roster, so
+    `currentModelId` echoes it back and an equality-only check would be satisfied
+    by a model the backend never validated.
+    """
+    from actionq_runner.acp import ModelResolutionError, verify_bound_model
+
+    with pytest.raises(ModelResolutionError):
+        verify_bound_model(
+            "totally-unknown-model",
+            "totally-unknown-model",          # round-trips cleanly
+            ["default", "sonnet", "haiku"],
+        )
+
+
+def test_settings_probe_evidence_still_supports_the_two_part_check() -> None:
+    import json
+    from pathlib import Path as _P
+
+    probe = (
+        _P(__file__).parents[1]
+        / "docs/evidence/acp-agents/claude-code-acp-0.16.2.settings-binding-probe.json"
+    )
+    if not probe.is_file():
+        pytest.skip(f"probe evidence not present: {probe}")
+    cases = json.loads(probe.read_text())["cases"]
+    # exact ids bind exactly
+    for name in ("sonnet", "haiku", "default"):
+        assert cases[f"exact-{name}"]["currentModelId"] == name
+    # the substring downgrade is real
+    assert cases["longer-name-sonnet-5"]["currentModelId"] == "sonnet"
+    # an unknown id is adopted rather than rejected
+    unknown = cases["unmatchable"]
+    assert unknown["currentModelId"] == unknown["wrote_model"]
+    assert unknown["wrote_model"] in unknown["available"]

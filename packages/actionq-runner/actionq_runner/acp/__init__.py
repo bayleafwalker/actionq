@@ -7,11 +7,14 @@ from ..context_policy import ContextPlan, verify_context_policy
 from ..execution_contract import Assurance, BindingStatus, ContextUsage, ModelBinding
 from .backends import (
     REGISTRY,
+    BindingAssurance,
     AcpBackend,
     Billing,
     BindingChannel,
+    ModelResolutionError,
     binding_is_trustworthy,
     check_model_allowed,
+    verify_bound_model,
 )
 from .v1 import (
     PROTOCOL_VERSION,
@@ -24,11 +27,14 @@ from .v1 import (
 __all__ = [
     "PROTOCOL_VERSION",
     "REGISTRY",
+    "BindingAssurance",
     "AcpBackend",
     "Billing",
     "BindingChannel",
+    "ModelResolutionError",
     "binding_is_trustworthy",
     "check_model_allowed",
+    "verify_bound_model",
     "Assurance",
     "BindingStatus",
     "ContextPlan",

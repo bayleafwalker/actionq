@@ -1,0 +1,63 @@
+{
+  "agent": "@zed-industries/claude-code-acp@0.16.2",
+  "cases": {
+    "exact-default": {
+      "available": [
+        "default",
+        "sonnet",
+        "haiku",
+        "default"
+      ],
+      "currentModelId": "default",
+      "wrote_model": "default"
+    },
+    "exact-haiku": {
+      "available": [
+        "default",
+        "sonnet",
+        "haiku"
+      ],
+      "currentModelId": "haiku",
+      "wrote_model": "haiku"
+    },
+    "exact-sonnet": {
+      "available": [
+        "default",
+        "sonnet",
+        "haiku"
+      ],
+      "currentModelId": "sonnet",
+      "wrote_model": "sonnet"
+    },
+    "longer-name-sonnet-5": {
+      "available": [
+        "default",
+        "sonnet",
+        "haiku",
+        "sonnet-5"
+      ],
+      "currentModelId": "sonnet",
+      "wrote_model": "sonnet-5"
+    },
+    "no-settings-file": {
+      "available": [
+        "default",
+        "sonnet",
+        "haiku"
+      ],
+      "currentModelId": "sonnet",
+      "wrote_model": null
+    },
+    "unmatchable": {
+      "available": [
+        "default",
+        "sonnet",
+        "haiku",
+        "totally-unknown-model"
+      ],
+      "currentModelId": "totally-unknown-model",
+      "wrote_model": "totally-unknown-model"
+    }
+  },
+  "verdict": "settings.model + session/new currentModelId is a VERIFIABLE binding channel"
+}
