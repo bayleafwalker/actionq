@@ -218,3 +218,55 @@ Care with this finding: it argues against owning *a queue and a claim loop*. It 
 that dispatched execution was worthless — action 14 completed successfully, and the qualification
 probes were doing real work. What it shows is that the demand was **episodic and human-initiated**,
 which is a shape a federation layer serves without a daemon.
+
+---
+
+# Close-out — step 1 concluded without the soak (F10)
+
+**Recorded:** 2026-08-19T20:15Z.
+
+## F10 — The soak was skipped by decision, not run and found silent
+
+Actions 15–17 were cancelled at 20:14:52Z:
+
+```
+15 cancelled   16 cancelled   17 cancelled
+reason: soak skipped by decision; step 1 concluded on F9 (no automated producer),
+        not on observed silence
+```
+
+Total observed soak: **21 minutes**, ~42 poll cycles, all declined, no reaction from anything.
+That is consistent with the fence holding (F8) and **worth nothing as evidence about whether
+anyone depends on devbox claiming work.** Twenty-one minutes of quiet is not a finding.
+
+This is recorded explicitly so that no later reader can mistake the short soak for a result.
+**Step 1's conclusion rests on F9 alone** — the queue has no automated producer, so there is no
+standing demand for a claim loop. The fence demonstrated that it works (F8); it never
+demonstrated that nothing misses it, because it was not run long enough to.
+
+The fence file remains in place. Nothing about the deletion ordering changes.
+
+## A non-finding, recorded so it is not mistaken for one later
+
+Between 20:07Z and 20:11Z the `actionq-pg` LB (192.168.20.215) became unreachable from devbox
+and from the workstation, the daemon crash-looped, and `actionctl` failed at connect.
+
+**This was planned cluster maintenance** — a rolling update evicting services from nodes — and
+the operator receives notices on cluster services. It is *not* evidence of an unmonitored
+execution plane, and it is *not* evidence that failures go unnoticed. It is recorded here only
+because the outage is visible in the event log's shape around that window, and a later reader
+finding the gap deserves to know what caused it.
+
+The near-miss is itself worth keeping: a routine eviction was momentarily legible as "the
+production database died and nobody noticed." Under a thesis that wants deletion to be
+justified, an unexplained outage is exactly the kind of observation that gets adopted too
+readily. Ask what caused a gap before recording it as a symptom.
+
+## Incidental — F2's version skew resolved itself
+
+The restart cycle replaced the daemon: PID 3124844 (running 2026-08-16 code, with the on-disk
+package three days newer) is gone; PID 3752935 started 2026-08-19T20:13:56Z, 10 restarts on the
+unit. The running process and the installed 0.1.28 package are now the same code. The F2
+discrepancy no longer exists on this host — but the coupling that produced it does: `actionctl`
+and the daemon adapter are separately-installed uv tools that can drift across a schema bump
+until something restarts.
