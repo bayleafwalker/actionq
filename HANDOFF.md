@@ -7,32 +7,35 @@ Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, 
 
 ---
 
-## 0. LIVE STATE — a production daemon is paused right now
+## 0. LIVE STATE — the daemon is running; the fence experiment is over
 
-The devbox ActionQ daemon is **fenced and not claiming work**, deliberately, since
-2026-08-19:
+The devbox ActionQ daemon is **unfenced and claiming normally** as of 2026-08-19T20:18Z. The
+queue holds no claimable work (11 `failed`, 3 `completed`, 3 `cancelled`), so a quiet daemon is
+expected and is not a fault.
 
 ```bash
-ssh devbox-agent 'cat /home/agent/.local/state/actionq-dispatcher/PAUSED'   # why + when
-ssh devbox-agent 'rm  /home/agent/.local/state/actionq-dispatcher/PAUSED'   # resume
+ssh devbox-agent 'systemctl is-active actionq-dispatch.service'
+ssh devbox-agent 'ls /home/agent/.local/state/actionq-dispatcher/PAUSED'   # absent = running
 ```
 
-This is step 1 of the deletion work below: stop consuming new work, change nothing else,
-and see what actually breaks. The unit stays `active` and the DB is untouched. The fence is
-read at `daemon_lifecycle.run_once()` **after** `recover_stale_state()` and **before**
-`client.claim()`, so recovery still runs and in-flight work is not killed.
+The fence (step 1) ran 2026-08-19 19:06Z → 20:18Z and is **closed**. It was shown to hold
+against real claimable work, then ended by decision after a 21-minute soak; the probe actions
+were cancelled. **Do not cite the soak as evidence** — see §5 and
+`docs/evidence/2026-08-19-devbox-fence-baseline.md` (F1–F10).
 
-**If you are wondering why no work is being dispatched, this is why** — but note that it was
-*already* not dispatching before the fence went up, and that the queue has no automated producer
-at all (`docs/evidence/2026-08-19-devbox-fence-baseline.md`, F9). Decide deliberately whether to
-resume; do not resume by reflex.
+To re-fence, write the pause file back (`pause_file` in `/etc/actionq/config.toml`, which is
+nix-managed and points at `~/.local/state/actionq-dispatcher/PAUSED`, *not* the package default).
+It is read at `daemon_lifecycle.run_once()` **after** `recover_stale_state()` and **before**
+`client.claim()`, so recovery still runs and in-flight work is not killed. While fenced,
+`coordinator_paused` is emitted every poll (30 s) — ~2,880 events/day into the event log.
 
-The daemon PID changed on 2026-08-19T20:13:56Z (cluster maintenance evicted `actionq-pg`; the
-daemon crash-looped and systemd restarted it, 10 restarts). The fence survived it. The running
-process is now the same code as the installed 0.1.28 package.
+Two things a fresh session should not misread:
 
-Side effect worth knowing: `coordinator_paused` is emitted every poll (30 s), so a long
-pause is ~2,880 events/day into the event log.
+- **Nothing autonomously feeds this queue** (F9). Seventeen actions across its entire history,
+  all hand-created. An idle daemon is the normal condition, not a symptom.
+- The daemon restarted at 2026-08-19T20:13:56Z (10 restarts) when planned cluster maintenance
+  evicted `actionq-pg`. It recovered unaided. That outage was **maintenance, not a fault**, and
+  is recorded as an explicit non-finding.
 
 ---
 
