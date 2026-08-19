@@ -1,0 +1,245 @@
+# Proposal: ACP as the harness-facing execution protocol
+
+**Status:** proposal — not implemented
+**Date:** 2026-08-19
+**Targets:** `docs/contracts/vuoro-execution-adapter.md`
+**Origin:** RTX 3090 local inference work; see `/projects/dev/local-inference/docs/10-execution-boundary.md`
+
+## Position
+
+Make **ACP the preferred harness-facing execution protocol where available**, and
+explicitly **do not** make ACP the internal ActionQ/Vuoro protocol.
+
+```text
+                    Vuoro domain
+ ┌──────────────────────────────────────────┐
+ │ sprintctl                                │
+ │     ↓                                    │
+ │ ActionQ  ← lifecycle / claims / policy   │
+ │     ↓                                    │
+ │ execution contract                       │
+ │     ↓                                    │
+ │ ACP runner/client adapter                │
+ └─────┬────────────────────────────────────┘
+       │ ACP
+       ├──────── OpenCode  `opencode acp`
+       ├──────── Claude Agent ACP
+       ├──────── Codex ACP
+       └──────── future ACP harness
+```
+
+Not `Vuoro → OpenCode-specific integration`, and emphatically not
+`Vuoro domain model == ACP domain model`.
+
+## Why now
+
+ACP covers almost exactly the mechanics the current runner adapter wants: capability
+negotiation, session create/resume, prompt submission, streaming session updates, tool-call
+reporting, permission requests, cancellation, working-directory semantics and MCP-server
+attachment. Those are **execution mechanics**, not work-management semantics.
+
+**Verified locally (2026-08-19):** `opencode acp` exists in the installed OpenCode 1.18.18
+— `start ACP (Agent Client Protocol) server`, JSON-RPC over stdio, with `--port`,
+`--hostname` and mDNS options. So this is a real integration path today, not speculative
+protocol architecture.
+
+**Verified against the spec:** ACP v1 defines `initialize`, `authenticate`, `session/new`,
+`session/prompt`, `session/cancel` (agent side), `session/request_permission` and the
+`session/update` notification (client side), with `session/load` behind a capability.
+
+Driving `opencode acp` is materially cleaner than driving `opencode run ...` and inferring
+lifecycle from process output.
+
+## Revised adapter shape
+
+Current contract is approximately `prepare / run / cancel / collect`. Proposed:
+
+```text
+ExecutionAdapter
+    capabilities()
+    open(execution_envelope)
+    prompt(...)
+    events()
+    authorize(...)
+    cancel()
+    close()
+```
+
+with implementations:
+
+```text
+AcpExecutionAdapter      # the default path
+ClaudeNativeAdapter      # fallback / capabilities ACP cannot express
+CodexNativeAdapter       # fallback
+```
+
+Policy: **ACP-first, native-second.**
+
+```yaml
+runtimes:
+  opencode:
+    adapter: acp
+    command: ["opencode", "acp"]
+  claude:
+    adapter: acp
+    command: ["claude-agent-acp"]
+  codex:
+    adapter: acp
+    command: ["codex-acp"]
+  weird-future-agent:
+    adapter: native
+```
+
+Native adapters exist for capabilities ACP cannot expose, incomplete implementations, and
+harness-specific optimisations worth preserving. They are not the default path.
+
+## What ACP must not own
+
+ActionQ's existing separation survives unchanged. ACP is **not** authority for:
+
+```text
+work identity          claim/lease ownership    readiness
+dependency state       execution eligibility    retry policy
+acceptance             integration              canonical artifact identity
+audit history          operator decisions
+```
+
+These mappings would all be wrong:
+
+```text
+ACP session         == ActionQ execution
+ACP stopReason      == ActionQ outcome
+ACP permission      == Vuoro authorization
+ACP session history == audit record
+```
+
+Correct shape — the ACP session id is an external runtime handle, nothing more:
+
+```text
+ActionQ execution ID
+    └── runtime:
+        protocol: acp
+        agent: opencode
+        external_session_id: abc123
+```
+
+## Permissions: ACP supplies mechanism, Vuoro supplies authority
+
+ACP has a client-side `session/request_permission`. In an editor that means "ask the human".
+Here, back it with policy instead:
+
+```text
+OpenCode
+  ↓ session/request_permission
+Vuoro ACP adapter
+  ↓
+execution policy / envelope
+  ├─ already permitted → allow
+  ├─ forbidden         → deny
+  └─ semantic decision → escalate to human
+```
+
+Far better than teaching every harness independently what Vuoro's permission model means.
+This is also the natural seam for the "human contribution is perpendicular" work: escalation
+is a policy outcome, not a harness feature.
+
+## ACP and MCP are orthogonal
+
+```text
+ACP:   how you interact with an agent
+MCP:   what capabilities/resources an agent has
+Vuoro: what work exists, who may execute it, what completion means, what is retained
+```
+
+ACP sessions can be handed MCP servers by the client at session setup, which keeps this
+clean: `Vuoro → ACP → agent`, and separately `agent → MCP → sprintctl facade / knowledge /
+external systems`.
+
+## Telemetry normalization
+
+Do not mirror ACP updates as Vuoro domain events. Normalize a useful subset:
+
+```text
+ACP                        Vuoro execution telemetry
+──────────────────────────────────────────────────────
+session/new            →   runtime.started
+session/update text    →   output.delta
+tool_call              →   tool.started
+tool_call_update       →   tool.updated
+terminal output        →   execution.output
+request_permission     →   policy.requested
+permission response    →   policy.resolved
+session/cancel         →   cancellation.requested
+idle + stop reason     →   runtime.stopped
+```
+
+Fan out to `auditctl` (durable evidence), Prometheus (metrics), Loki (operational streams).
+Keep raw ACP traffic as optional debug evidence, never canonical application state — Vuoro
+should not become a transcript database.
+
+## Recovery
+
+Given `ActionQ execution E-123` bound to `ACP session S-987`, if the harness dies ActionQ
+still knows E-123's state. Policy then decides: resume S-987, create S-988 from the sealed
+execution envelope, or fail E-123.
+
+**Vuoro correctness must not depend on session recovery working.** That is the right failure
+boundary, and it is why the session id is a handle rather than an identity.
+
+## Version isolation
+
+Isolate ACP types behind one adapter:
+
+```text
+BAD                          GOOD
+ActionQ types                ActionQ
+  import acp.Session           ↓
+  import acp.StopReason      Vuoro Execution Contract
+  import acp.ToolCall          ↓
+                             adapter/acp/{v1,v2}
+```
+
+Implement **v1 first** — that is what deployed agents speak, and it is the version whose
+method set is confirmed above. Structure the adapter so a later version is another
+codec/lifecycle implementation rather than a migration of Vuoro itself.
+
+> **Unverified:** the existence and status of an ACP v2 draft (reported as published
+> 2026-07-20 with breaking redesigns) comes from the requester, not from a source this
+> proposal checked. It does not change the recommendation — if anything, an in-flux next
+> version is a stronger argument for isolation — but it should be confirmed before any v2
+> work is scheduled.
+
+## Acceptance test for this proposal
+
+Not another OpenCode feature test:
+
+```text
+same sealed ActionQ execution
+        ↓
+   ACP runner
+    ↙      ↘
+OpenCode   Codex/Claude
+    ↓        ↓
+normalized Vuoro event stream
+        ↓
+same acceptance/reconciliation path
+```
+
+Passing that demonstrates the execution backend has become **fungible**, which is worth
+considerably more than "Vuoro supports OpenCode".
+
+## Boundary this preserves
+
+```text
+STRATEGIC / YOURS            STANDARDIZE / BORROW
+─────────────────────        ──────────────────────────────
+sprint/work semantics        agent session protocol → ACP
+ActionQ lifecycle            agent tools/resources  → MCP
+policy, envelopes            harness impl → OpenCode/Claude/Codex
+evidence, audit              model API → OpenAI-compatible
+acceptance, reconciliation   inference scheduling → llama-swap
+identity/provenance          observability → OTel/Prom/Loki
+```
+
+Healthier than Vuoro becoming a handcrafted replacement for things the ecosystem has since
+standardized.
