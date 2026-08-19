@@ -1,5 +1,7 @@
+import atexit
 import getpass
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -149,6 +151,7 @@ def _start_postgres() -> dict:
     if missing:
         raise pytest.UsageError(f"PostgreSQL server binaries are required: {missing}")
 
+    _reap_stale_clusters()
     root = Path(tempfile.mkdtemp(prefix="actionq-pg-"))
     data = root / "data"
     socket_dir = root / "socket"
@@ -246,11 +249,96 @@ def _start_postgres() -> dict:
     }
 
 
+def _cluster_is_live(root: Path) -> bool:
+    """True if a cluster directory still belongs to a running postmaster.
+
+    Reads postmaster.pid rather than guessing from mtime: a long test run must
+    never have its cluster reaped by a second run starting alongside it.
+    """
+    pid_file = root / "data" / "postmaster.pid"
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").splitlines()[0])
+    except (OSError, ValueError, IndexError):
+        return False
+    try:
+        os.kill(pid, 0)          # signal 0 = liveness probe only
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True              # exists but is not ours; leave it alone
+    return True
+
+
+def _reap_stale_clusters() -> None:
+    """Remove disposable clusters abandoned by a previous run.
+
+    pytest_unconfigure is the only teardown, and it does not run when the
+    interpreter is killed -- SIGKILL, OOM, a harness tearing down a session. On
+    an unattended host that is the normal way a run ends, so clusters accumulate
+    indefinitely: two were found on devbox still running eight days after the
+    run that created them, alongside four orphaned directories.
+
+    Reaping at startup is what makes the leak bounded regardless of how the last
+    process died, which no exit-time handler can promise.
+    """
+    for root in sorted(Path(tempfile.gettempdir()).glob("actionq-pg-*")):
+        if not root.is_dir() or _cluster_is_live(root):
+            continue
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _shutdown_postgres() -> None:
+    """Stop and remove the disposable cluster. Safe to call more than once."""
+    global _POSTGRES_STATE
+    state, _POSTGRES_STATE = _POSTGRES_STATE, None
+    if state is None:
+        return
+    for name, value in state["previous_env"].items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    if state.get("external"):
+        return
+    subprocess.run(
+        [str(state["pg_ctl"]), "-D", str(state["data"]), "-m", "fast", "-w", "stop"],
+        check=False, capture_output=True, text=True,
+    )
+    shutil.rmtree(state["root"], ignore_errors=True)
+
+
+def _install_shutdown_handlers() -> None:
+    """Clean up on the exits that pytest_unconfigure does not cover.
+
+    atexit catches a normal interpreter exit; the signal handlers catch the
+    terminate-and-move-on that an unattended harness does. SIGKILL cannot be
+    caught by anything -- that case is covered by _reap_stale_clusters() on the
+    next run, which is why both halves exist.
+    """
+    atexit.register(_shutdown_postgres)
+
+    def _handler(signum, _frame):
+        _shutdown_postgres()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            if signal.getsignal(sig) in (signal.SIG_DFL, signal.default_int_handler):
+                signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass          # not the main thread, or platform will not allow it
+
+
 def pytest_configure(config) -> None:
     global _POSTGRES_STATE
     if not _needs_postgres(config):
         return
     _POSTGRES_STATE = _start_postgres()
+    # Registered only once a cluster exists, so a run that never starts one does
+    # not install handlers it has no use for.
+    if not _POSTGRES_STATE.get("external"):
+        _install_shutdown_handlers()
     urls = _POSTGRES_STATE["urls"]
     os.environ["ACTIONQ_TEST_URL"] = urls["admin"]
     os.environ["ACTIONQ_TEST_MIGRATION_URL"] = urls["migration"]
@@ -262,22 +350,7 @@ def pytest_configure(config) -> None:
 
 
 def pytest_unconfigure(config) -> None:
-    global _POSTGRES_STATE
-    if _POSTGRES_STATE is None:
-        return
-    for name, value in _POSTGRES_STATE["previous_env"].items():
-        if value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = value
-    if not _POSTGRES_STATE.get("external"):
-        subprocess.run(
-            [str(_POSTGRES_STATE["pg_ctl"]), "-D", str(_POSTGRES_STATE["data"]), "-m", "fast", "-w", "stop"],
-            check=False, capture_output=True, text=True,
-        )
-    if not _POSTGRES_STATE.get("external"):
-        shutil.rmtree(_POSTGRES_STATE["root"], ignore_errors=True)
-    _POSTGRES_STATE = None
+    _shutdown_postgres()
 
 
 @pytest.fixture(scope="session")
