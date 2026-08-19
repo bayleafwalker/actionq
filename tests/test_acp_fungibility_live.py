@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from actionq_runner.acp import AcpExecutionAdapter
+from actionq_runner.acp import REGISTRY, AcpExecutionAdapter, check_model_allowed
 from actionq_runner.execution_contract import (
     Assurance,
     ContextPolicy,
@@ -32,17 +32,27 @@ pytestmark = pytest.mark.skipif(
 
 TASK = "Create a file named result.txt whose only content is the word OK. Then stop."
 
+
+def _default_model(name: str) -> str:
+    return {
+        "opencode": "local3090/worker-fast",
+        "codex": "gpt-5.6-sol[low]",
+    }[name]
+
+# The two backends this test exercises, taken from the shared registry rather than
+# redeclared here -- an inline copy drifts from what the runner actually launches,
+# and then the test stops testing the deployed configuration.
+EXERCISED = ("opencode", "codex")
+
 BACKENDS = {
-    "opencode": {
-        "command": ["opencode", "acp"],
-        "model": os.environ.get("ACP_OPENCODE_MODEL", "local3090/worker-fast"),
-        "mode": "build",
-    },
-    "codex": {
-        "command": ["npx", "-y", "@agentclientprotocol/codex-acp@1.4.0"],
-        "model": os.environ.get("ACP_CODEX_MODEL", "gpt-5.6-sol[low]"),
-        "mode": "agent",
-    },
+    name: {
+        "command": list(REGISTRY[name].command),
+        "model": os.environ.get(
+            f"ACP_{name.upper().replace('-', '_')}_MODEL", _default_model(name)
+        ),
+        "mode": REGISTRY[name].default_mode,
+    }
+    for name in EXERCISED
 }
 
 
@@ -96,6 +106,9 @@ def results(tmp_path_factory) -> dict:
     for name, spec in BACKENDS.items():
         if shutil.which(spec["command"][0]) is None:
             pytest.skip(f"{name} backend unavailable")
+        # An overridden ACP_*_MODEL must still belong to the backend it is aimed
+        # at; catching it here means no session and, on a hosted backend, no bill.
+        check_model_allowed(REGISTRY[name], spec["model"])
         out[name] = _run(name, spec, _repo(tmp, name))
     return out
 

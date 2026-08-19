@@ -3,6 +3,8 @@
 import hashlib
 import json
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 
@@ -17,6 +19,33 @@ NODES = {
     "legacy-quarantine": "test_action_resource_history_legacy_raw_64_case_preaccess_quarantine",
     "fencing": "test_action_resource_history_two_incarnation_stale_session_fencing",
 }
+def observed_postgres_version() -> str:
+    """Version of the PostgreSQL this regeneration will actually run against.
+
+    Read, never carried forward. Regeneration used to re-read the existing result
+    packet and overwrite only implementation_sha and the receipt, so every other
+    field -- including environment.postgres_version -- survived verbatim. A
+    refresh on a different server therefore kept the old version string and
+    silently misattributed the evidence, which is the one thing a verification
+    packet must not do.
+
+    Resolved the same way tests/conftest.py resolves it (`shutil.which`), so this
+    reports the binary the run will really use rather than a plausible guess.
+    """
+    initdb = shutil.which("initdb")
+    if initdb is None:
+        raise SystemExit(
+            "cannot determine the PostgreSQL version: initdb is not on PATH. "
+            "Refusing to regenerate rather than carry the previous packet's "
+            "version forward as if it were observed."
+        )
+    completed = subprocess.run([initdb, "--version"], capture_output=True, text=True)
+    match = re.search(r"(\d+(?:\.\d+)*)", completed.stdout)
+    if completed.returncode != 0 or not match:
+        raise SystemExit(f"could not parse a version from: {completed.stdout!r}")
+    return match.group(1)
+
+
 def candidate_paths() -> list[str]:
     paths = set()
     for pattern in ("actionq/**/*.py", "actionq/migrations/*.sql", "tests/**/*.py"):
@@ -65,6 +94,8 @@ def main() -> int:
     result_path = ROOT / "verification/results" / f"action-resource-owner-{history}.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["implementation_sha"] = f"candidate-tree:{receipt['candidate_tree_digest']}"
+    # Observed, not inherited -- see observed_postgres_version().
+    result.setdefault("environment", {})["postgres_version"] = observed_postgres_version()
     result["execution"]["receipt"] = {
         "path": target.relative_to(ROOT).as_posix(),
         "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
