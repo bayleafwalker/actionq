@@ -49,6 +49,14 @@ class BindingChannel(str, Enum):
     #: Out of band (e.g. spawn environment). The protocol neither accepts nor can
     #: report it, so such a binding can never be better than UNVERIFIABLE.
     ENVIRONMENT = "environment"
+    #: `session/set_model` exists and returns success, but validates nothing and
+    #: cannot be read back -- so the success response is not evidence of anything.
+    #: Measured on Claude Code ACP 0.16.2 (finding A13): it accepted every id
+    #: offered including another vendor's, a local profile name, obvious garbage
+    #: and the empty string, while session/status and session/info are both
+    #: method_not_found. This is worse than an outright missing set_model, which
+    #: at least fails closed and loudly.
+    UNVALIDATED = "unvalidated"
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,17 @@ class AcpBackend:
         if not self.model_namespaces:
             return True
         return any(model.startswith(prefix) for prefix in self.model_namespaces)
+
+
+def binding_is_trustworthy(backend: AcpBackend) -> bool:
+    """Whether this backend's model binding can be believed at all.
+
+    False for UNVALIDATED: the agent says "ok" to any id and offers no read-back,
+    so nothing about the response distinguishes a correct binding from a silently
+    wrong one. A policy requiring a verified model must refuse such a backend
+    rather than record its cheerful success as an assertion.
+    """
+    return backend.binding_channel is not BindingChannel.UNVALIDATED
 
 
 def check_model_allowed(backend: AcpBackend, model: str) -> None:
@@ -117,10 +136,21 @@ REGISTRY: dict[str, AcpBackend] = {
         name="claude-code",
         command=("npx", "-y", "@zed-industries/claude-code-acp@0.16.2"),
         billing=Billing.HOSTED,
-        model_namespaces=("claude-",),
-        # Left None until a capture proves the mode vocabulary. `_set_mode` raises
-        # on a rejected mode, so guessing one here would turn an unknown into a
-        # failed run.
+        # Observed, not guessed. The 2026-08-19 capture shows this agent advertises
+        # exactly three model ids -- `default`, `sonnet`, `haiku` -- which are
+        # SELECTORS, not model names: `default` resolved to Opus 4.6 and `sonnet` to
+        # Sonnet 4.5 on the day. An earlier guess of a "claude-" prefix here was
+        # wrong, and the capture is the only reason that is known.
+        #
+        # These are exact ids, so the prefix match is an exact match.
+        #
+        # This check is not defence in depth here -- it is the ONLY validation in
+        # the system. The agent itself validates nothing (see binding_channel).
+        model_namespaces=("default", "sonnet", "haiku"),
+        # Observed: default | acceptEdits | plan | dontAsk | bypassPermissions.
+        # Left None deliberately -- the envelope should name one, and note that
+        # three of those five are permission-weakening.
         default_mode=None,
+        binding_channel=BindingChannel.UNVALIDATED,
     ),
 }

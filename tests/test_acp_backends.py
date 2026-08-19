@@ -15,6 +15,7 @@ from actionq_runner.acp import (
     AcpBackend,
     Billing,
     BindingChannel,
+    binding_is_trustworthy,
     check_model_allowed,
 )
 from actionq_runner.acp.v1 import ModelBindingError
@@ -43,12 +44,12 @@ def test_the_local_profile_is_refused_on_a_hosted_backend() -> None:
 def test_each_backend_accepts_its_own_namespace() -> None:
     check_model_allowed(REGISTRY["opencode"], "local3090/worker-fast")
     check_model_allowed(REGISTRY["codex"], "gpt-5.6-sol[low]")
-    check_model_allowed(REGISTRY["claude-code"], "claude-sonnet-4-5")
+    check_model_allowed(REGISTRY["claude-code"], "sonnet")
 
 
 def test_cross_dispatch_is_refused_in_every_direction() -> None:
     wrong = [
-        ("opencode", "claude-sonnet-4-5"),
+        ("opencode", "sonnet"),
         ("opencode", "gpt-5.6-sol[low]"),
         ("codex", "local3090/worker-fast"),
         ("claude-code", "gpt-5.6-sol[low]"),
@@ -75,11 +76,70 @@ def test_registry_entries_are_version_pinned_when_fetched_per_run() -> None:
             assert "@" in backend.command[-1].lstrip("@"), backend.name
 
 
-def test_binding_channel_defaults_to_in_protocol() -> None:
-    for backend in REGISTRY.values():
-        assert backend.binding_channel is BindingChannel.PROTOCOL
+def test_binding_channel_records_what_was_measured() -> None:
+    assert REGISTRY["opencode"].binding_channel is BindingChannel.PROTOCOL
+    assert REGISTRY["codex"].binding_channel is BindingChannel.PROTOCOL
+    # Finding A13: set_model returns success for literally any id and there is no
+    # read-back, so its success means nothing.
+    assert REGISTRY["claude-code"].binding_channel is BindingChannel.UNVALIDATED
+
+
+def test_an_unvalidated_binding_is_never_trustworthy() -> None:
+    assert binding_is_trustworthy(REGISTRY["opencode"])
+    assert binding_is_trustworthy(REGISTRY["codex"])
+    assert not binding_is_trustworthy(REGISTRY["claude-code"])
+
+
+def test_the_probe_evidence_still_says_set_model_validates_nothing() -> None:
+    """Bind the UNVALIDATED verdict to the capture that justified it.
+
+    If a future agent version starts validating, this fails and the registry
+    should be re-measured rather than left pessimistic out of habit.
+    """
+    import json
+    from pathlib import Path as _P
+
+    probe = (
+        _P(__file__).parents[1]
+        / "docs/evidence/acp-agents/claude-code-acp-0.16.2.set-model-probe.json"
+    )
+    if not probe.is_file():
+        pytest.skip(f"probe evidence not present: {probe}")
+    data = json.loads(probe.read_text())
+    advertised = set(data["advertised"])
+    accepted_unadvertised = [
+        v["modelId"] for v in data["probes"].values()
+        if v["accepted"] and v["modelId"] not in advertised
+    ]
+    assert accepted_unadvertised, "probe no longer shows unadvertised ids being accepted"
 
 
 def test_backends_are_frozen() -> None:
     with pytest.raises(Exception):
         REGISTRY["opencode"].billing = Billing.HOSTED  # type: ignore[misc]
+
+
+def test_claude_model_ids_match_the_captured_evidence() -> None:
+    """The registry's Claude model ids must be the ones the agent advertises.
+
+    A first pass guessed a "claude-" prefix and was wrong: the agent advertises
+    `default`, `sonnet`, `haiku` -- selectors rather than model names. Bind the
+    registry to the capture so the guess cannot creep back in, and so a future
+    agent version that changes its vocabulary fails here rather than at dispatch.
+    """
+    import json
+    from pathlib import Path
+
+    capture = (
+        Path(__file__).parents[1]
+        / "docs/evidence/acp-agents/claude-code-acp-0.16.2.session-new.json"
+    )
+    if not capture.is_file():
+        pytest.skip(f"capture not present: {capture}")
+    advertised = {
+        m["modelId"]
+        for m in json.loads(capture.read_text())["session_new"]["result"]["models"][
+            "availableModels"
+        ]
+    }
+    assert set(REGISTRY["claude-code"].model_namespaces) == advertised

@@ -10,6 +10,7 @@ from .backends import (
     AcpBackend,
     Billing,
     BindingChannel,
+    binding_is_trustworthy,
     check_model_allowed,
 )
 from .v1 import (
@@ -26,6 +27,7 @@ __all__ = [
     "AcpBackend",
     "Billing",
     "BindingChannel",
+    "binding_is_trustworthy",
     "check_model_allowed",
     "Assurance",
     "BindingStatus",

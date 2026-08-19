@@ -405,3 +405,116 @@ One codec drives OpenCode, Codex, Claude Code ACP and Gemini CLI with no vendor 
   the actual request, which is available for local models and not for hosted ones.
 - ACP v2's status remains **unverified**, exactly as the proposal flagged. Nothing here
   bears on it.
+
+---
+
+# Phase 4 addendum — Claude Code ACP, measured
+
+Captured 2026-08-19 from a plain shell (the nesting guard in A10 makes this impossible from
+inside a Claude Code session). Harness: `verification/capture_claude_acp.py` and
+`verification/probe_claude_acp_set_model.py`. Raw:
+`acp-agents/claude-code-acp-0.16.2.session-new.json` and `…set-model-probe.json`.
+
+## A12 — `session/new` exposes both a model roster and a mode vocabulary
+
+`@zed-industries/claude-code-acp@0.16.2` returns `models.availableModels` **and**
+`models.currentModelId` from `session/new`, so the existing `_model_options` reader finds
+them with no new code. Three ids, and they are **selectors, not model names**:
+
+| modelId | described as |
+|---|---|
+| `default` | Opus 4.6 · Most capable for complex work |
+| `sonnet` | Sonnet 4.5 · Best for everyday tasks |
+| `haiku` | Haiku 4.5 · Fastest for quick answers |
+
+`currentModelId` was `sonnet` at session creation — i.e. **a session begins bound to a model
+nobody chose**, which is A4 restated for this agent.
+
+Modes: `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`. Three of the five
+weaken permissions. A bogus modeId returns `-32603 Internal error` rather than a clean
+rejection, so mode validation exists but is not well-formed.
+
+## A13 — `session/set_model` returns success for *any* string, and cannot be read back
+
+This is the finding that governs whether Claude Code ACP can be wired at all.
+
+`session/set_model` exists — so the adapter's `method_not_found` fail-closed path never
+fires. It answered `{"result":{}}` to every one of these:
+
+| sent | in advertised list? | result |
+|---|---|---|
+| `sonnet` | yes | accepted |
+| `haiku` | yes | accepted |
+| `claude-sonnet-4-5` | no | **accepted** |
+| `gpt-5.6-sol[low]` | no (another vendor) | **accepted** |
+| `local3090/worker-fast` | no (a local profile) | **accepted** |
+| `definitely-not-a-model-9999` | no | **accepted** |
+| `""` (empty string) | no | **accepted** |
+
+And there is **no read-back**: `session/status` and `session/info` are both `-32601`.
+
+> **A successful `set_model` response from this agent is not evidence that anything was
+> bound.** It is not evidence that the id was even understood.
+
+This is worse than the missing `set_model` the plan anticipated. A missing method fails
+closed and loudly; this fails open and cheerfully, on a hosted model that bills. It is the
+same shape as the six in `local-inference` HANDOFF §3: the operation reports success, the
+result is plausible, and nothing at any layer says otherwise.
+
+## A14 — why: the ACP layer is a bridge that neither owns nor checks model selection
+
+Read from the published package rather than inferred.
+
+`claude-code-acp` is a thin translation shim over `@anthropic-ai/claude-agent-sdk`, which it
+**pins at 0.2.44**. Two consequences follow, and they answer two separate questions:
+
+1. **No validation.** `unstable_setSessionModel` (`dist/acp-agent.js:483`) checks only that
+   the session exists, then forwards the raw string to `query.setModel(params.modelId)`.
+   The bridge does not validate because selecting models is not its job — but the ACP client
+   is told `ok` regardless. Note the method's own name: `unstable_`.
+2. **The roster is as old as the pinned SDK.** `availableModels` is built
+   (`dist/acp-agent.js:920-938`) from the model list the bundled Claude Code CLI reports at
+   initialization, and those strings live in that SDK version's `cli.js`. 0.16.2 is the
+   **latest** published bridge, so this is not a stale pin on our side — the current bridge
+   ships a roster that predates the Claude 5 family. "The harness handles the model side" is
+   exactly right, and is precisely why the ACP surface cannot answer for it.
+
+A third detail, worth naming because it is a trap for anyone tempted to pass a newer id: the
+settings-to-model matcher (`dist/acp-agent.js:924-928`) matches **substrings in both
+directions** — `m.value.includes(settings.model) || settings.model.includes(m.value)`. A
+configured `sonnet-5` therefore matches the `sonnet` entry and silently resolves to
+**Sonnet 4.5**. Asking for a newer model by a longer name is a way to get an older one with
+no error.
+
+## A15 — `session/list` is machine-global, not connection-scoped
+
+The listing returned **50 sessions with a `nextCursor`, spanning 12 unrelated working
+directories**, including sessions belonging to other projects entirely and the very Claude
+Code session that was running at capture time. Entries carry `sessionId`, `cwd`, `updatedAt`
+and a `title` taken from the session's opening text.
+
+Two consequences:
+
+- It is **not** a usable root-verification channel (A11 correction 2 assumed a narrower
+  scope). A session appearing in the list says nothing about the connection asking.
+- It is an **information-exposure surface**: any ACP client that can reach this agent can
+  enumerate the titles and working directories of unrelated local Claude Code sessions.
+
+## A16 — what this means for wiring
+
+Recorded in code as `BindingChannel.UNVALIDATED` on the `claude-code` backend, with
+`binding_is_trustworthy()` returning `False` for it.
+
+- The client-side `model_namespaces` check in `acp/backends.py` is **the only validation in
+  the system** for this backend. It is not defence in depth; it is the defence.
+- No policy requiring a verified — or even meaningfully asserted — model may be satisfied by
+  this backend. Its binding cannot rise above `UNVERIFIABLE`, and recording anything stronger
+  would be recording a courtesy as a fact.
+- The admission rule still governs. Claude Code ACP solves no class of work `worker-fast`
+  does not, costs money, and now demonstrably cannot confirm what it ran. **Wiring it as a
+  routine execution backend is not justified by anything measured here.** The honest outcome
+  is the documented refusal the plan anticipated — reached for a different and stronger
+  reason than "no `set_model`".
+- What would change this: an agent version that validates `set_model` against its own
+  advertised list, or exposes any read-back of the bound model. Both are cheap to re-test
+  with the two scripts in `verification/`.
