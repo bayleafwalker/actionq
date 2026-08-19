@@ -300,12 +300,48 @@ and the affected tool resolves to `failed` rather than dangling. The adapter now
 every outstanding permission request with `cancelled` when it cancels, per the v1 contract;
 leaving them unanswered strands the agent.
 
+## A10 — three ACP v1 implementations, and they diverge
+
+Captured `initialize` responses in `acp-agents/`:
+
+| agent | version | sessionCapabilities | promptCapabilities | loadSession |
+|---|---|---|---|---|
+| OpenCode | 1.18.18 | `close`, `fork`, `list`, `resume` | image, embeddedContext | yes |
+| Claude Code ACP (`@zed-industries/claude-code-acp`) | 0.16.2 | `fork`, `list`, `resume` — **no `close`** | image, embeddedContext | yes |
+| Gemini CLI (`--experimental-acp`) | 0.55.1 | **none advertised** | image, **audio**, embeddedContext | yes |
+
+All three negotiate `protocolVersion: 1`, and **one codec parses all three with no
+per-vendor branch** — the adapter is protocol-shaped rather than OpenCode-shaped. No two of
+the three agree on session capabilities.
+
+This vindicates per-property assurance concretely rather than theoretically. `session/list`
+is what carries the root verification (A7); Gemini does not advertise session capabilities
+at all, so the *same adapter* would yield `root: VERIFIED` on OpenCode and
+`root: UNVERIFIABLE` on Gemini. A single "trusted ACP session" flag would have had to pick
+one of those and be wrong about the other.
+
+### Execution legs are blocked, and not by the protocol
+
+Neither second agent could be driven past `session/new`:
+
+- **Claude Code ACP** refuses to launch inside an existing Claude Code session:
+  *"Nested sessions share runtime resources and will crash all active sessions."* The guard
+  is bypassable by unsetting `CLAUDECODE`, which is **not** something to do underneath a
+  live session on the strength of a benchmark.
+- **Gemini CLI** returns `-32000 "Gemini API key is missing or not configured."` No
+  credential is present, and this repository does not acquire one on its own initiative.
+
+So the capability half of fungibility is evidenced; the **execution half is not**, and the
+two-harness acceptance test remains unrun. The obstacles are environmental — a process
+guard and a missing credential — not protocol incompatibility, but an unrun test is unrun
+and is recorded as such.
+
 ## What this does not establish
 
 - ~~Tool-call and permission flows were not exercised.~~ **Closed by A9.**
-- No second agent was probed. The fungibility claim in the proposal's acceptance test is
-  still untested; only the OpenCode leg exists. The adapter is written against the protocol
-  rather than against OpenCode, but that is a design intention, not a measurement.
+- **The two-harness acceptance test has not been run.** A10 establishes that three agents
+  negotiate v1 and that one codec reads all three, but only OpenCode has executed a sealed
+  envelope end to end. Capability parity is not execution parity.
 - The **harness's true context overhead is unmeasured.** A8 establishes only that ACP's
   reported figure cannot measure it. Determining it would need server-side observation of
   the actual request, which is available for local models and not for hosted ones.

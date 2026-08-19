@@ -602,7 +602,53 @@ live on this branch).
 
 ## Remaining
 
-**Second-agent fungibility**, and nothing else on this branch. Per-agent differences should
+**Second-agent fungibility** — partially evidenced, see below. Per-agent differences should
 be made *visible* rather than normalized away — fungibility means Vuoro executes correctly
 across both backends, not that both pretend to identical capability. The assurance map
 already expresses exactly that.
+
+
+---
+
+# Second-agent status (2026-08-19, fifth slice — partial)
+
+Three shipping ACP v1 implementations probed; `initialize` responses preserved in
+`docs/evidence/acp-agents/`. Full detail in evidence A10.
+
+## Evidenced: the codec is protocol-shaped
+
+All three negotiate `protocolVersion: 1` and **one codec parses all three with no
+per-vendor branch**. Their capabilities genuinely diverge — no two of the three agree on
+session capabilities; only OpenCode advertises `close`; Gemini advertises none at all and
+adds `audio` prompt support.
+
+This makes per-property assurance concrete rather than theoretical. `session/list` carries
+root verification (A7), so the *same adapter* yields `root: VERIFIED` on OpenCode and
+`root: UNVERIFIABLE` on Gemini. A single "trusted session" flag would have to pick one and
+be wrong about the other. Differences stay visible, which is what fungibility should mean:
+Vuoro executes correctly across backends, not that backends pretend to be alike.
+
+13 divergence tests run against the captured responses.
+
+## Not evidenced: execution parity
+
+Neither second agent could be driven past `session/new`, for environmental reasons rather
+than protocol ones:
+
+- **Claude Code ACP 0.16.2** refuses to run nested inside a live Claude Code session —
+  *"Nested sessions share runtime resources and will crash all active sessions."*
+  Bypassable by unsetting `CLAUDECODE`; deliberately not done underneath a running session.
+- **Gemini CLI 0.55.1** has no credential configured.
+
+**The two-harness acceptance test is therefore unrun.** Capability parity is not execution
+parity, and the fungibility claim in this proposal is not yet demonstrated.
+
+To finish it, one of:
+
+1. Run the Claude Code leg from a shell with no active Claude Code session (`CLAUDECODE`
+   unset), where the nesting guard is satisfied honestly rather than bypassed.
+2. Configure a Gemini credential.
+3. Install a third-party ACP agent with no such constraint.
+
+The adapter needs no change for any of these; the work is one capture run plus the
+comparison assertions.
