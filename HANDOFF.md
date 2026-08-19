@@ -22,8 +22,9 @@ and see what actually breaks. The unit stays `active` and the DB is untouched. T
 read at `daemon_lifecycle.run_once()` **after** `recover_stale_state()` and **before**
 `client.claim()`, so recovery still runs and in-flight work is not killed.
 
-**If you are wondering why no work is being dispatched, this is why.** Decide deliberately
-whether to resume; do not resume by reflex.
+**If you are wondering why no work is being dispatched, this is why** — but note that it was
+*already* not dispatching before the fence went up (`docs/evidence/2026-08-19-devbox-fence-baseline.md`).
+Decide deliberately whether to resume; do not resume by reflex.
 
 Side effect worth knowing: `coordinator_paused` is emitted every poll (30 s), so a long
 pause is ~2,880 events/day into the event log.
@@ -129,14 +130,22 @@ perform.
 
 ## 5. Open work
 
-- **Step 1 of the goal is running right now** — the fence. Read it before doing anything else.
-- **Native harness qualification is unstarted** and is the highest-value next measurement.
+- **Step 1 is fenced but unfalsifiable.** See `docs/evidence/2026-08-19-devbox-fence-baseline.md`
+  (F1–F6). devbox last claimed work 2026-08-09 (and it *failed*); the queue has held zero
+  claimable actions since 2026-08-15; the only events between the 2026-08-16 restart and the
+  fence are the fence's own `coordinator_paused`. **A quiet week proves nothing.** To get
+  signal, enqueue work devbox would otherwise claim, leave the fence up, and record what fails
+  to happen and who notices. Until then step 1's result is *"no signal"*, not *"nothing broke"*.
+- **Native harness qualification is unstarted** and is now the highest-value next measurement
+  outright, since step 1 is blocked on someone deciding whether to feed the fence.
 - `actionq-dispatcher`'s remote branches were never audited: its `gh pr list` failed during
   the branch sweep and it was skipped rather than assumed empty. Redo that one repo.
-- The deployed devbox daemon reports `active` since 2026-08-16, but its dispatcher log ends
-  2026-08-15 with `actionq schema 'execution' is too-new: schema version 12 exceeds supported
-  maximum 11`, and the running process is a *different* binary (`actionq-daemon` 0.1.28 from
-  `~/.local/share/uv/tools`). **Untangle which component that error belongs to** before
-  attributing anything to the pause.
+- ~~Untangle the devbox schema-error / different-binary contradiction~~ **resolved** — F1, F2.
+  The `too-new` error was `actionctl`'s, surfaced through the daemon's `claim` subprocess while
+  the daemon adapter itself reported schema 12 compatible; the 2026-08-16 restart cleared it.
+  There is no second binary — uv rewrote the package on disk 2026-08-19 under a process still
+  running the 2026-08-16 code. Residue worth keeping: `actionctl` and the daemon adapter are
+  independently-installed uv tools that drifted across a schema bump and only a restart
+  reconciled them.
 - 20 previously machine-only branches were pushed to origin across the estate; they still
   need merge-or-drop decisions.
