@@ -1,0 +1,65 @@
+[
+  {
+    "backend": "opencode",
+    "root": "/tmp/fungibility-cmxoswbw",
+    "stop_reason": "end_turn",
+    "assurance": {
+      "model": "asserted",
+      "revision": "verified",
+      "context_tiers": "verified",
+      "root": "verified",
+      "context_hot": "asserted",
+      "harness_usage": "unverifiable"
+    },
+    "tools": [
+      {
+        "kind": "edit",
+        "status": "completed",
+        "permission": null
+      }
+    ],
+    "protocol_faults": [],
+    "acceptance": {
+      "revision.unchanged": true,
+      "paths.permitted": true,
+      "acceptance.target_present": true
+    },
+    "accepted": true,
+    "artifact_present": true,
+    "artifact": "OK"
+  },
+  {
+    "backend": "codex",
+    "root": "/tmp/fungibility-20rrxetv",
+    "stop_reason": "end_turn",
+    "assurance": {
+      "model": "asserted",
+      "revision": "verified",
+      "context_tiers": "verified",
+      "root": "unverifiable",
+      "context_hot": "asserted",
+      "harness_usage": "unverifiable"
+    },
+    "tools": [
+      {
+        "kind": "edit",
+        "status": "completed",
+        "permission": null
+      },
+      {
+        "kind": "execute",
+        "status": "completed",
+        "permission": null
+      }
+    ],
+    "protocol_faults": [],
+    "acceptance": {
+      "revision.unchanged": true,
+      "paths.permitted": true,
+      "acceptance.target_present": true
+    },
+    "accepted": true,
+    "artifact_present": true,
+    "artifact": "OK"
+  }
+]

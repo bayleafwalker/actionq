@@ -1,6 +1,6 @@
 # Proposal: ACP as the harness-facing execution protocol
 
-**Status:** accepted; v1 adapter, envelope enforcement, context enforcement and observed wire shapes implemented 2026-08-19 (Phase 3 — remaining: second-agent fungibility)
+**Status:** accepted and implemented 2026-08-19. **Phase 3 complete** — two-backend fungibility demonstrated (evidence A11).
 **Date:** 2026-08-19
 **Targets:** `docs/contracts/vuoro-execution-adapter.md`
 **Origin:** RTX 3090 local inference work; see `/projects/dev/local-inference/docs/10-execution-boundary.md`
@@ -652,3 +652,56 @@ To finish it, one of:
 
 The adapter needs no change for any of these; the work is one capture run plus the
 comparison assertions.
+
+
+---
+
+# Phase 3 exit (2026-08-19)
+
+```text
+[x] one ACP codec across 4 real implementations, no vendor branch
+[x] capability-driven, per-property assurance
+[x] machine-checked execution invariants
+[x] context-policy representation and enforcement
+[x] real OpenCode execution
+[x] second real ACP execution of the same sealed task
+[x] same normalized acceptance path
+```
+
+The acceptance test ran on **OpenCode 1.18.18 and Codex ACP 1.4.0**: one sealed
+`ExecutionEnvelope`, one adapter, enforcement on, both accepted, both producing the
+artifact. Codex's existing `~/.codex/auth.json` worked unmodified — authentication was
+treated as an observed property, not a prerequisite to arrange.
+
+Assurance differed exactly where the backends differ:
+
+```text
+                opencode        codex
+root            VERIFIED        UNVERIFIABLE
+model           asserted        asserted
+revision        verified        verified
+```
+
+**Fungibility means Vuoro executes correctly across backends — not that backends pretend
+to be alike.** The difference survives into the outcome. The settled rule:
+
+> Capability absence changes assurance. It does not fail the run, and it does not select a
+> vendor-specific implementation path.
+
+The Claude Code ACP and Gemini legs were **not** executed — a process nesting guard and a
+missing credential respectively — and were not needed. Neither was worth distorting the
+environment for.
+
+Full detail: evidence A11. Raw result and the runnable script are preserved as
+`docs/evidence/2026-08-19-two-backend-fungibility.{json,py}`; the repeatable form is
+`tests/test_acp_fungibility_live.py` (`ACP_FUNGIBILITY=1`).
+
+## What Phase 3 does not claim
+
+- The sealed task was small (create a one-word file). It exercises the full envelope,
+  acceptance and assurance path, not a demanding workload.
+- Context policy is enforced in *representation* — WARM/COLD stay addressable, HOT stays
+  within budget — but no retrieval provider exists yet, so promotion accounting has no
+  production path. `selective-retrieval.yaml` points here when one does.
+- Harness context overhead remains unmeasured; ACP's usage figure cannot measure it (A8).
+- ACP v2 remains unverified.

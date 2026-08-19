@@ -61,9 +61,13 @@ def main() -> None:
             if behaviour == "no_session_list":
                 fail(rid, -32601, "Method not found: session/list")
             else:
-                cwd = "/somewhere/else/entirely" if behaviour == "wrong_root" else os.getcwd()
-                reply(rid, {"sessions": [{"sessionId": session_id, "cwd": cwd,
-                                          "title": "t", "updatedAt": "now"}]})
+                if behaviour == "session_absent_from_list":
+                    reply(rid, {"sessions": [{"sessionId": "some-other", "cwd": "/x",
+                                              "title": "t", "updatedAt": "now"}]})
+                else:
+                    cwd = "/somewhere/else/entirely" if behaviour == "wrong_root" else os.getcwd()
+                    reply(rid, {"sessions": [{"sessionId": session_id, "cwd": cwd,
+                                              "title": "t", "updatedAt": "now"}]})
         elif method == "session/set_mode":
             reply(rid, {})
         elif method == "session/set_model":

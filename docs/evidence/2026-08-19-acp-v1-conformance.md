@@ -336,12 +336,70 @@ two-harness acceptance test remains unrun. The obstacles are environmental — a
 guard and a missing credential — not protocol incompatibility, but an unrun test is unrun
 and is recorded as such.
 
+## A11 — two backends, one sealed envelope, one acceptance path
+
+The acceptance test the proposal asked for. Codex ACP 1.4.0 supplied the second leg; its
+existing `~/.codex/auth.json` worked without modification, so authentication was an
+observed property rather than a prerequisite that had to be manufactured.
+
+Same `ExecutionEnvelope` (task, invariants, permitted paths, acceptance target, context
+policy), same adapter, invariant enforcement **on**, differing only in the runtime binding
+each backend requires:
+
+| | OpenCode 1.18.18 | Codex ACP 1.4.0 |
+|---|---|---|
+| model | `local3090/worker-fast` | `gpt-5.6-sol[low]` |
+| mode | `build` | `agent` |
+| stopReason | `end_turn` | `end_turn` |
+| tools | edit | edit, execute |
+| protocol faults | none | none |
+| **acceptance** | **passed** | **passed** |
+| artifact | `OK` | `OK` |
+
+Assurance, side by side:
+
+```text
+                opencode        codex
+model           asserted        asserted
+revision        verified        verified
+root            VERIFIED        UNVERIFIABLE
+context_tiers   verified        verified
+context_hot     asserted        asserted
+harness_usage   unverifiable    unverifiable
+```
+
+**Fungibility is not parity.** The backends reached the same acceptance outcome while
+attesting differently, and the difference survives into the outcome instead of being
+averaged away. Codex cannot attest its working root — its `session/list` covers persisted
+threads, not the live session — and that lowers assurance without failing the execution.
+
+### Two corrections this run forced
+
+1. **Model advertisement has no single shape.** Codex exposes *both* a `configOptions`
+   select carrying base ids and a `models.availableModels` block carrying the
+   `id[effort]` forms that `set_model` actually validates. Picking one as authoritative
+   rejected a valid model; the codec now takes the union of what the agent advertises.
+2. **Absence of evidence is not evidence of disagreement.** A session missing from the
+   agent's listing first surfaced as a *failed* root check. It is not: nothing was
+   contradicted. It now yields `UNVERIFIABLE` and passes, while a listing that reports a
+   *different* root still fails. Punishing a backend for a capability gap would have made
+   the assurance map a compatibility gate.
+
+The rule this settles:
+
+> **Capability absence changes assurance. It does not fail the run, and it does not select
+> a vendor-specific implementation path.**
+
+One codec drives OpenCode, Codex, Claude Code ACP and Gemini CLI with no vendor branch.
+
 ## What this does not establish
 
 - ~~Tool-call and permission flows were not exercised.~~ **Closed by A9.**
-- **The two-harness acceptance test has not been run.** A10 establishes that three agents
-  negotiate v1 and that one codec reads all three, but only OpenCode has executed a sealed
-  envelope end to end. Capability parity is not execution parity.
+- ~~The two-harness acceptance test has not been run.~~ **Closed by A11**, on OpenCode and
+  Codex. The Claude Code and Gemini legs remain unexecuted (nesting guard, missing
+  credential) and are not needed for the claim.
+- The sealed task was **small** — create a one-word file. It exercises the full envelope,
+  acceptance and assurance path, not a demanding workload.
 - The **harness's true context overhead is unmeasured.** A8 establishes only that ACP's
   reported figure cannot measure it. Determining it would need server-side observation of
   the actual request, which is available for local models and not for hosted ones.

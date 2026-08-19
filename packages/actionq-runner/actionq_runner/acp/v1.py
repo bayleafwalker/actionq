@@ -278,7 +278,12 @@ class AcpExecutionAdapter:
                 raise AcpError(
                     f"envelope requests mode {mode!r} but the agent has no session/set_mode"
                 ) from error
-            raise
+            # Mode vocabularies are agent-specific: OpenCode offers build/plan, Codex
+            # read-only/agent/agent-full-access. A rejected mode is a real mismatch
+            # between envelope and backend, not something to silently continue without.
+            raise AcpError(
+                f"agent {self._agent!r} rejected mode {mode!r}: {error}"
+            ) from error
 
     def _bind_model(self, model: str, session_result: dict[str, Any]) -> None:
         """Set the session model, then establish how well the binding is known.
@@ -386,7 +391,9 @@ class AcpExecutionAdapter:
                 key = _ASSURANCE_KEYS.get(check.name)
                 if key is None:
                     continue
-                if check.name == "session.root_readback" and check.observed == "unavailable":
+                if check.name == "session.root_readback" and check.observed in (
+                    "unavailable", "session not listed", "no cwd reported"
+                ):
                     levels[key] = Assurance.UNVERIFIABLE
                 else:
                     levels[key] = Assurance.VERIFIED if check.passed else Assurance.UNSUPPORTED
@@ -433,14 +440,32 @@ class AcpExecutionAdapter:
             s for s in listing.get("sessions") or []
             if s.get("sessionId") == self._session_id
         ]
-        observed = mine[0].get("cwd") if mine else None
+        if not mine:
+            # The agent listed sessions and ours was not among them. Observed on Codex,
+            # whose listing covers persisted threads rather than the live session. That
+            # is an absence of evidence, not evidence of a wrong root: nothing was
+            # contradicted, so the property drops to unverifiable rather than failing.
+            report = BoundaryReport(phase="session_root", checks=(
+                BoundaryCheck(
+                    name="session.root_readback",
+                    passed=True,
+                    expected=root,
+                    observed="session not listed",
+                    detail="agent lists sessions but not this one; root is unverifiable",
+                ),
+            ))
+            self._boundary_reports.append(report)
+            self._emit(EventKind.BOUNDARY_CHECKED, _report_payload(report))
+            return
+
+        observed = mine[0].get("cwd")
         matches = observed is not None and Path(observed).resolve() == Path(root).resolve()
         report = BoundaryReport(phase="session_root", checks=(
             BoundaryCheck(
                 name="session.root_readback",
                 passed=matches,
                 expected=root,
-                observed=observed or "session not listed",
+                observed=observed or "no cwd reported",
                 detail="agent self-report, not an independent observation",
             ),
         ))
@@ -674,10 +699,30 @@ def _recorded_revision(report: BoundaryReport, declared: str) -> str | None:
 
 
 def _model_options(session_result: dict[str, Any]) -> set[str]:
+    """Models the agent offered, across the shapes agents actually use.
+
+    ACP does not fix how a session advertises its models. Observed: OpenCode uses a
+    generic `configOptions` select keyed `model`; Codex uses a dedicated `models` block.
+    Both are read here, keyed on the *shape present* rather than on which agent sent it --
+    capability absence changes what we can check, it does not select a vendor branch.
+    """
+    offered: set[str] = set()
+
     for option in session_result.get("configOptions") or []:
         if option.get("id") == "model":
-            return {o.get("value") for o in option.get("options") or [] if o.get("value")}
-    return set()
+            offered |= {o.get("value") for o in option.get("options") or [] if o.get("value")}
+
+    models = session_result.get("models") or {}
+    offered |= {
+        m.get("modelId") for m in models.get("availableModels") or []
+        if isinstance(m, dict) and m.get("modelId")
+    }
+
+    # Union rather than precedence. Codex advertises both -- `configOptions` carries base
+    # ids while `models.availableModels` carries the `id[effort]` forms that set_model
+    # actually validates -- and guessing which list is authoritative would reject valid
+    # models on one agent or accept invalid ones on another.
+    return {m for m in offered if m}
 
 
 def _model_option_value(state: dict[str, Any]) -> str | None:

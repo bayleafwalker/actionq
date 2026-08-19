@@ -455,3 +455,24 @@ def test_clean_run_reports_no_protocol_faults(repo: Path) -> None:
         a.open(envelope(repo))
         a.prompt()
         assert a.protocol_faults == ()
+
+
+def test_session_absent_from_listing_is_unverifiable_not_a_violation(repo: Path) -> None:
+    """Observed on Codex: the listing omits the live session.
+
+    Nothing was contradicted, so the root drops to unverifiable. Failing the execution
+    here would punish a backend for a capability gap rather than for being wrong.
+    """
+    with adapter("session_absent_from_list") as a:
+        a.open(envelope(repo))
+        levels = a.assurance()
+        root_report = [r for r in a.boundary_reports if r.phase == "session_root"][0]
+    assert root_report.ok
+    assert levels["root"] is Assurance.UNVERIFIABLE
+
+
+def test_a_contradicted_root_still_fails(repo: Path) -> None:
+    """Absence is tolerated; disagreement is not."""
+    with adapter("wrong_root") as a:
+        with pytest.raises(BoundaryViolation, match="session.root_readback"):
+            a.open(envelope(repo))
