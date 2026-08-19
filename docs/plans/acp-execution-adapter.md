@@ -243,3 +243,76 @@ identity/provenance          observability → OTel/Prom/Loki
 
 Healthier than Vuoro becoming a handcrafted replacement for things the ecosystem has since
 standardized.
+
+
+---
+
+# Addendum: the execution envelope has two halves
+
+**Added 2026-08-19, from experiment 2.3** (`local-inference/docs/08-measurements.md`,
+Findings 15 and 15b).
+
+The envelope was previously discussed as roughly `task / repo / revision / permissions /
+acceptance`. Measurement now says that is only half of it. Context allocation is not an
+implementation detail of the harness — it changed accepted-task wall time by **4.7x** on a
+task with plentiful but sparse evidence, at identical acceptance. It therefore belongs in
+the execution contract.
+
+```text
+execution envelope
+├── invariants                 machine-checked, never prompt text
+│   ├── repo / root
+│   ├── revision
+│   ├── permitted paths
+│   └── acceptance target
+│
+└── context policy             what the execution is entitled and expected to receive
+    ├── HOT material           inlined
+    ├── WARM addresses         addressable, retrieved on evidence of need
+    ├── COLD addresses         bulky/reference, targeted retrieval only
+    └── promotion policy       what may be promoted, and the ceiling on it
+```
+
+References, not payloads: WARM and COLD belong in the envelope as **addresses plus a
+provider**, not as embedded content. Embedding them recreates arm A, which was the slow arm.
+
+## Why invariants must be machine-checked, not prompted
+
+Three failures in this repo were all the same shape — a silent gap between what config or a
+prompt claimed and what actually happened:
+
+1. Benchmark scenarios declared concurrency the server did not provide (`--parallel 1`).
+2. A context-limit check never fired, so oversized prompts were sent and rejected for weeks.
+3. **OpenCode resolved its project from the `PWD` environment variable**, so runs operated on
+   the wrong repository entirely and reported plausible results for it. Preserved as
+   `local-inference/benchmarks/evidence/2026-08-19-project-root-bug.md`.
+
+None raised an error. The governing principle:
+
+> **Make invalid states unrepresentable or loudly observable. Never rely on noticing that
+> something silently did not happen.**
+
+So `root`, `revision`, `permitted paths` and `acceptance target` are **verified around the
+harness** — before dispatch and after completion — rather than stated inside its prompt and
+hoped for. A harness that can be pointed at the wrong tree by an inherited environment
+variable will not be saved by an instruction telling it not to be.
+
+## How this divides with ACP
+
+```text
+ACP     transports the agent session
+Vuoro   determines what context the execution is entitled and expected to receive,
+        and verifies the invariants independently of what the agent reports
+```
+
+The context policy is Vuoro's to set and audit. ACP's `session/new` cwd/roots and MCP
+attachments are the mechanism by which HOT/WARM/COLD addresses reach the agent — the
+mechanism, never the authority.
+
+## Testable consequence
+
+`local-inference/benchmarks/regression/selective-retrieval.yaml` is the permanent fixture:
+large available evidence, sparse relevant evidence, identical acceptance, and the assertion
+that retrieval stays **selective**. If a future context provider starts eagerly injecting
+everything, nothing errors — work simply gets several times slower. That is the class of
+regression a context policy in the execution contract exists to prevent.
