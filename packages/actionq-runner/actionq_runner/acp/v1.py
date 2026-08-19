@@ -22,6 +22,7 @@ from ..execution_contract import (
     ContextUsage,
     ModelBinding,
     PermissionDecision,
+    ToolCall,
     RuntimeHandle,
 )
 from ..execution_boundary import (
@@ -136,6 +137,9 @@ class AcpExecutionAdapter:
         self._session_id: str | None = None
         self._envelope: ExecutionEnvelope | None = None
         self._events: Queue[ExecutionEvent] = Queue()
+        self._tool_calls: dict[str, ToolCall] = {}
+        self._pending_permissions: dict[Any, str | None] = {}
+        self._protocol_faults: list[str] = []
 
     # -- introspection -----------------------------------------------------
 
@@ -144,6 +148,16 @@ class AcpExecutionAdapter:
         if self._capabilities is None:
             raise AcpError("capabilities are unknown until open() has run initialize")
         return self._capabilities
+
+    @property
+    def tool_calls(self) -> tuple[ToolCall, ...]:
+        """Tool invocations observed this execution, in creation order."""
+        return tuple(self._tool_calls.values())
+
+    @property
+    def protocol_faults(self) -> tuple[str, ...]:
+        """Wire-level incoherence the adapter refused to paper over."""
+        return tuple(self._protocol_faults)
 
     @property
     def context_plan(self) -> ContextPlan | None:
@@ -491,6 +505,13 @@ class AcpExecutionAdapter:
             return
         self._emit(EventKind.CANCELLATION_REQUESTED, {"session_id": self._session_id})
         self._rpc.notify("session/cancel", {"sessionId": self._session_id})
+        # ACP v1: permission requests outstanding when a turn is cancelled must be
+        # resolved as cancelled. Leaving them unanswered strands the agent.
+        for request_id, call_id in list(self._pending_permissions.items()):
+            self._rpc.respond(request_id, {"outcome": {"outcome": "cancelled"}})
+            if call_id and call_id in self._tool_calls:
+                self._tool_calls[call_id].permission_outcome = "cancelled"
+            self._pending_permissions.pop(request_id, None)
 
     def close(self) -> None:
         if self._rpc is None:
@@ -531,12 +552,65 @@ class AcpExecutionAdapter:
             self._answer_permission(message)
             return
         for event in normalize_inbound(message):
+            self._track_tool(event)
             self._events.put(event)
+
+    def _track_tool(self, event: ExecutionEvent) -> None:
+        if event.kind not in (EventKind.TOOL_STARTED, EventKind.TOOL_UPDATED):
+            return
+        call_id = event.payload.get("tool_call_id")
+        if not call_id:
+            # Identity is required on every tool update. Without it there is nothing to
+            # attribute the update to, and guessing would invent a correlation.
+            self._fault("tool update arrived with no toolCallId")
+            return
+        if event.kind is EventKind.TOOL_STARTED and call_id in self._tool_calls:
+            self._fault(f"tool_call re-announced an existing id {call_id!r}")
+        call = self._tool_calls.get(call_id)
+        if call is None:
+            if event.kind is EventKind.TOOL_UPDATED:
+                # An update for a call we never saw created. Recorded, not invented.
+                self._fault(f"tool_call_update for unannounced id {call_id!r}")
+            call = ToolCall(tool_call_id=call_id)
+            self._tool_calls[call_id] = call
+        elif call.terminal and event.payload.get("status"):
+            self._fault(f"update after terminal status for {call_id!r}")
+        call.apply(
+            kind=event.payload.get("tool_kind"),
+            title=event.payload.get("title"),
+            status=event.payload.get("status"),
+        )
+
+    def _fault(self, detail: str) -> None:
+        self._protocol_faults.append(detail)
+        self._emit(EventKind.PROTOCOL_UNMAPPED, {"protocol_fault": detail})
 
     def _answer_permission(self, message: dict[str, Any]) -> None:
         assert self._rpc is not None
         params = message.get("params") or {}
         self._emit(EventKind.POLICY_REQUESTED, {"request": params}, raw=message)
+
+        call_id = (params.get("toolCall") or {}).get("toolCallId")
+        if not call_id or call_id not in self._tool_calls:
+            # Authorization must never be correlated by guesswork. A permission request
+            # naming a call we have not seen is a protocol failure, and the only safe
+            # answer is refusal -- not "probably the most recent tool".
+            self._fault(f"permission requested for unknown toolCallId {call_id!r}")
+            self._emit(EventKind.POLICY_RESOLVED, {
+                "decision": PermissionDecision.DENY.value,
+                "reason": "unknown tool call; refused rather than correlated",
+            })
+            if "id" in message:
+                option = _permission_option(params, PermissionDecision.DENY)
+                self._rpc.respond(message["id"], {"outcome": (
+                    {"outcome": "selected", "optionId": option} if option
+                    else {"outcome": "cancelled"})})
+            return
+
+        tracked = self._tool_calls[call_id]
+        tracked.permission_requested = True
+        if "id" in message:
+            self._pending_permissions[message["id"]] = call_id
         try:
             decision = self._resolve_permission(params)
         except Exception as error:  # a resolver that fails denies; it does not allow
@@ -546,10 +620,13 @@ class AcpExecutionAdapter:
             self._emit(EventKind.POLICY_RESOLVED, {"decision": decision.value})
         if "id" not in message:
             return
+        self._pending_permissions.pop(message["id"], None)
         option = _permission_option(params, decision)
         if option is None:
+            tracked.permission_outcome = "cancelled"
             self._rpc.respond(message["id"], {"outcome": {"outcome": "cancelled"}})
             return
+        tracked.permission_outcome = decision.value
         self._rpc.respond(message["id"], {"outcome": {"outcome": "selected", "optionId": option}})
 
 

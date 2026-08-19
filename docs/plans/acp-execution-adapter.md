@@ -1,6 +1,6 @@
 # Proposal: ACP as the harness-facing execution protocol
 
-**Status:** accepted; v1 adapter, envelope enforcement and context enforcement implemented 2026-08-19 (Phase 3, partial — see the status sections at the end)
+**Status:** accepted; v1 adapter, envelope enforcement, context enforcement and observed wire shapes implemented 2026-08-19 (Phase 3 — remaining: second-agent fungibility)
 **Date:** 2026-08-19
 **Targets:** `docs/contracts/vuoro-execution-adapter.md`
 **Origin:** RTX 3090 local inference work; see `/projects/dev/local-inference/docs/10-execution-boundary.md`
@@ -548,3 +548,61 @@ runtime trust.
 - **A retrieval provider.** `ContextPolicy` carries addresses; nothing resolves them yet.
   `local-inference/benchmarks/regression/selective-retrieval.yaml` points here once one
   exists.
+
+
+---
+
+# Observed wire shapes (2026-08-19, fourth slice)
+
+Closes the last part of the adapter that rested on the fake agent rather than observed
+traffic. Six scenarios induced against OpenCode 1.18.18 with permissions forced to `ask`;
+raw stdio traces preserved in `docs/evidence/opencode-1.18.18/`. Full detail in evidence A9.
+
+## Two fixture layers, kept apart
+
+```text
+docs/evidence/opencode-1.18.18/*.raw.jsonl   what did OpenCode actually do?
+tests/test_acp_wire_shapes.py                what contract does ActionQ depend on?
+```
+
+The raw traces are never asserted field-by-field. The tests replay them through the real
+normalizer and assert *semantics*: identity retained across updates, lifecycle internally
+coherent, completion observable, nothing unmapped. ACP leaves most update fields optional,
+so a second agent may legitimately send far less — asserting OpenCode's exact transcript
+would turn a protocol adapter into an OpenCode-1.18.18 transcript parser.
+
+## What observation changed
+
+- **Identity is `toolCallId` alone.** `title` was observed to mutate mid-lifecycle
+  (`"read"` → `"data.txt"` for one call), so correlating on it would mis-attribute work.
+- **`in_progress` repeats**; a one-transition-per-status assumption would be wrong.
+- **A fourth kind, `search`, appeared unbidden** — the kind set is recorded, not enumerated.
+- **`optionId` is harness-private** (`once`/`always`/`reject`); `kind` is the portable
+  field. The adapter already selected by `kind`, now confirmed rather than assumed.
+  `reject_always` was not offered, so decisions degrade across the kinds present.
+- **A rejected tool ends `failed` while the turn ends `end_turn`.** A policy denial is a
+  tool-level outcome, not a turn-level abort.
+- **Cancellation** yields `stopReason: "cancelled"`; the adapter now answers every
+  outstanding permission request with `cancelled` when it cancels, per the v1 contract.
+
+## No fuzzy correlation around authorization
+
+A `session/request_permission` naming a `toolCallId` the adapter never saw announced is a
+**protocol fault, answered with denial** — never attached to "probably the most recent
+tool". The resolver is not even consulted. Three further malformed cases are refused the
+same way rather than absorbed: an update with no `toolCallId`, an update for an unannounced
+call, and an update after a terminal status. Each is recorded in `protocol_faults` and
+surfaced as telemetry, because accepting incoherent lifecycle state is how false authority
+gets manufactured.
+
+## Tests
+
+25 replay tests over the captured evidence, 6 malformed-lifecycle tests (92 offline, 11
+live on this branch).
+
+## Remaining
+
+**Second-agent fungibility**, and nothing else on this branch. Per-agent differences should
+be made *visible* rather than normalized away — fungibility means Vuoro executes correctly
+across both backends, not that both pretend to identical capability. The assurance map
+already expresses exactly that.

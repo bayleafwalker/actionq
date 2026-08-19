@@ -386,3 +386,72 @@ def test_harness_usage_is_reported_but_labelled(repo: Path) -> None:
         stopped = [e for e in a.events() if e.kind is EventKind.RUNTIME_STOPPED][0]
     assert stopped.payload["usage_assurance"] == "unverifiable"
     assert "usage_reported" in stopped.payload
+
+
+# -- malformed lifecycle ---------------------------------------------------
+
+
+def test_permission_for_an_unknown_tool_is_refused_not_correlated(repo: Path) -> None:
+    """No fuzzy correlation around authorization.
+
+    A request naming a call we never saw must be denied outright. Attaching it to "the
+    most recent tool" would grant real authority on a guess.
+    """
+    granted = []
+
+    def allow(request):
+        granted.append(request)
+        return PermissionDecision.ALLOW
+
+    with adapter("orphan_permission", permission_resolver=allow) as a:
+        a.open(envelope(repo))
+        a.prompt()
+        resolved = [e for e in a.events() if e.kind is EventKind.POLICY_RESOLVED]
+        faults = a.protocol_faults
+
+    assert not granted, "the resolver must never be consulted for an unknown tool call"
+    assert resolved[0].payload["decision"] == "deny"
+    assert any("unknown toolCallId" in f for f in faults)
+
+
+def test_update_without_identity_is_a_fault_not_a_guess(repo: Path) -> None:
+    with adapter("update_without_id") as a:
+        a.open(envelope(repo))
+        a.prompt()
+        faults = a.protocol_faults
+        calls = a.tool_calls
+    assert any("no toolCallId" in f for f in faults)
+    assert all(c.tool_call_id for c in calls)
+
+
+def test_update_for_an_unannounced_call_is_recorded_as_a_fault(repo: Path) -> None:
+    with adapter("orphan_update") as a:
+        a.open(envelope(repo))
+        a.prompt()
+        faults = a.protocol_faults
+    assert any("unannounced" in f for f in faults)
+
+
+def test_update_after_terminal_status_is_a_fault(repo: Path) -> None:
+    with adapter("update_after_terminal") as a:
+        a.open(envelope(repo))
+        a.prompt()
+        faults = a.protocol_faults
+    assert any("after terminal" in f for f in faults)
+
+
+def test_tool_lifecycle_is_tracked_by_id(repo: Path) -> None:
+    with adapter() as a:
+        a.open(envelope(repo))
+        a.prompt()
+        calls = a.tool_calls
+    assert len(calls) == 1
+    assert calls[0].tool_call_id == "t1"
+    assert calls[0].kind == "read"
+
+
+def test_clean_run_reports_no_protocol_faults(repo: Path) -> None:
+    with adapter() as a:
+        a.open(envelope(repo))
+        a.prompt()
+        assert a.protocol_faults == ()

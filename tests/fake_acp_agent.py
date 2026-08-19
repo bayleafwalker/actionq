@@ -89,6 +89,32 @@ def main() -> None:
                 "sessionId": session_id,
                 "update": {"sessionUpdate": "tool_call", "toolCallId": "t1",
                            "title": "read README.md", "status": "pending", "kind": "read"}}})
+            if behaviour == "orphan_permission":
+                # Permission for a tool call that was never announced.
+                out({"jsonrpc": "2.0", "id": 9002, "method": "session/request_permission",
+                     "params": {"sessionId": session_id,
+                                "toolCall": {"toolCallId": "never-announced"},
+                                "options": [
+                                    {"optionId": "a1", "kind": "allow_once", "name": "Allow"},
+                                    {"optionId": "r1", "kind": "reject_once", "name": "Reject"}]}})
+            if behaviour == "update_after_terminal":
+                out({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": session_id,
+                    "update": {"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                               "status": "completed"}}})
+                out({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": session_id,
+                    "update": {"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                               "status": "in_progress"}}})
+            if behaviour == "update_without_id":
+                out({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": session_id,
+                    "update": {"sessionUpdate": "tool_call_update", "status": "completed"}}})
+            if behaviour == "orphan_update":
+                out({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": session_id,
+                    "update": {"sessionUpdate": "tool_call_update",
+                               "toolCallId": "never-announced", "status": "completed"}}})
             if behaviour == "asks_permission":
                 out({"jsonrpc": "2.0", "id": 9001, "method": "session/request_permission",
                      "params": {"sessionId": session_id,

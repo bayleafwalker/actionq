@@ -224,6 +224,53 @@ class ModelBinding:
         return self.status is BindingStatus.VERIFIED
 
 
+class ToolStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    @property
+    def terminal(self) -> bool:
+        return self in (ToolStatus.COMPLETED, ToolStatus.FAILED)
+
+
+@dataclass
+class ToolCall:
+    """One tool invocation, tracked across its update stream.
+
+    Identity is ``tool_call_id`` and nothing else. ``title`` is observed to *mutate*
+    mid-lifecycle -- OpenCode sends "read" and later "data.txt" for the same call -- so
+    correlating on it would silently mis-attribute work. ``kind`` is optional in the
+    protocol and is recorded as first seen.
+    """
+
+    tool_call_id: str
+    kind: str | None = None
+    title: str | None = None
+    status: ToolStatus | None = None
+    status_history: list[ToolStatus] = field(default_factory=list)
+    permission_requested: bool = False
+    permission_outcome: str | None = None
+
+    def apply(self, *, kind: str | None, title: str | None, status: str | None) -> None:
+        if kind:
+            self.kind = self.kind or kind
+        if title:
+            self.title = title
+        if status:
+            try:
+                parsed = ToolStatus(status)
+            except ValueError:
+                return
+            self.status = parsed
+            self.status_history.append(parsed)
+
+    @property
+    def terminal(self) -> bool:
+        return self.status is not None and self.status.terminal
+
+
 @dataclass(frozen=True)
 class RuntimeHandle:
     """An external runtime handle. Never a work identity.

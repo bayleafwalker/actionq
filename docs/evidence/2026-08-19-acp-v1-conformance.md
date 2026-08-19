@@ -247,11 +247,62 @@ The general lesson is the same one A2b taught about `session/status`: a number a
 reports is a claim, and a claim that has not been checked against an independent
 observation is not a measurement.
 
+## A9 — real tool-call and permission wire shapes (closes the A6 gap)
+
+Induced against OpenCode 1.18.18 with a project-level `opencode.json` setting
+`{"edit":"ask","bash":"ask"}`, so permission requests were forced rather than hoped for.
+Raw stdio traces preserved verbatim in `opencode-1.18.18/`.
+
+### Tool-call lifecycle
+
+| capture | kinds | statuses | permission | stopReason |
+|---|---|---|---|---|
+| `read` | read | pending → in_progress → completed | none | `end_turn` |
+| `execute` | execute | pending → in_progress ×3 → completed | allow | `end_turn` |
+| `permission-allow` | read, edit | pending → in_progress → completed | allow | `end_turn` |
+| `permission-reject` | search, read, edit | edit: pending → in_progress → **failed** | reject | `end_turn` |
+| `permission-cancel` | execute | pending → in_progress → **failed** | cancelled | **`cancelled`** |
+
+Observations that changed the adapter:
+
+1. **`title` mutates mid-lifecycle.** The same call is announced as `"read"` and later
+   reported as `"data.txt"`. Correlating on it would mis-attribute work, so identity is
+   `toolCallId` and nothing else.
+2. **`in_progress` repeats.** Any state machine assuming one transition per status is
+   wrong.
+3. **A fourth kind, `search`, appeared unbidden.** The kind set is not fixed and is
+   recorded rather than enumerated.
+4. **A rejected tool ends `failed` while the turn still ends `end_turn`.** A policy denial
+   is a tool-level outcome, not a turn-level abort — which is how ActionQ must interpret
+   it.
+
+### Permission request
+
+```json
+{"sessionId":"ses_…",
+ "toolCall":{"toolCallId":"55Da1uyr…","title":"…/data.txt","kind":"edit",
+             "status":"pending","locations":[…],"rawInput":{…}},
+ "options":[{"optionId":"once","kind":"allow_once","name":"Allow once"},
+            {"optionId":"always","kind":"allow_always","name":"Always allow"},
+            {"optionId":"reject","kind":"reject_once","name":"Reject"}]}
+```
+
+**`optionId` values are harness-private strings** (`once`, `always`, `reject`) and carry no
+portable meaning. The portable field is `kind`. The adapter already selected by `kind` and
+returned the paired `optionId`; this confirms that was right rather than lucky.
+`reject_always` was **not offered** — the option set is partial, so a policy decision must
+degrade across the kinds actually present.
+
+### Cancellation
+
+Cancelling mid-turn with a permission request outstanding yields `stopReason: "cancelled"`,
+and the affected tool resolves to `failed` rather than dangling. The adapter now answers
+every outstanding permission request with `cancelled` when it cancels, per the v1 contract;
+leaving them unanswered strands the agent.
+
 ## What this does not establish
 
-- Tool-call and permission flows were not exercised — `plan` mode and a trivial prompt were
-  chosen deliberately to isolate the protocol from agent behaviour. `tool_call`,
-  `tool_call_update` and `session/request_permission` remain **unobserved**.
+- ~~Tool-call and permission flows were not exercised.~~ **Closed by A9.**
 - No second agent was probed. The fungibility claim in the proposal's acceptance test is
   still untested; only the OpenCode leg exists. The adapter is written against the protocol
   rather than against OpenCode, but that is a design intention, not a measurement.
