@@ -1,0 +1,31 @@
+{
+  "protocolVersion": 1,
+  "agentCapabilities": {
+    "promptCapabilities": {
+      "image": true,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "loadSession": true,
+    "sessionCapabilities": {
+      "fork": {},
+      "list": {},
+      "resume": {}
+    }
+  },
+  "agentInfo": {
+    "name": "@zed-industries/claude-code-acp",
+    "title": "Claude Code",
+    "version": "0.16.2"
+  },
+  "authMethods": [
+    {
+      "description": "Run `claude /login` in the terminal",
+      "name": "Log in with Claude Code",
+      "id": "claude-login"
+    }
+  ]
+}
