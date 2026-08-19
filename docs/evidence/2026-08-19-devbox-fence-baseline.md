@@ -106,3 +106,167 @@ Two things worth separating from the deletion argument, because they are true re
   The execution plane's last observed behaviour on this host is a failure, not a success.
 - `actionctl` and the daemon adapter drifted apart across a schema bump (F1) and only a restart
   reconciled them. That is a live coupling between two independently-installed uv tools.
+
+---
+
+# Addendum — the fence has been fed (F7–F8)
+
+**Recorded:** 2026-08-19T19:54Z · the experiment now has something to withhold.
+
+## F7 — Three claimable actions enqueued against the configured project
+
+Per the finding above, a quiet week could not mean anything while the queue was empty. Work was
+enqueued against `[projects.vuoro]` — the stanza already present in devbox's nix-managed
+`/etc/actionq/config.toml` — so that **no change to the deployed host was required**:
+
+```
+15  pending  scope-iterate  vuoro  2026-08-19T19:54:07Z  claimed_by=None
+16  pending  scope-iterate  vuoro  2026-08-19T19:54:08Z  claimed_by=None
+17  pending  scope-iterate  vuoro  2026-08-19T19:54:08Z  claimed_by=None
+    created_by: human:fence-experiment-step1
+    source:     fence:2026-08-19-execution-plane-deletion-step1
+```
+
+`scope-iterate` on `vuoro` is the same action type and project as action 14, the last action this
+estate completed successfully (2026-08-15T16:18Z). This is work devbox would ordinarily claim.
+
+`aligned-equity` was considered and rejected as the target: its dispatch manifest is
+`"adoption_level": "guidance-only"` with all five action classes (`plan`, `build`, `review`,
+`verify`, `reconcile`) set `"enabled": false`, and devbox's config defines no
+`[projects.aligned-equity]`. Using it would have required a gitops-nixos change plus a devbox
+rebuild — i.e. changing the deployed host in the middle of the experiment measuring that host.
+
+## F8 — The fence holds against real claimable work
+
+The daemon polls every 30 s and has done so continuously since the fence went up. Its behaviour
+across the enqueue:
+
+```
+19:53:46.225609Z  coordinator_paused
+19:54:07.520678Z  action_enqueued  15
+19:54:08.110965Z  action_enqueued  16
+19:54:08.690323Z  action_enqueued  17
+19:54:16.894570Z  coordinator_paused     <- polled with work waiting, declined to claim
+```
+
+Before this moment the fence had never been tested against a non-empty queue — every
+`coordinator_paused` since 19:06 was emitted over an empty one, and would have been emitted
+whether the fence existed or not. **19:54:16 is the first event in this experiment that the
+fence alone explains.**
+
+## What to read, and when
+
+The queue now holds work that a healthy devbox would have executed. What remains is to observe,
+over the coming days, with the fence left up:
+
+- Does anything else in the estate react to `scope-iterate` work sitting `pending` — the
+  dispatch planner, sprintctl, any canary or alert? Silence here is the deletion argument.
+- Does anyone or anything *notice*? That, not queue mechanics, is what step 1 was always asking.
+- The pause emits ~2,880 `coordinator_paused` events/day into the event log; budget for that.
+
+Actions 15–17 are inert while the fence is up. To end the experiment, either resume
+(`rm /home/agent/.local/state/actionq-dispatcher/PAUSED`) and let them run, or cancel them
+(`actionctl cancel`). Do not leave them pending indefinitely and then read the resulting
+quiet as evidence — that is the same mistake this document was written to prevent.
+
+---
+
+# Addendum 2 — the queue has no automated producer (F9)
+
+**Recorded:** 2026-08-19T20:10Z, while establishing what the fed fence should be watched against.
+
+## F9 — Every action this queue has ever held was created by hand
+
+Seventeen actions exist across the entire history of the execution queue
+(2026-07-30T12:06Z → 2026-08-19T19:54Z). All seventeen are `scope-iterate`. Their creators:
+
+| Count | `created_by` |
+|---:|---|
+| 7 | `dispatch-planner-vuoro` |
+| 3 | `human:fence-experiment-step1` *(this experiment)* |
+| 2 | `human:actionq-contained-provider-smoke-authority-repaired` |
+| 2 | `human:actionq-contained-provider-qualification` |
+| 1 | `human:actionq-contained-provider-smoke-profile-fixed` |
+| 1 | `human:actionq-contained-provider-smoke-served-safe` |
+| 1 | `human:served-execution-canary` |
+
+Seven are explicitly `human:` smoke tests, canaries and qualification probes. The remaining seven
+are `dispatch-planner-vuoro` — and **there is no dispatch planner.** On devbox there is no unit,
+no timer (the only actionq timer is `actionq-agent-tools-refresh.timer`), and no cron. The string
+appears nowhere in the estate's source. It is a `created_by` label attached to actions enqueued
+from a human-driven session; the Aug 15 batch carries `WorkstationLinux` as its daemon actor, not
+devbox.
+
+**Nothing autonomously produces work for this queue.** It has never been fed by anything but a
+person, and the "production daemon" has spent its life polling every 30 s against a queue that
+only fills when someone deliberately fills it.
+
+## Why this outranks the soak
+
+Step 1 asked what breaks when devbox stops claiming. F9 answers a sharper question that does not
+require waiting: **there is no standing demand for a claim loop at all.** A daemon that polls
+2,880 times a day to serve 17 hand-created actions in three weeks — most of them tests *of the
+daemon itself* — is not an execution plane under load. It is infrastructure whose only consistent
+workload is proving it still works.
+
+That is the deletion argument, and it does not depend on how the fence soak reads. The soak can
+still add to it (does anything notice work sitting `pending`?), and actions 15–17 should still be
+resumed or cancelled rather than left pending forever. But the case no longer rests on a week of
+silence, and should not be described as if it does.
+
+Care with this finding: it argues against owning *a queue and a claim loop*. It does not argue
+that dispatched execution was worthless — action 14 completed successfully, and the qualification
+probes were doing real work. What it shows is that the demand was **episodic and human-initiated**,
+which is a shape a federation layer serves without a daemon.
+
+---
+
+# Close-out — step 1 concluded without the soak (F10)
+
+**Recorded:** 2026-08-19T20:15Z.
+
+## F10 — The soak was skipped by decision, not run and found silent
+
+Actions 15–17 were cancelled at 20:14:52Z:
+
+```
+15 cancelled   16 cancelled   17 cancelled
+reason: soak skipped by decision; step 1 concluded on F9 (no automated producer),
+        not on observed silence
+```
+
+Total observed soak: **21 minutes**, ~42 poll cycles, all declined, no reaction from anything.
+That is consistent with the fence holding (F8) and **worth nothing as evidence about whether
+anyone depends on devbox claiming work.** Twenty-one minutes of quiet is not a finding.
+
+This is recorded explicitly so that no later reader can mistake the short soak for a result.
+**Step 1's conclusion rests on F9 alone** — the queue has no automated producer, so there is no
+standing demand for a claim loop. The fence demonstrated that it works (F8); it never
+demonstrated that nothing misses it, because it was not run long enough to.
+
+The fence file remains in place. Nothing about the deletion ordering changes.
+
+## A non-finding, recorded so it is not mistaken for one later
+
+Between 20:07Z and 20:11Z the `actionq-pg` LB (192.168.20.215) became unreachable from devbox
+and from the workstation, the daemon crash-looped, and `actionctl` failed at connect.
+
+**This was planned cluster maintenance** — a rolling update evicting services from nodes — and
+the operator receives notices on cluster services. It is *not* evidence of an unmonitored
+execution plane, and it is *not* evidence that failures go unnoticed. It is recorded here only
+because the outage is visible in the event log's shape around that window, and a later reader
+finding the gap deserves to know what caused it.
+
+The near-miss is itself worth keeping: a routine eviction was momentarily legible as "the
+production database died and nobody noticed." Under a thesis that wants deletion to be
+justified, an unexplained outage is exactly the kind of observation that gets adopted too
+readily. Ask what caused a gap before recording it as a symptom.
+
+## Incidental — F2's version skew resolved itself
+
+The restart cycle replaced the daemon: PID 3124844 (running 2026-08-16 code, with the on-disk
+package three days newer) is gone; PID 3752935 started 2026-08-19T20:13:56Z, 10 restarts on the
+unit. The running process and the installed 0.1.28 package are now the same code. The F2
+discrepancy no longer exists on this host — but the coupling that produced it does: `actionctl`
+and the daemon adapter are separately-installed uv tools that can drift across a schema bump
+until something restarts.

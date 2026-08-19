@@ -7,27 +7,35 @@ Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, 
 
 ---
 
-## 0. LIVE STATE — a production daemon is paused right now
+## 0. LIVE STATE — the daemon is running; the fence experiment is over
 
-The devbox ActionQ daemon is **fenced and not claiming work**, deliberately, since
-2026-08-19:
+The devbox ActionQ daemon is **unfenced and claiming normally** as of 2026-08-19T20:18Z. The
+queue holds no claimable work (11 `failed`, 3 `completed`, 3 `cancelled`), so a quiet daemon is
+expected and is not a fault.
 
 ```bash
-ssh devbox-agent 'cat /home/agent/.local/state/actionq-dispatcher/PAUSED'   # why + when
-ssh devbox-agent 'rm  /home/agent/.local/state/actionq-dispatcher/PAUSED'   # resume
+ssh devbox-agent 'systemctl is-active actionq-dispatch.service'
+ssh devbox-agent 'ls /home/agent/.local/state/actionq-dispatcher/PAUSED'   # absent = running
 ```
 
-This is step 1 of the deletion work below: stop consuming new work, change nothing else,
-and see what actually breaks. The unit stays `active` and the DB is untouched. The fence is
-read at `daemon_lifecycle.run_once()` **after** `recover_stale_state()` and **before**
-`client.claim()`, so recovery still runs and in-flight work is not killed.
+The fence (step 1) ran 2026-08-19 19:06Z → 20:18Z and is **closed**. It was shown to hold
+against real claimable work, then ended by decision after a 21-minute soak; the probe actions
+were cancelled. **Do not cite the soak as evidence** — see §5 and
+`docs/evidence/2026-08-19-devbox-fence-baseline.md` (F1–F10).
 
-**If you are wondering why no work is being dispatched, this is why** — but note that it was
-*already* not dispatching before the fence went up (`docs/evidence/2026-08-19-devbox-fence-baseline.md`).
-Decide deliberately whether to resume; do not resume by reflex.
+To re-fence, write the pause file back (`pause_file` in `/etc/actionq/config.toml`, which is
+nix-managed and points at `~/.local/state/actionq-dispatcher/PAUSED`, *not* the package default).
+It is read at `daemon_lifecycle.run_once()` **after** `recover_stale_state()` and **before**
+`client.claim()`, so recovery still runs and in-flight work is not killed. While fenced,
+`coordinator_paused` is emitted every poll (30 s) — ~2,880 events/day into the event log.
 
-Side effect worth knowing: `coordinator_paused` is emitted every poll (30 s), so a long
-pause is ~2,880 events/day into the event log.
+Two things a fresh session should not misread:
+
+- **Nothing autonomously feeds this queue** (F9). Seventeen actions across its entire history,
+  all hand-created. An idle daemon is the normal condition, not a symptom.
+- The daemon restarted at 2026-08-19T20:13:56Z (10 restarts) when planned cluster maintenance
+  evicted `actionq-pg`. It recovered unaided. That outage was **maintenance, not a fault**, and
+  is recorded as an explicit non-finding.
 
 ---
 
@@ -130,14 +138,17 @@ perform.
 
 ## 5. Open work
 
-- **Step 1 is fenced but unfalsifiable.** See `docs/evidence/2026-08-19-devbox-fence-baseline.md`
-  (F1–F6). devbox last claimed work 2026-08-09 (and it *failed*); the queue has held zero
-  claimable actions since 2026-08-15; the only events between the 2026-08-16 restart and the
-  fence are the fence's own `coordinator_paused`. **A quiet week proves nothing.** To get
-  signal, enqueue work devbox would otherwise claim, leave the fence up, and record what fails
-  to happen and who notices. Until then step 1's result is *"no signal"*, not *"nothing broke"*.
+- **Step 1 is closed.** `docs/evidence/2026-08-19-devbox-fence-baseline.md` (F1–F10). It did
+  *not* conclude the way it was designed to: the fence was fed, shown to hold against real
+  claimable work (F8), then the soak was **skipped by decision** after 21 minutes and the probe
+  actions cancelled. **Do not cite the soak.** The conclusion rests on **F9** — seventeen actions
+  across the queue's entire history, all hand-created, and no dispatch planner exists on any
+  host. There is no standing demand for a claim loop. That is the deletion argument for the
+  queue; it is *not* an argument that dispatched execution was worthless (action 14 succeeded),
+  only that demand is episodic and human-initiated — a shape a federation layer serves without
+  a daemon.
 - **Native harness qualification is unstarted** and is now the highest-value next measurement
-  outright, since step 1 is blocked on someone deciding whether to feed the fence.
+  outright, since step 1 is closed and step 3 is deletion work.
 - `actionq-dispatcher`'s remote branches were never audited: its `gh pr list` failed during
   the branch sweep and it was skipped rather than assumed empty. Redo that one repo.
 - ~~Untangle the devbox schema-error / different-binary contradiction~~ **resolved** — F1, F2.
