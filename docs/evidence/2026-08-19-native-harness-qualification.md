@@ -40,12 +40,15 @@ turn, its canonical form, and that it was `firstParty` — i.e. subscription, no
 genuine binding channel and it settles attribution, which A13 established `session/set_model`
 could not do at all.
 
-**But it is post-hoc.** `total_cost_usd` was `0.034924` on that turn: the read-back arrives
-*after* billing. A17's `.claude/settings.json` + `currentModelId` check remains the only
+**But it is post-hoc.** The read-back arrives *after the turn has run and consumed subscription
+usage.* (`total_cost_usd`/`costUSD` in this envelope is **notional usage accounting, not money** —
+this estate holds subscriptions only, with API billing enabled nowhere. `provider: "firstParty"`
+is the envelope's own confirmation of that. Read every dollar figure in this document as
+"equivalent usage", never as spend.) A17's `.claude/settings.json` + `currentModelId` check remains the only
 **pre-flight** verification, and `claude.py` uses neither channel — `build_command` writes
 `--model` and never reads anything back.
 
-## N3 — An unrecognised model id fails closed, at zero cost
+## N3 — An unrecognised model id fails closed, consuming nothing
 
 `--model definitely-not-a-model-xyz`:
 
@@ -54,11 +57,11 @@ could not do at all.
 is_error: true   total_cost_usd: 0   modelUsage: {}   duration_api_ms: 0
 ```
 
-Nothing ran and nothing was billed. This is the *opposite* of the ACP behaviour in A13, where any
+Nothing ran and nothing was consumed. This is the *opposite* of the ACP behaviour in A13, where any
 string — garbage included — returned success. **On this axis the native path is strictly better
 than the bridge.**
 
-## N4 — But rejection is not uniformly free, and a rejected turn can bill a model the caller never asked for
+## N4 — But rejection is not uniformly free, and a rejected turn can consume usage on a model the caller never asked for
 
 `--model gpt-4o` (another vendor's id) is also rejected as `unrecognized_model` — and yet:
 
@@ -67,17 +70,20 @@ is_error: true   total_cost_usd: 0.000952
 modelUsage: { "claude-haiku-4-5-20251001": { "inputTokens": 897, "outputTokens": 11, ... } }
 ```
 
-Same error class as N3, materially different outcome: 897 input tokens were billed against
+Same error class as N3, materially different outcome: 897 input tokens were consumed against
 **`claude-haiku-4-5`, a model the caller never requested**, on a turn that reports `is_error:
-true`. Whatever handles this path performs its own model call before or during the rejection.
+true`. No money moved — this is subscription usage — but usage is the scarce resource under a
+subscription, and it was spent on a model nobody selected. Whatever handles this path performs its own model call before or during the rejection.
 
 This is the A17 lesson arriving again by a new route: **one check is not enough.** A caller
-trusting `is_error` alone concludes "nothing happened" and is wrong about both cost and model
+trusting `is_error` alone concludes "nothing happened" and is wrong about both usage and model
 attribution. A caller trusting `modelUsage` alone sees a Haiku turn it cannot explain.
 
 **Qualification rule for this harness:** treat `is_error` and `modelUsage` as *independent*
 signals. Non-empty `modelUsage` on an errored turn means something ran that you did not ask for —
-reconcile it rather than discarding it.
+reconcile it rather than discarding it. Under a subscription this matters *more* than it would
+under API billing: usage is rationed and non-transferable, so an unrequested Haiku turn is drawn
+from the same allowance the requested work needs.
 
 ## N5 — What `claude.py` would need to be qualified, not merely working
 
@@ -98,9 +104,10 @@ Today the adapter is write-only with respect to model binding. To reach the A19 
 ## Method
 
 Three live invocations against the installed CLI, prompt `Reply with exactly: ok`, in a
-disposable git repo, with `--disallowedTools Bash,Edit,Write` on the first. Total cost of this
-qualification: **~$0.036**. The findings are re-derivable at that price, which is the point A19
-made about qualification records outliving the adapters they describe.
+disposable git repo, with `--disallowedTools Bash,Edit,Write` on the first. Total **notional
+usage** for this qualification: ~$0.036-equivalent, drawn from a subscription; no API billing is
+enabled anywhere in this estate. The findings are re-derivable at that price, which is the point
+A19 made about qualification records outliving the adapters they describe.
 
 Not yet measured: `codex.py`, `opencode.py`, `copilot.py`; whether `--no-session-persistence`
 actually prevents session creation (a `session_id` is still returned on every turn); and whether
