@@ -106,3 +106,65 @@ Two things worth separating from the deletion argument, because they are true re
   The execution plane's last observed behaviour on this host is a failure, not a success.
 - `actionctl` and the daemon adapter drifted apart across a schema bump (F1) and only a restart
   reconciled them. That is a live coupling between two independently-installed uv tools.
+
+---
+
+# Addendum — the fence has been fed (F7–F8)
+
+**Recorded:** 2026-08-19T19:54Z · the experiment now has something to withhold.
+
+## F7 — Three claimable actions enqueued against the configured project
+
+Per the finding above, a quiet week could not mean anything while the queue was empty. Work was
+enqueued against `[projects.vuoro]` — the stanza already present in devbox's nix-managed
+`/etc/actionq/config.toml` — so that **no change to the deployed host was required**:
+
+```
+15  pending  scope-iterate  vuoro  2026-08-19T19:54:07Z  claimed_by=None
+16  pending  scope-iterate  vuoro  2026-08-19T19:54:08Z  claimed_by=None
+17  pending  scope-iterate  vuoro  2026-08-19T19:54:08Z  claimed_by=None
+    created_by: human:fence-experiment-step1
+    source:     fence:2026-08-19-execution-plane-deletion-step1
+```
+
+`scope-iterate` on `vuoro` is the same action type and project as action 14, the last action this
+estate completed successfully (2026-08-15T16:18Z). This is work devbox would ordinarily claim.
+
+`aligned-equity` was considered and rejected as the target: its dispatch manifest is
+`"adoption_level": "guidance-only"` with all five action classes (`plan`, `build`, `review`,
+`verify`, `reconcile`) set `"enabled": false`, and devbox's config defines no
+`[projects.aligned-equity]`. Using it would have required a gitops-nixos change plus a devbox
+rebuild — i.e. changing the deployed host in the middle of the experiment measuring that host.
+
+## F8 — The fence holds against real claimable work
+
+The daemon polls every 30 s and has done so continuously since the fence went up. Its behaviour
+across the enqueue:
+
+```
+19:53:46.225609Z  coordinator_paused
+19:54:07.520678Z  action_enqueued  15
+19:54:08.110965Z  action_enqueued  16
+19:54:08.690323Z  action_enqueued  17
+19:54:16.894570Z  coordinator_paused     <- polled with work waiting, declined to claim
+```
+
+Before this moment the fence had never been tested against a non-empty queue — every
+`coordinator_paused` since 19:06 was emitted over an empty one, and would have been emitted
+whether the fence existed or not. **19:54:16 is the first event in this experiment that the
+fence alone explains.**
+
+## What to read, and when
+
+The queue now holds work that a healthy devbox would have executed. What remains is to observe,
+over the coming days, with the fence left up:
+
+- Does anything else in the estate react to `scope-iterate` work sitting `pending` — the
+  dispatch planner, sprintctl, any canary or alert? Silence here is the deletion argument.
+- Does anyone or anything *notice*? That, not queue mechanics, is what step 1 was always asking.
+- The pause emits ~2,880 `coordinator_paused` events/day into the event log; budget for that.
+
+Actions 15–17 are inert while the fence is up. To end the experiment, either resume
+(`rm /home/agent/.local/state/actionq-dispatcher/PAUSED`) and let them run, or cancel them
+(`actionctl cancel`). Do not leave them pending indefinitely and then read the resulting
+quiet as evidence — that is the same mistake this document was written to prevent.
