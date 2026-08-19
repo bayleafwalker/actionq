@@ -133,3 +133,38 @@ def test_live_wrong_revision_never_launches_the_agent(repo: Path) -> None:
         with pytest.raises(BoundaryViolation, match="revision.pinned"):
             a.open(_envelope(repo, invariants=ExecutionInvariants(
                 root=str(repo), revision="0" * 40)))
+
+
+def test_live_acp_usage_is_not_a_measure_of_context_size(repo: Path) -> None:
+    """Pins the finding that rules ACP usage out of budget accounting.
+
+    Measured 2026-08-19: identical requests reported 516, then 4, 4, 4 input tokens while
+    the inference server reported a steady 22 with cached_tokens rising 0 -> 18. The
+    figure tracks prefix-cache state, not request size. If a future release makes it
+    stable, this test fails and the accounting can be revisited -- which is the point.
+    """
+    seen = []
+    for _ in range(3):
+        with AcpExecutionAdapter(AGENT, agent="opencode") as a:
+            a.open(_envelope(repo))
+            seen.append(a.prompt(timeout=300.0).usage.get("inputTokens"))
+    assert len(set(seen)) > 1, (
+        f"ACP inputTokens was stable across identical requests ({seen}); "
+        "re-examine whether it can now be trusted for accounting"
+    )
+
+
+def test_live_harness_usage_is_labelled_unverifiable(repo: Path) -> None:
+    with AcpExecutionAdapter(AGENT, agent="opencode") as a:
+        a.open(_envelope(repo))
+        a.prompt(timeout=300.0)
+        assert a.assurance()["harness_usage"].value == "unverifiable"
+
+
+def test_live_root_is_verified_while_model_is_only_asserted(repo: Path) -> None:
+    """The granularity that motivated per-property assurance."""
+    with AcpExecutionAdapter(AGENT, agent="opencode") as a:
+        a.open(_envelope(repo))
+        levels = a.assurance()
+    assert levels["root"].value == "verified"
+    assert levels["model"].value == "asserted"

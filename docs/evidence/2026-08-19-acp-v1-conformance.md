@@ -164,11 +164,9 @@ session/update : usage_update          x1
 `session/update` notifications discriminated by a `sessionUpdate` field. This matches the
 shape the proposal's telemetry-normalization table assumed.
 
-**7 771 input tokens for a two-token answer.** That is OpenCode's system prompt and tool
-definitions, not the task. It is fixed overhead on every ACP execution and it interacts
-directly with the tiered context policy (HOT = 12 288): the harness preamble consumes a
-majority of the HOT tier before any task content is added. Worth measuring properly before
-the context policy is tuned against ACP.
+`stopReason` and a usage block come back on the response. **The 7 771 figure in that usage
+block is not what it looks like — see A8, which retracts the reading originally given
+here.**
 
 ## A7 — the effective root *is* readable back, and a hostile PWD does not move it
 
@@ -199,6 +197,56 @@ reported cwd  : /…/scratchpad/acp/sandbox      MATCH
 since that costs nothing — and the root read-back is what would notice if this regressed. A
 live test pins the behaviour.
 
+## A8 — ACP `usage.inputTokens` is not a measure of context size (retracts A6)
+
+A6 originally read `inputTokens: 7771` on a two-token answer as OpenCode's fixed system
+prompt and tool definitions — "fixed overhead on every ACP execution", consuming most of
+the HOT tier. That reading was wrong, and it was wrong in the way this repository keeps
+finding things wrong: a single plausible observation, generalised without a second look.
+
+Measuring it properly, by varying task length and fitting the intercept:
+
+```
+task_tokens=    10   input_tokens=7771   implied overhead=7761
+task_tokens=   211   input_tokens= 530   implied overhead= 319
+task_tokens=   811   input_tokens=1116   implied overhead= 305
+```
+
+The implied overhead is not fixed. Repeating the *identical* short prompt four times:
+
+```
+run 1  inputTokens = 516
+run 2  inputTokens =   4
+run 3  inputTokens =   4
+run 4  inputTokens =   4
+```
+
+Ground truth from the inference server for the same content, taken directly:
+
+```
+prompt_tokens=22   cached_tokens= 0
+prompt_tokens=22   cached_tokens=18
+prompt_tokens=22   cached_tokens=18
+```
+
+The server's accounting is stable at 22. OpenCode's ACP figure moves 516 → 4 → 4 → 4 for
+an unchanged request, tracking **prefix-cache state**, not request size.
+
+**Consequences.**
+
+1. There is no evidence of a ~7 K harness preamble. The A6 claim is retracted, and nothing
+   should be tuned against it.
+2. `usage.inputTokens` cannot be used for budget accounting, cost attribution, or a
+   preamble-growth regression guard. The adapter emits it as `usage_reported` alongside an
+   explicit `usage_assurance: unverifiable`, and budget decisions use the pre-dispatch
+   count, which we compute ourselves from content we hold.
+3. A live test asserts the figure is *unstable* across identical requests. If a future
+   release makes it stable, that test fails and the accounting can be revisited.
+
+The general lesson is the same one A2b taught about `session/status`: a number a harness
+reports is a claim, and a claim that has not been checked against an independent
+observation is not a measurement.
+
 ## What this does not establish
 
 - Tool-call and permission flows were not exercised — `plan` mode and a trivial prompt were
@@ -207,7 +255,8 @@ live test pins the behaviour.
 - No second agent was probed. The fungibility claim in the proposal's acceptance test is
   still untested; only the OpenCode leg exists. The adapter is written against the protocol
   rather than against OpenCode, but that is a design intention, not a measurement.
-- The **7 771-token harness preamble** (A6) was observed once, on one prompt, in one repo.
-  It is not a characterised figure and nothing should be tuned against it yet.
+- The **harness's true context overhead is unmeasured.** A8 establishes only that ACP's
+  reported figure cannot measure it. Determining it would need server-side observation of
+  the actual request, which is available for local models and not for hosted ones.
 - ACP v2's status remains **unverified**, exactly as the proposal flagged. Nothing here
   bears on it.

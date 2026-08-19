@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from .jsonrpc import JsonRpcError, JsonRpcTimeout, StdioJsonRpc
 from ..execution_boundary import BoundaryCheck, BoundaryReport, BoundaryViolation
-from ..execution_contract import BindingStatus, ModelBinding
+from ..context_policy import ContextPlan, verify_context_policy
+from ..execution_contract import Assurance, BindingStatus, ContextUsage, ModelBinding
 from .v1 import (
     PROTOCOL_VERSION,
     AcpError,
@@ -14,7 +15,11 @@ from .v1 import (
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "Assurance",
     "BindingStatus",
+    "ContextPlan",
+    "ContextUsage",
+    "verify_context_policy",
     "BoundaryCheck",
     "BoundaryReport",
     "BoundaryViolation",

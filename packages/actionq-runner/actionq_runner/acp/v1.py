@@ -13,11 +13,13 @@ from queue import Empty, Queue
 from typing import Any, Callable, Iterator
 
 from ..execution_contract import (
+    Assurance,
     BindingStatus,
     ExecutionEnvelope,
     ExecutionEvent,
     ExecutionOutcome,
     EventKind,
+    ContextUsage,
     ModelBinding,
     PermissionDecision,
     RuntimeHandle,
@@ -29,6 +31,7 @@ from ..execution_boundary import (
     verify_after_completion,
     verify_before_dispatch,
 )
+from ..context_policy import ContextPlan, TokenCounter, verify_context_policy
 from .jsonrpc import JsonRpcError, StdioJsonRpc
 from .telemetry import normalize_inbound
 
@@ -111,6 +114,7 @@ class AcpExecutionAdapter:
         request_timeout: float = 60.0,
         require_verified_model: bool = False,
         enforce_invariants: bool = True,
+        count_tokens: TokenCounter | None = None,
     ) -> None:
         if not command:
             raise ValueError("an ACP adapter requires a command to launch the agent")
@@ -121,6 +125,8 @@ class AcpExecutionAdapter:
         self._timeout = request_timeout
         self._require_verified_model = require_verified_model
         self._enforce = enforce_invariants
+        self._count_tokens = count_tokens
+        self._context_plan: ContextPlan | None = None
         self._binding: ModelBinding | None = None
         self._baseline_paths: frozenset[str] = frozenset()
         self._pinned_revision: str | None = None
@@ -138,6 +144,11 @@ class AcpExecutionAdapter:
         if self._capabilities is None:
             raise AcpError("capabilities are unknown until open() has run initialize")
         return self._capabilities
+
+    @property
+    def context_plan(self) -> ContextPlan | None:
+        """What the execution was authorised to hold. ``None`` until open()."""
+        return self._context_plan
 
     @property
     def boundary_reports(self) -> tuple[BoundaryReport, ...]:
@@ -175,6 +186,15 @@ class AcpExecutionAdapter:
         if pre.ok:
             self._pinned_revision = _recorded_revision(pre, envelope.invariants.revision)
             self._baseline_paths = snapshot_changed_paths(root)
+
+        context_report, plan = verify_context_policy(
+            envelope.context_policy, count_tokens=self._count_tokens
+        )
+        self._context_plan = plan
+        self._boundary_reports.append(context_report)
+        self._emit(EventKind.BOUNDARY_CHECKED, _report_payload(context_report))
+        if self._enforce:
+            context_report.raise_for_violations()
 
         env = dict(os.environ)
         # OpenCode resolves its project from PWD, not the process cwd. Leaving an
@@ -334,6 +354,36 @@ class AcpExecutionAdapter:
                 return model
         return None
 
+    def assurance(self) -> dict[str, Assurance]:
+        """Per-property assurance for this execution.
+
+        Deliberately not one "trusted session" flag. The backend attests to different
+        properties with different strength -- on OpenCode the working root is VERIFIED
+        while the bound model is only ASSERTED -- and collapsing them would report the
+        weakest as strong or the strongest as weak. As ACP implementations diverge, the
+        granularity is the part that ages well.
+        """
+        levels: dict[str, Assurance] = {}
+
+        levels["model"] = self._binding.status if self._binding else Assurance.UNVERIFIABLE
+
+        for report in self._boundary_reports:
+            for check in report.checks:
+                key = _ASSURANCE_KEYS.get(check.name)
+                if key is None:
+                    continue
+                if check.name == "session.root_readback" and check.observed == "unavailable":
+                    levels[key] = Assurance.UNVERIFIABLE
+                else:
+                    levels[key] = Assurance.VERIFIED if check.passed else Assurance.UNSUPPORTED
+
+        if self._context_plan is not None:
+            levels["context_hot"] = self._context_plan.hot_assurance
+
+        # The harness reports a usage figure; it is not a measure of context size.
+        levels["harness_usage"] = Assurance.UNVERIFIABLE
+        return levels
+
     def _verify_effective_root(self, root: str) -> None:
         """Confirm the session resolved to the tree the envelope named.
 
@@ -417,7 +467,18 @@ class AcpExecutionAdapter:
         )
         stop_reason = result.get("stopReason", "unknown")
         usage = result.get("usage") or {}
-        self._emit(EventKind.RUNTIME_STOPPED, {"stop_reason": stop_reason, "usage": usage})
+        # Reported, never trusted for accounting. On the observed harness this figure
+        # tracks prefix-cache state rather than request size: 516, then 4, 4, 4 for an
+        # identical request, while the inference server reported a steady 22 (evidence
+        # A8). Budget decisions use the pre-dispatch count, which we hold ourselves.
+        self._emit(
+            EventKind.RUNTIME_STOPPED,
+            {
+                "stop_reason": stop_reason,
+                "usage_reported": usage,
+                "usage_assurance": Assurance.UNVERIFIABLE.value,
+            },
+        )
         return ExecutionOutcome(
             stop_reason=stop_reason,
             usage=usage,
@@ -490,6 +551,17 @@ class AcpExecutionAdapter:
             self._rpc.respond(message["id"], {"outcome": {"outcome": "cancelled"}})
             return
         self._rpc.respond(message["id"], {"outcome": {"outcome": "selected", "optionId": option}})
+
+
+_ASSURANCE_KEYS = {
+    "session.root_readback": "root",
+    "revision.pinned": "revision",
+    "revision.recorded": "revision",
+    "revision.unchanged": "revision_unchanged",
+    "paths.permitted": "changed_paths",
+    "acceptance.target_present": "acceptance",
+    "context.tiers_remain_addressable": "context_tiers",
+}
 
 
 def _report_payload(report: BoundaryReport) -> dict[str, Any]:

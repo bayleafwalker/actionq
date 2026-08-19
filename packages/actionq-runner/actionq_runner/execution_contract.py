@@ -68,15 +68,65 @@ class ContextAddress:
 
 @dataclass(frozen=True)
 class ContextPolicy:
-    """What an execution is entitled and expected to receive."""
+    """What an execution is entitled and expected to receive.
+
+    The invariant this exists to hold is *not* a token maximum:
+
+        Bulky context outside HOT must remain addressable rather than silently
+        becoming model-visible content.
+
+    ``hot_budget`` is a measured parameter, currently 12 288 (local-inference F15/F15b),
+    and is expected to be re-derived. The tier separation is the architecture; the number
+    is a setting. Eager injection of WARM/COLD measured 4.7x slower at identical
+    acceptance, and nothing errored -- which is why this is enforced rather than advised.
+    """
 
     hot_material: tuple[str, ...] = ()
     addresses: tuple[ContextAddress, ...] = ()
-    hot_token_ceiling: int = 12288
+    hot_budget: int = 12288
     promotion_allowed: bool = True
+    promotion_budget: int = 0
+    """Additional tokens WARM/COLD retrieval may promote into view. 0 means unbounded."""
 
     def addresses_for(self, tier: ContextTier) -> tuple[ContextAddress, ...]:
         return tuple(a for a in self.addresses if a.tier is tier)
+
+
+@dataclass(frozen=True)
+class ContextUsage:
+    """Accounting for one execution's context, with the harness's share broken out.
+
+    Total request length and task-controlled allocation are different quantities, and
+    conflating them makes a budget ambiguous. Separating them is also what lets a future
+    harness release whose preamble grows be *detected* rather than silently absorbed.
+
+    ``harness_tokens`` is whatever the backend adds on its own account -- system prompt,
+    tool definitions, conversation scaffolding. It carries an assurance level because on
+    the observed harness it is **not reliably reportable**: OpenCode's ACP
+    ``usage.inputTokens`` tracks cache state, not request size, and returned 516 then 4,
+    4, 4 for an identical request while the inference server reported a steady 22. See
+    docs/evidence/2026-08-19-acp-v1-conformance.md section A8.
+    """
+
+    hot_tokens: int = 0
+    promoted_tokens: int = 0
+    harness_tokens: int | None = None
+    harness_assurance: "Assurance" = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.harness_assurance is None:
+            object.__setattr__(self, "harness_assurance", Assurance.UNVERIFIABLE)
+
+    @property
+    def task_tokens(self) -> int:
+        """What the envelope actually allocated. The part policy controls."""
+        return self.hot_tokens + self.promoted_tokens
+
+    @property
+    def total_tokens(self) -> int | None:
+        if self.harness_tokens is None:
+            return None
+        return self.task_tokens + self.harness_tokens
 
 
 @dataclass(frozen=True)
@@ -130,23 +180,34 @@ class ExecutionEnvelope:
             raise ValueError("an execution envelope requires an instruction")
 
 
-class BindingStatus(str, Enum):
-    """How strongly the adapter knows the execution ran on the model it asked for."""
+class Assurance(str, Enum):
+    """How strongly one execution property is known to hold.
 
-    VERIFIED = "verified"
-    """The agent reported the bound model back and it matched."""
+    Assurance is per-property, not per-session. A backend attests to different properties
+    with different strength -- OpenCode can prove the working root but not the bound model
+    -- and a single "trusted session" flag would average those into a lie. As ACP
+    implementations diverge, the granularity is what ages well.
 
-    ASSERTED = "asserted"
-    """The agent accepted the binding but exposes no way to read it back.
-
-    Not the same as verified, and never reported as if it were. See
-    docs/evidence/2026-08-19-acp-v1-conformance.md section A2b: OpenCode 1.18.18 has no
-    ACP method that returns a session's current model, so this is the best available
-    state for the primary conformance target.
+    The rule this encodes: declare what must be true, ask the backend what it can attest,
+    verify everything it exposes, and explicitly label the rest. Absence of evidence must
+    never quietly become runtime trust.
     """
 
+    VERIFIED = "verified"
+    """Observed to hold, independently of what the agent claims about itself."""
+
+    ASSERTED = "asserted"
+    """The agent accepted the instruction but exposes no way to confirm it took."""
+
+    UNVERIFIABLE = "unverifiable"
+    """The property matters and the backend offers no means to check it at all."""
+
     UNSUPPORTED = "unsupported"
-    """The agent cannot bind a model at all. Always fatal."""
+    """The backend cannot provide the property. Always fatal."""
+
+
+# Retained name: model binding was the first property to need this distinction.
+BindingStatus = Assurance
 
 
 @dataclass(frozen=True)

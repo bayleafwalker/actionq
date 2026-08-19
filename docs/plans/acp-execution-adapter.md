@@ -1,6 +1,6 @@
 # Proposal: ACP as the harness-facing execution protocol
 
-**Status:** accepted; v1 adapter + envelope enforcement implemented 2026-08-19 (Phase 3, partial — see *Implementation status* at the end)
+**Status:** accepted; v1 adapter, envelope enforcement and context enforcement implemented 2026-08-19 (Phase 3, partial — see the status sections at the end)
 **Date:** 2026-08-19
 **Targets:** `docs/contracts/vuoro-execution-adapter.md`
 **Origin:** RTX 3090 local inference work; see `/projects/dev/local-inference/docs/10-execution-boundary.md`
@@ -386,10 +386,8 @@ process cwd.
 
 ## Measured, not tuned
 
-A trivial two-token prompt cost **7 771 input tokens** — OpenCode's system prompt and tool
-definitions, before any task content. That is a majority of the HOT tier (12 288) consumed
-as fixed harness overhead. Observed once, on one prompt; it wants characterising before the
-context policy is tuned against ACP.
+An early reading of a **7 771-token harness preamble** appeared here. It was wrong and has
+been retracted — see evidence A8. The figure tracks prefix-cache state, not request size.
 
 
 ---
@@ -457,3 +455,96 @@ outside the lane, pre-existing dirt misattributed, and an agent reporting the wr
   once a provider exists.
 - Real permission and tool-call wire shapes remain unverified against a live harness.
 - The two-agent fungibility acceptance test.
+
+
+---
+
+# Context enforcement (2026-08-19, third slice)
+
+`actionq_runner/context_policy.py` — protocol-neutral.
+
+## The invariant is not a token maximum
+
+`assert prompt_tokens <= 12288` would have turned a measured parameter into the
+architecture. What is enforced instead:
+
+> **Bulky context outside HOT must remain addressable rather than silently becoming
+> model-visible content.**
+
+That survives HOT being re-derived at 10 240 or 16 384. `hot_budget` is a field with the
+measured default (12 288), and a test asserts enforcement responds to changing it rather
+than to a constant in the code.
+
+## Two jobs, separately
+
+**Before dispatch** — deterministic, against content we hold:
+
+| Check | Catches |
+|---|---|
+| `context.tiers_remain_addressable` | a WARM/COLD entry whose "address" is a wall of content — a payload wearing a reference's clothes, which recreates the 4.7x-slower arm |
+| `context.hot_within_budget` | HOT material over its allocation |
+| `context.promotion_bounded` | a policy that forbids promotion while carrying a promotion budget |
+
+**During execution** — `account_promotion` records what retrieval brought into view and
+checks it against `promotion_allowed` / `promotion_budget`, so promotion is *recorded*
+rather than merely permitted.
+
+## Token counting has provenance
+
+The count must come from the execution's own tokenizer, so `TokenCounter` is injected;
+`llama_cpp_counter` supplies a real one. When none is given, a crude ~4-chars-per-token
+fallback is used and the resulting assurance is **ASSERTED, not VERIFIED**, with the reason
+stated on the check. An approximate count is never reported as a measured one.
+
+## Harness overhead is accounted separately — and is currently unmeasurable
+
+`ContextUsage` splits `hot_tokens` / `promoted_tokens` (what policy controls) from
+`harness_tokens` (what the backend adds on its own account), because conflating them makes
+the budget ambiguous: total request length and task-controlled allocation are different
+quantities.
+
+`harness_tokens` carries its own assurance, and on the observed harness it is
+**UNVERIFIABLE**. ACP's `usage.inputTokens` reports prefix-cache state, not request size —
+516, then 4, 4, 4 for an identical request against a steady server-side 22 (evidence A8).
+So the intended preamble-growth regression guard **cannot be built on ACP usage**. What
+exists instead is a live test asserting the figure is *unstable*; if a release makes it
+stable, that test fails and the accounting can be revisited.
+
+## Per-property assurance
+
+The ASSERTED/VERIFIED distinction generalised. `adapter.assurance()` returns:
+
+```text
+model           ASSERTED       no read-back exists (A2b)
+root            VERIFIED       session/list reports cwd (A7)
+revision        VERIFIED       checked outside the harness
+changed_paths   VERIFIED       diffed against a pre-dispatch baseline
+acceptance      VERIFIED       target presence checked
+context_hot     VERIFIED       with a real tokenizer; ASSERTED with the fallback
+harness_usage   UNVERIFIABLE   the backend's figure does not measure what it appears to
+```
+
+Not one "trusted ACP session" flag. A backend attests to different properties with
+different strength, and collapsing them reports the weakest as strong. The rule:
+
+> Declare what must be true → ask the backend what it can attest → verify everything it
+> exposes → explicitly label the rest unverifiable.
+
+Stronger than fail-closed alone, because it stops absence of evidence from quietly becoming
+runtime trust.
+
+## Tests
+
+14 context-policy, 6 adapter-level, 3 live (61 offline + 11 live on this branch).
+
+## Still not done
+
+- **Real permission and tool-call wire shapes.** Still the only part of the adapter based
+  primarily on the fake agent rather than observed traffic, and therefore the next slice —
+  deliberately inducing Read, Edit, a shell command, and both permission outcomes, then
+  turning each observed shape into a fixture.
+- **The two-agent fungibility test**, which is worth doing only after the above; otherwise
+  two agents pass through an adapter whose less-trivial handling is still hypothetical.
+- **A retrieval provider.** `ContextPolicy` carries addresses; nothing resolves them yet.
+  `local-inference/benchmarks/regression/selective-retrieval.yaml` points here once one
+  exists.

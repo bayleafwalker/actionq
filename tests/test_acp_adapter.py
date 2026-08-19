@@ -18,6 +18,7 @@ from actionq_runner.acp import (
     ModelBindingError,
 )
 from actionq_runner.execution_boundary import resolve_revision
+from actionq_runner.execution_contract import Assurance, ContextAddress, ContextPolicy, ContextTier
 from actionq_runner.execution_contract import (
     BindingStatus,
     ContextAddress,
@@ -329,3 +330,59 @@ def test_verify_completion_requires_an_open_execution() -> None:
     a = adapter()
     with pytest.raises(AcpError, match="requires an opened execution"):
         a.verify_completion()
+
+
+# -- context policy at the adapter ----------------------------------------
+
+
+def test_envelope_embedding_bulky_evidence_is_refused(repo: Path) -> None:
+    policy = ContextPolicy(addresses=(
+        ContextAddress(ContextTier.COLD, "docs", "x" * 40_000),
+    ))
+    with adapter() as a:
+        with pytest.raises(BoundaryViolation, match="tiers_remain_addressable"):
+            a.open(envelope(repo, context_policy=policy))
+
+
+def test_envelope_over_hot_budget_is_refused(repo: Path) -> None:
+    policy = ContextPolicy(hot_material=("word " * 5000,), hot_budget=50)
+    with adapter() as a:
+        with pytest.raises(BoundaryViolation, match="hot_within_budget"):
+            a.open(envelope(repo, context_policy=policy))
+
+
+def test_addressable_policy_is_accepted_and_planned(repo: Path) -> None:
+    policy = ContextPolicy(
+        hot_material=("brief",),
+        addresses=(ContextAddress(ContextTier.WARM, "git", "src/a.py"),),
+    )
+    with adapter() as a:
+        a.open(envelope(repo, context_policy=policy))
+        plan = a.context_plan
+    assert plan is not None and len(plan.warm_addresses) == 1
+
+
+def test_assurance_is_reported_per_property(repo: Path) -> None:
+    """Not one trusted-session flag: root is verified while the model is only asserted."""
+    with adapter("no_status") as a:
+        a.open(envelope(repo))
+        levels = a.assurance()
+    assert levels["root"] is Assurance.VERIFIED
+    assert levels["model"] is Assurance.ASSERTED
+    assert levels["harness_usage"] is Assurance.UNVERIFIABLE
+
+
+def test_missing_readback_is_unverifiable_not_verified(repo: Path) -> None:
+    with adapter("no_session_list") as a:
+        a.open(envelope(repo))
+        levels = a.assurance()
+    assert levels["root"] is Assurance.UNVERIFIABLE
+
+
+def test_harness_usage_is_reported_but_labelled(repo: Path) -> None:
+    with adapter() as a:
+        a.open(envelope(repo))
+        a.prompt()
+        stopped = [e for e in a.events() if e.kind is EventKind.RUNTIME_STOPPED][0]
+    assert stopped.payload["usage_assurance"] == "unverifiable"
+    assert "usage_reported" in stopped.payload
