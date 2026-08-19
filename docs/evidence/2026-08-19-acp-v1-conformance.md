@@ -1,0 +1,184 @@
+# Evidence: ACP v1 conformance of `opencode acp`
+
+**Date:** 2026-08-19 · **Agent:** OpenCode 1.18.18 · **Transport:** JSON-RPC over stdio
+**Raw trace:** `2026-08-19-acp-conformance-trace.jsonl`
+**Probes:** `docs/plans/acp-execution-adapter.md` (Phase 3)
+
+Observed by driving the agent directly, not read from the spec. Every claim below has a
+line in the trace or a server-side log entry behind it.
+
+## A1 — protocol version and capabilities are as the proposal assumed
+
+`initialize` with `protocolVersion: 1` returns:
+
+```json
+{"protocolVersion":1,
+ "agentInfo":{"name":"OpenCode","version":"1.18.18"},
+ "agentCapabilities":{
+   "loadSession":true,
+   "mcpCapabilities":{"http":true,"sse":true},
+   "promptCapabilities":{"embeddedContext":true,"image":true},
+   "sessionCapabilities":{"close":{},"fork":{},"list":{},"resume":{}}},
+ "authMethods":[{"id":"opencode-login","name":"Login with opencode",
+                 "description":"Run `opencode auth login` in the terminal"}]}
+```
+
+v1 is confirmed as the deployed version. `session/load` is advertised as available
+(`loadSession: true`), which the proposal had marked as capability-gated.
+
+## A2 — the deployed method set is larger than the proposal recorded
+
+The proposal listed `initialize`, `authenticate`, `session/{new,prompt,cancel,load}`,
+`session/request_permission`, `session/update`. Extracted from the shipped binary:
+
+```
+session/active   session/cancel   session/close    session/fork
+session/info     session/list     session/load     session/message
+session/new      session/part     session/prompt   session/request_permission
+session/resume   session/set_config_option         session/set_mode
+session/set_model                 session/status   session/update
+```
+
+Treat this as OpenCode's surface, not as ACP v1's. Which of these are core v1 versus
+OpenCode extensions is **not** established by this probe, and the adapter must not assume
+any of the extras exist on another agent. `session/{new,prompt,set_mode,set_model,list}` were
+each driven successfully; the rest are named-in-binary only.
+
+## A2b — three of those names are not methods (correction to A2)
+
+Driving them refutes the binary-strings inventory:
+
+```
+session/status  -> -32601 Method not found
+session/info    -> -32601 Method not found
+session/active  -> -32601 Method not found
+session/list    -> ok  {"sessions":[{sessionId, cwd, title, updatedAt}, ...]}
+```
+
+So a string in the binary is not evidence of a method. The inventory in A2 is a list of
+candidates to probe, nothing more, and this document's own A2 overstated it until probed.
+
+The consequence is substantive: **`session/list` returns no model, and no other method
+reports a session's current model. There is no way to read the bound model back over ACP
+from OpenCode 1.18.18.**
+
+That means the verification A4 demands cannot be completed in-protocol against the primary
+conformance target. The binding is therefore recorded with an explicit strength rather than
+asserted as fact:
+
+| status | meaning |
+|---|---|
+| `VERIFIED` | the agent reported its bound model and it matched |
+| `ASSERTED` | the agent accepted the binding and offers the model, but exposes no read-back |
+| `UNSUPPORTED` | the agent cannot bind a model at all — always fatal |
+
+OpenCode yields `ASSERTED`. The adapter emits a `model.binding` telemetry event carrying the
+status and attaches it to the execution outcome, so a weak binding is visible in audit
+rather than indistinguishable from a strong one. `require_verified_model=True` makes the
+weak case fatal for callers that need proof of the backend; against this harness that
+setting refuses every execution, which is the honest answer.
+
+Out-of-band confirmation remains available and is what A5 used: observe the inference
+endpoint. That works for local models and is outside ACP's reach.
+
+## A3 — unknown methods fail loudly
+
+```json
+{"id":3,"error":{"code":-32601,
+  "message":"\"Method not found\": session/definitely_not_a_method",
+  "data":{"method":"session/definitely_not_a_method"}}}
+```
+
+Standard JSON-RPC `-32601`. Capability gaps are therefore observable rather than silent,
+which is the precondition for probing a second agent's surface at `open()` time instead of
+configuring it by hand.
+
+## A4 — **the session model defaults to a hosted model, and nothing says so**
+
+This is the finding that changes the adapter's design.
+
+`session/new` returns a `configOptions` array alongside the session id:
+
+```
+id=model  type=select  currentValue=opencode-go/kimi-k2.7-code  (84 options)
+id=mode   type=select  currentValue=build                       (2 options: build, plan)
+```
+
+Three providers are visible — `opencode`, `opencode-go`, `local3090` — with
+`local3090/worker-fast` and `local3090/devstral` among them. But a session created with no
+model specified runs on **`opencode-go/kimi-k2.7-code`**, a hosted model.
+
+Nothing in the ACP handshake surfaces this as a decision. An ActionQ execution dispatched
+over ACP without an explicit model would run on a hosted backend, bill accordingly, and
+return plausible results — with no error at any layer. That is precisely the failure class
+the governing principle names:
+
+> Make invalid states unrepresentable or loudly observable. Never rely on noticing that
+> something silently did not happen.
+
+It is the same shape as the `PWD` project-root bug
+(`local-inference/benchmarks/evidence/2026-08-19-project-root-bug.md`): the harness resolves
+something important from its own ambient defaults, and reports success either way.
+
+**Consequence for the adapter:** model identity is part of the execution envelope and must
+be *set and then verified*, never defaulted. `open()` fails closed when the envelope names
+no model — `ExecutionEnvelope` rejects an empty model at construction, so the invalid state
+is unrepresentable — and confirms the bound model after setting it rather than trusting the
+`ok` reply. See A2b for how far that confirmation can actually get against this harness.
+
+## A5 — the model binding was verified at the server, not from the reply
+
+`session/set_model` → `local3090/worker-fast` returned `ok`. That reply is not evidence.
+Independent confirmation from llama-swap:
+
+```
+POST /v1/chat/completions 200 "opencode/1.18.18 ai-sdk/... bun/1.3.14"   638.7ms
+POST /v1/chat/completions 200 "opencode/1.18.18 ai-sdk/... bun/1.3.14"  3074.3ms
+```
+
+Two observations:
+
+1. The request genuinely reached the local endpoint — the binding took effect.
+2. **One prompt produced two completions.** OpenCode issues at least one side-effect model
+   call per turn beyond the prompt itself. Any per-execution cost or token accounting that
+   assumes one call per prompt will undercount. Not investigated further here.
+
+## A6 — a complete prompt turn, end to end
+
+`session/prompt` with a trivial text prompt, mode `plan` (edit tools disallowed), in a
+throwaway git repo:
+
+```json
+{"id":5,"result":{"stopReason":"end_turn",
+ "usage":{"inputTokens":7771,"outputTokens":2,"totalTokens":7773}}}
+```
+
+Notifications received during the turn:
+
+```
+session/update : agent_message_chunk   x1
+session/update : usage_update          x1
+```
+
+`stopReason` and a usage block come back on the response; streaming arrives as
+`session/update` notifications discriminated by a `sessionUpdate` field. This matches the
+shape the proposal's telemetry-normalization table assumed.
+
+**7 771 input tokens for a two-token answer.** That is OpenCode's system prompt and tool
+definitions, not the task. It is fixed overhead on every ACP execution and it interacts
+directly with the tiered context policy (HOT = 12 288): the harness preamble consumes a
+majority of the HOT tier before any task content is added. Worth measuring properly before
+the context policy is tuned against ACP.
+
+## What this does not establish
+
+- Tool-call and permission flows were not exercised — `plan` mode and a trivial prompt were
+  chosen deliberately to isolate the protocol from agent behaviour. `tool_call`,
+  `tool_call_update` and `session/request_permission` remain **unobserved**.
+- No second agent was probed. The fungibility claim in the proposal's acceptance test is
+  still untested; only the OpenCode leg exists. The adapter is written against the protocol
+  rather than against OpenCode, but that is a design intention, not a measurement.
+- The **7 771-token harness preamble** (A6) was observed once, on one prompt, in one repo.
+  It is not a characterised figure and nothing should be tuned against it yet.
+- ACP v2's status remains **unverified**, exactly as the proposal flagged. Nothing here
+  bears on it.

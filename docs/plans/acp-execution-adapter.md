@@ -1,6 +1,6 @@
 # Proposal: ACP as the harness-facing execution protocol
 
-**Status:** proposal — not implemented
+**Status:** accepted; v1 adapter implemented 2026-08-19 (Phase 3, partial — see *Implementation status* at the end)
 **Date:** 2026-08-19
 **Targets:** `docs/contracts/vuoro-execution-adapter.md`
 **Origin:** RTX 3090 local inference work; see `/projects/dev/local-inference/docs/10-execution-boundary.md`
@@ -316,3 +316,80 @@ large available evidence, sparse relevant evidence, identical acceptance, and th
 that retrieval stays **selective**. If a future context provider starts eagerly injecting
 everything, nothing errors — work simply gets several times slower. That is the class of
 regression a context policy in the execution contract exists to prevent.
+
+
+---
+
+# Implementation status (2026-08-19)
+
+Conformance was **observed before the adapter was written**, not read from the spec.
+Evidence: `docs/evidence/2026-08-19-acp-v1-conformance.md`, raw trace alongside it.
+
+## Landed
+
+| Module | Role |
+|---|---|
+| `actionq_runner/execution_contract.py` | protocol-neutral vocabulary — envelope, invariants, context policy, normalized events, binding strength. Imports no ACP. |
+| `actionq_runner/acp/jsonrpc.py` | line-delimited JSON-RPC over child stdio. Transport only. |
+| `actionq_runner/acp/v1.py` | `AcpExecutionAdapter` — the v1 codec and lifecycle. |
+| `actionq_runner/acp/telemetry.py` | `session/update` → normalized events. |
+| `tests/fake_acp_agent.py` | scriptable agent, including dishonest behaviours. |
+| `tests/test_acp_adapter.py` | 19 tests, no harness required. |
+| `tests/test_acp_conformance_live.py` | 5 tests against the real harness, `ACP_LIVE=1`. |
+
+The version boundary the proposal asked for holds: ACP vocabulary appears only under
+`acp/`, and a v2 codec would be a sibling of `v1.py`.
+
+## What the evidence changed about the design
+
+**Model identity is now part of the envelope, and it is mandatory.** A `session/new` with
+no model specified binds a *hosted* model (`opencode-go/kimi-k2.7-code`) and reports
+nothing. An execution would have run on the wrong backend, billed for it, and returned
+plausible output. `ExecutionEnvelope` rejects an empty model at construction, so that state
+is unrepresentable rather than merely discouraged.
+
+**Binding strength is explicit.** OpenCode 1.18.18 has no method that reports a session's
+current model — `session/status`, `session/info` and `session/active` appear in the binary
+but return `-32601`. So the confirmation step cannot complete in-protocol against the
+primary target. Rather than assert the binding as verified, the adapter records
+`VERIFIED` / `ASSERTED` / `UNSUPPORTED`, emits it as telemetry, and attaches it to the
+outcome. `require_verified_model=True` makes the weak case fatal.
+
+**Permissions fail closed.** With no resolver wired in, and when a resolver raises, the
+answer is deny. ACP supplies mechanism; an adapter with no authority grants nothing.
+`ESCALATE` has no ACP representation and is reported as a cancelled request, resolved above
+this layer — escalation is a policy outcome, not a harness feature.
+
+**Unmapped traffic is visible.** Anything the codec does not recognise becomes
+`protocol.unmapped` rather than being dropped, so an agent that starts sending something
+new is observable. The live test asserts the real harness produces none.
+
+**`PWD` is set explicitly at spawn.** OpenCode resolves its project from `PWD`, not the
+process cwd.
+
+## Not done
+
+- **Tool-call and permission flows are unobserved against a real harness.** The live probe
+  used `plan` mode and a trivial prompt to isolate protocol from agent behaviour. The fake
+  agent covers the adapter's handling; the wire shapes for `tool_call`, `tool_call_update`
+  and `session/request_permission` are assumed from the spec, not confirmed.
+- **The acceptance test is not built.** Only the OpenCode leg exists. Fungibility remains
+  a claim, not a measurement, until a second agent runs the same sealed envelope.
+- **The context policy is modelled but not enforced.** `ContextPolicy` is carried on the
+  envelope; nothing yet resolves WARM/COLD addresses or holds the HOT ceiling. That is the
+  seam where `local-inference/benchmarks/regression/selective-retrieval.yaml` should be
+  pointed once a provider exists.
+- **Invariants are declared, not checked.** `ExecutionInvariants` rejects an empty root or
+  revision, but nothing yet verifies the revision or permitted paths around the harness.
+  The proposal is explicit that these must be machine-checked before dispatch and after
+  completion; that verification is still to write.
+- **`session/load` / resume is unused.** Advertised as available; recovery policy is not
+  implemented.
+- **ACP v2 remains unverified.** Unchanged by this work.
+
+## Measured, not tuned
+
+A trivial two-token prompt cost **7 771 input tokens** — OpenCode's system prompt and tool
+definitions, before any task content. That is a majority of the HOT tier (12 288) consumed
+as fixed harness overhead. Observed once, on one prompt; it wants characterising before the
+context policy is tuned against ACP.
