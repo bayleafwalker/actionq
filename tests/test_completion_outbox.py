@@ -18,11 +18,6 @@ from actionq.completion_outbox import (
     CompletionOutbox,
     payload_digest,
 )
-from actionq.session_wrapper import (
-    SessionIdentity,
-    SessionWrapper,
-    recover_stale_markers,
-)
 
 
 @pytest.fixture()
@@ -253,117 +248,6 @@ def test_operator_cli_is_payload_free_and_reports_replay_state(tmp_path: Path) -
             assert parsed[0]["event_id"] == event["event_id"]
 
 
-def test_wrapper_records_after_capsule_and_preserves_outcome_on_disk_failure(
-    tmp_path: Path, git_repo: Path, monkeypatch
-) -> None:
-    errors: list[str] = []
-    wrapper = SessionWrapper(
-        SessionIdentity(repo_project="actionq", actor="test"),
-        repo_path=git_repo,
-        capsule_dir=tmp_path / "capsules",
-        marker_dir=tmp_path / "markers",
-        outbox_path=tmp_path / "outbox.sqlite3",
-        on_recorder_error=lambda message, exc: errors.append(message),
-    )
-    monkeypatch.setattr(
-        "actionq.completion_outbox.CompletionOutbox.record",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
-    )
-
-    assert wrapper.run([sys.executable, "-c", "import sys; sys.exit(7)"]) == 7
-    assert wrapper.last_capsule_path is not None
-    assert any("session completion" in message for message in errors)
-    assert list((tmp_path / "markers").glob("*.json"))
-
-
-def test_startup_recovers_capsule_to_outbox_after_crash_boundary(
-    tmp_path: Path, git_repo: Path, monkeypatch
-) -> None:
-    outbox_path = tmp_path / "outbox.sqlite3"
-    capsule_dir = tmp_path / "capsules"
-    marker_dir = tmp_path / "markers"
-    original_record = CompletionOutbox.record
-    monkeypatch.setattr(
-        "actionq.completion_outbox.CompletionOutbox.record",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("lost after capsule")),
-    )
-    wrapper = SessionWrapper(
-        SessionIdentity(
-            repo_project="actionq",
-            actor="test",
-            attempt_id="attempt-1",
-            action_id="action-1",
-        ),
-        repo_path=git_repo,
-        capsule_dir=capsule_dir,
-        marker_dir=marker_dir,
-        outbox_path=outbox_path,
-        on_recorder_error=lambda message, exc: None,
-    )
-    assert wrapper.run([sys.executable, "-c", "pass"]) == 0
-    marker_path = next(marker_dir.glob("*.json"))
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    marker["pid"] = 999999999
-    marker_path.write_text(json.dumps(marker), encoding="utf-8")
-    monkeypatch.setattr("actionq.completion_outbox.CompletionOutbox.record", original_record)
-
-    recovering = SessionWrapper(
-        SessionIdentity(repo_project="actionq", actor="recovery"),
-        repo_path=git_repo,
-        capsule_dir=capsule_dir,
-        marker_dir=marker_dir,
-        outbox_path=outbox_path,
-    )
-    recovering.start()
-    recovered = CompletionOutbox(outbox_path).pending()[0]["payload"]
-    assert recovered["event_id"]
-    assert recovered["attempt_id"] == "attempt-1"
-    assert recovered["action_id"] == "action-1"
-    assert recovered["terminal"]["kind"] == "succeeded"
-    assert recovered["origin_stream_id"] == wrapper.origin_stream_id
-    assert list(marker_dir.glob("*.json")) == [recovering._marker_path]
-    recovering.finish(exit_code=0)
-
-
-def test_dispatched_marker_survives_outbox_none_then_recovers_correlation(
-    tmp_path: Path, git_repo: Path
-) -> None:
-    capsule_dir = tmp_path / "capsules"
-    marker_dir = tmp_path / "markers"
-    wrapper = SessionWrapper(
-        SessionIdentity(
-            repo_project="actionq",
-            actor="test",
-            attempt_id="attempt-later",
-            action_id="action-later",
-        ),
-        repo_path=git_repo,
-        capsule_dir=capsule_dir,
-        marker_dir=marker_dir,
-        outbox_path=tmp_path / "unused.sqlite3",
-        on_recorder_error=lambda message, exc: None,
-    )
-    wrapper.start()
-    marker_path = next(marker_dir.glob("*.json"))
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    marker["pid"] = 999999999
-    marker_path.write_text(json.dumps(marker), encoding="utf-8")
-
-    assert recover_stale_markers(marker_dir, capsule_dir, outbox=None) == []
-    assert marker_path.exists()
-    assert list(capsule_dir.glob("*.json"))
-
-    outbox = CompletionOutbox(tmp_path / "later.sqlite3")
-    recovered = recover_stale_markers(marker_dir, capsule_dir, outbox=outbox)
-    assert recovered
-    event = outbox.pending()[0]["payload"]
-    assert (event["attempt_id"], event["action_id"]) == (
-        "attempt-later",
-        "action-later",
-    )
-    assert not marker_path.exists()
-
-
 def test_retention_policy_is_persisted_and_reused(tmp_path: Path) -> None:
     path = tmp_path / "outbox.sqlite3"
     year = 365 * 24 * 60 * 60
@@ -414,29 +298,3 @@ def test_cli_inspection_never_compacts_or_overrides_persisted_policy(
         ).fetchone()[0] == year
 
 
-def test_generated_event_passes_canonical_agentops_validator(
-    tmp_path: Path, git_repo: Path, session_artifact_validator: Path
-) -> None:
-    outbox_path = tmp_path / "outbox.sqlite3"
-    wrapper = SessionWrapper(
-        SessionIdentity(repo_project="actionq", actor="test"),
-        repo_path=git_repo,
-        capsule_dir=tmp_path / "capsules",
-        marker_dir=tmp_path / "markers",
-        outbox_path=outbox_path,
-    )
-    assert wrapper.run([sys.executable, "-c", "pass"]) == 0
-    event = CompletionOutbox(outbox_path).pending()[0]["payload"]
-    assert event["origin_stream_id"] == wrapper.last_capsule["origin_stream_id"]
-    completion_dir = tmp_path / "session-completions"
-    completion_dir.mkdir()
-    (completion_dir / "event.json").write_text(json.dumps(event), encoding="utf-8")
-
-    validator = session_artifact_validator
-    completed = subprocess.run(
-        [sys.executable, str(validator), "--root", str(tmp_path)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr or completed.stdout

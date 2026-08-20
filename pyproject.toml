@@ -44,7 +44,6 @@ Issues = "https://github.com/bayleafwalker/actionq/issues"
 actionctl = "actionq.cli:cli"
 actionq-server = "actionq.server:main"
 actionq-daemon = "actionq.daemon:main"
-actionq-session-wrap = "actionq.session_wrapper:main"
 actionq-completion-outbox = "actionq.completion_outbox:main"
 
 [project.optional-dependencies]

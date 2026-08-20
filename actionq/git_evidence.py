@@ -1,10 +1,12 @@
 """Shared git-evidence collection for crash/inferred-end recovery.
 
-Extracted from ``actionq.session_wrapper`` (work item #1114) so the daemon's
-own stale-session recovery (work item #1115) can collect the same
-"surviving commits/worktree" evidence for a crashed daemon-dispatched
-session that the Tier-0 wrapper already collects for a crashed wrapped
-session, instead of duplicating (and risking drifting) the git plumbing.
+Extracted from the former ``actionq.session_wrapper`` (work item #1114) so the
+daemon's own stale-session recovery (work item #1115) could collect the same
+"surviving commits/worktree" evidence for a crashed daemon-dispatched session
+that the Tier-0 wrapper collected for a crashed wrapped session, instead of
+duplicating (and risking drifting) the git plumbing. That extraction is why the
+wrapper could later be deleted without touching daemon recovery; this module is
+now the only home for the plumbing.
 
 Every function here is read-only against the target repo: recovery must
 never mutate a worktree it is only trying to describe.

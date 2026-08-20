@@ -14,6 +14,9 @@ from typing import Any
 
 
 SCHEMA_VERSION = "session.completion-observed/v1"
+# The "session-wrapper" path component is legacy: that module is gone, but the
+# deployed devbox daemon reads this exact location, so the name is load-bearing
+# state, not a reference to live code. Renaming it orphans the outbox.
 DEFAULT_OUTBOX_PATH = Path("~/.local/state/actionq/session-wrapper/completion-outbox.sqlite3")
 MAX_RETRY_SECONDS = 300
 DEFAULT_ACK_RETENTION_SECONDS = 7 * 24 * 60 * 60
