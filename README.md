@@ -1,5 +1,12 @@
 # actionq
 
+> **Current architecture note (2026-08-20):** the ActionQ daemon/server execution plane and
+> `actionq-dispatcher` are retired. Native runtimes own execution. The queue/claim commands
+> documented below remain a historical compatibility surface while tranche 4 replaces their
+> authority with revision-CAS federation resources; see
+> `docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md`. Do not start a new
+> dispatcher or execution integration from the legacy examples.
+
 `actionq` is a Postgres-backed action queue for deterministic agent and operator dispatch. It gives you a small, explicit CLI contract for enqueuing work, claiming one item at a time, recording lifecycle transitions, and reading the queue event log without exposing direct SQL writes to consumers.
 
 `actionctl` is the public contract. Consumers should not import the package directly or write to the database outside the queue interface.

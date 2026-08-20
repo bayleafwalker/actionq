@@ -78,8 +78,10 @@ deletion.
 | Vuoro adapter | `actionq.vuoro`, 26-operation execution catalog and compatibility record | Vuoro composition and released-adapter pin validators; specialized composition verification | Publish a new catalog version containing federation resources, refs, evidence, acceptance and reconciliation only. Claim/renew/settle, enqueue/managed dispatch and execution groups do not cross the new boundary. Old hashes remain pinned for archive compatibility until explicit cutover. |
 | Migration assets | `actionq/migrations/001`–`012`; loaded as `actionq` package data; ledger uses version/name/checksum | wheel packaging, migration CLI, deployment migration Job, schema tests | Bytes, names, versions and order are immutable. A storage-package move must prove byte-for-byte identity and continue to recognize the existing ledger before switching the loader. New evolution is additive migration 013+, never edits to 001–012. |
 | `actionq-runner` workspace package | separate portable executor/publisher/candidate code, reachable from its own scripts/tests, not from the retained federation root | package-specific consumers and tests | Out of this extraction. It is native execution-plane residue requiring a separate owner/retirement decision; storage must not import it. |
+| Retired dispatcher | `actionq-dispatcher` tombstone PR #2 merged at `510822a`; release `actionq-dispatcher-v0.2.0` publishes the retirement | stale q-spec, ActionQ historical protocol/README language, root and generated agent guidance | Retired, not a compatibility launcher. No tranche-4 work may dispatch through it. Remove stale normative references under their owning repositories; preserve historical receipts as evidence. |
 | Vuoro repository | `packages/vuoro-service/.../composition.py`; adapter pins; released catalog validators; pre-migration script; migration Job | deployed and release composition | Blocking consumer. W4 must land coordinated pins/composition before W5 removes legacy catalog operations. Deployment mutation remains separate operator work. |
-| q-spec | `actionq-spec.md` and `dispatcher-spec.md` define claim/daemon/CLI queue as contract | architectural readers and dispatcher implementations | Historical/stale external specification. Supersede in q-spec in a separately owned change; do not treat it as the tranche-4 oracle. |
+| q-spec | `actionq-spec.md` and `dispatcher-spec.md` still define claim/daemon/CLI queue as a normative contract | architectural readers | Stale after dispatcher retirement. Supersede in q-spec in a separately owned change, explicitly citing the tombstone release and native-runtime/ActionQ-federation boundary; do not treat either file as a tranche-4 oracle or implementation contract. |
+| Workspace/agentops guidance | root `AGENTS.md` and generated agentops workspace guidance still instruct operators to start/use the legacy daemon/launcher | agent sessions and runbooks generated from the shared template | Separate cross-repository documentation cleanup. Until corrected, the retirement release and this owner oracle take precedence; tranche 4 must not edit the generated guidance locally. |
 | gitops/devbox | runbooks, Nix module and scripts invoke `actionctl` compatibility, add and sessions | external operator automation | Blocking consumer inventory. Read-only compatibility/session uses can move; enqueue/daemon uses must retire under their owner. No changes from this plan. |
 | appservice/runtime | deployed image, roles, migration jobs and catalog consumers | cluster/runtime owners | External cutover dependency only. No mutation is authorized here; package/schema/catalog rollout requires a separate reviewed plan. |
 
@@ -277,7 +279,7 @@ served mutation omits expected revision.
 
 ### W5 — consumer cutover and legacy-write fence
 
-Require zero known writers from Vuoro, q-spec implementations, gitops/devbox automation and
+Require zero known writers from Vuoro, legacy q-spec-derived integrations, gitops/devbox automation and
 other deployed clients. Then disable legacy writes at application/catalog/CLI boundaries;
 retain archive reads.
 
@@ -340,8 +342,11 @@ W7 archive retirement -> separate retention/destruction authorization
 ```
 
 W1 and W2 are ActionQ owner work. W3 should be implemented independently from its reviewer.
-W4 has separate ActionQ and Vuoro owners but cannot merge as a partial catalog cutover. W5
-requires current external-consumer evidence. W6 must not start while W0–W5 gates are open.
+W4 has separate ActionQ and Vuoro owners but cannot merge as a partial catalog cutover. The
+q-spec supersession and root/agentops generated-guidance cleanup are separate documentation
+work packets owned outside this branch; both must cite the dispatcher tombstone rather than
+preserve a compatibility-launcher fiction. W5 requires current external-consumer evidence.
+W6 must not start while W0–W5 gates are open.
 
 ## Remaining operator decisions
 
