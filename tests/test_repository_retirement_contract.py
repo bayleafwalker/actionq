@@ -56,3 +56,21 @@ def test_retired_execution_entrypoints_do_not_return_as_repo_surfaces() -> None:
         )
     )
     assert "legacy-http-route-quarantine" not in required_histories["histories"]
+
+
+def test_current_docs_do_not_present_the_retired_http_or_daemon_plan_as_live() -> None:
+    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+    assert (
+        "ActionQApplication is the adapter-safe application core shared by actionctl and the "
+        "Vuoro execution adapter's federation handlers"
+    ) in readme.replace("`", "")
+    assert "shared by legacy Actionq HTTP" not in readme.replace("`", "")
+
+    plan = (ROOT / "docs/plans/actionq-server-daemon-workstream-c-plan.md").read_text(
+        encoding="utf-8"
+    )
+    assert "\nstatus: superseded\n" in plan
+    assert "superseded_on: 2026-08-20" in plan
+    assert "Historical plan — superseded 2026-08-20" in plan
+    assert "docs/plans/2026-08-20-execution-plane-deletion-order.md" in plan
+    assert "owner/federation successor" in plan

@@ -1,7 +1,7 @@
 # Handoff — actionq
 
 **As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged)
-**Suite:** 479 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
+**Suite:** 480 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
 deletes the tests along with the code they covered)*
 **`actionq/`: 13,169 → 8,273 LOC.** The execution plane is gone.
 

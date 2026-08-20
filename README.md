@@ -51,8 +51,9 @@ uv sync --extra dev
 
 ## Vuoro execution adapter
 
-`ActionQApplication` is the adapter-safe application core shared by
-`actionctl`, the legacy Actionq HTTP façade, and the Vuoro execution adapter.
+`ActionQApplication` is the adapter-safe application core shared by `actionctl`
+and the Vuoro execution adapter's federation handlers. The retired HTTP façade
+historically consumed this core but is not a current ActionQ surface.
 The owner-provided `actionq.vuoro` module publishes domain-qualified operation
 metadata, JSON Schemas, handlers, and the execution compatibility record for
 Vuoro composition. It does not add migrations or database access to the
