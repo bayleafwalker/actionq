@@ -7,11 +7,14 @@ surface before a later, separately reviewed packet is allowed to move code.
 from __future__ import annotations
 
 import ast
+import base64
 import copy
 import hashlib
+import io
 import json
 import re
 import subprocess
+import tarfile
 import tomllib
 from pathlib import Path
 
@@ -171,6 +174,42 @@ def _validate_external_path_proofs(manifest: dict) -> None:
     assert agentops["commit_refs"] == {
         "canonical_program_record": "6c01869b8a0c5ad3dfaf3313385f9a162900dab8"
     }
+
+
+def _validate_external_proof_bundle(
+    manifest: dict, *, corrupt: dict[tuple[str, str], bytes] | None = None
+) -> None:
+    bundle = manifest["external_proof_bundle"]
+    encoded = (ROOT / bundle["path"]).read_bytes()
+    archive = base64.b64decode(encoded, validate=False)
+    assert hashlib.sha256(archive).hexdigest() == bundle["sha256"]
+    members: dict[tuple[str, str], bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as opened:
+        for member in opened.getmembers():
+            if not member.isfile():
+                continue
+            name = member.name.removeprefix("./")
+            consumer_id, path = name.split("/", 1)
+            key = (consumer_id, path)
+            assert key not in members
+            extracted = opened.extractfile(member)
+            assert extracted is not None
+            members[key] = extracted.read()
+    for key, content in (corrupt or {}).items():
+        assert key in members
+        members[key] = content
+    proofs = {
+        (item["consumer_id"], item["path"]): item
+        for item in manifest["external_path_proofs"]
+    }
+    assert bundle["member_count"] == 51
+    assert set(members) == set(proofs)
+    for key, content in members.items():
+        assert hashlib.sha256(content).hexdigest() == proofs[key]["sha256"], key
+        if key[0] == "appservice-ordered-retirement" and key[1].endswith(".secret.yaml"):
+            for line in content.decode("utf-8").splitlines():
+                if re.match(r"^\s+(?:username|password|uri):", line):
+                    assert "ENC[" in line, (key, "plaintext secret field")
 
 
 def _local_import_edges() -> set[str]:
@@ -440,6 +479,8 @@ def _check_mixed_symbols_constants_and_semantic_assets():
         "verification/capture_claude_acp.py", "docs/operations/codex-luna-catalog-workaround.md",
             "docs/plans/acp-execution-adapter.md", "docs/verification/*depth-2-survey.md",
             ".agents/overlays/actionq.hybrid-worker.md", "actionq/migrations/__init__.py", "AGENTS.md",
+            "verification/fixtures/tranche4-external-paths-v1.tar.gz.base64",
+            "verification/fixtures/tranche4-external-paths-v1.md",
     ):
         selected.update(path.relative_to(ROOT).as_posix() for path in ROOT.glob(pattern) if path.is_file())
     assert _flatten(manifest["semantic_assets"], "paths") == selected
@@ -477,6 +518,7 @@ def _check_mixed_symbols_constants_and_semantic_assets():
     assert len(vuoro["released_operation_sha256"]) == 22
     assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in vuoro["released_operation_sha256"].values())
     _validate_external_path_proofs(manifest)
+    _validate_external_proof_bundle(manifest)
     proof_repos = {
         "vuoro-composition": Path("/projects/dev/vuoro"),
         "actionq-dispatcher-tombstone": Path("/tmp/actionq-dispatch-proof"),
@@ -573,6 +615,12 @@ def _check_r1_reviewer_corruption_probes():
         assert changed["external_path_proofs"][0]["sha256"] == (
             "6d2f9739c1ffa1a5fa3a9cfdf8dd22b81ed71d5a93eff211fa1db134ae8902f1"
         )
+    for key in (
+        ("gitops-nixos-daemon-retirement", "scripts/check-actionq-retirement.sh"),
+        ("appservice-ordered-retirement", "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-migrate-v1.yaml"),
+    ):
+        with pytest.raises(AssertionError):
+            _validate_external_proof_bundle(manifest, corrupt={key: b"corrupted source bytes"})
 
     changed = copy.deepcopy(manifest)
     completion = next(
