@@ -1,10 +1,13 @@
 # Handoff — actionq
 
-**As of:** 2026-08-20 · **`main`:** `0fb33f6` (PR #28 merged) · **Suite:** 718 passed, 19 skipped, 0 failed
+**As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged) · **Suite:** 718 passed, 19 skipped, 0 failed
 
-**Open PR you own:** [#29](https://github.com/bayleafwalker/actionq/pull/29) on
-`evidence/native-harness-qualification` — both harness qualification records (N1–N13) and the
-re-runnable probe. **Merge it first;** step 3 starts from it.
+**Open PR you own:** `delete/session-wrapper-execution-plane` — step 3 tranche 1 (the session
+wrapper, 970 LOC) plus the deletion order. Read
+`docs/plans/2026-08-20-execution-plane-deletion-order.md` **before deleting anything else**;
+it lists four modules that look deletable and are not.
+
+**Step 3 is blocked on two decisions, not on evidence** — see §5.
 
 Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, then the two
 evidence records: `docs/evidence/2026-08-19-acp-v1-conformance.md` (A1–A19, the ACP bridge) and
@@ -91,9 +94,12 @@ justifies the next one. Ordered:
    this architecture *those are the integration points*, and their binding assurance is
    **completely unmeasured** — everything in A12–A19 characterises the ACP bridge, which
    should not be in Claude's path at all. *Done.*
-3. **Delete, in an order that keeps devbox working.** ← **YOU ARE HERE.** Start with what the fence proved is
-   unused. The lease/claim surface inside `db.py`/`schema.py` comes last because it is
-   entangled with schema versions that the deployed daemon still reads.
+3. **Delete, in an order that keeps devbox working.** ← **YOU ARE HERE.** Order and gates:
+   `docs/plans/2026-08-20-execution-plane-deletion-order.md`. Tranche 1 (session wrapper,
+   970 LOC) is done. Tranche 2 (`server.py`) is gated on removing a declared cluster
+   deployment; tranche 3 (the daemon-only execution plane, **4,480 LOC**) is gated on devbox
+   stopping `actionq-dispatch.service`; tranche 4 (lease/claim inside `db.py`/`schema.py`) is
+   extraction, not deletion, and comes last.
 
 *Done when the whole thing is done:* what remains is work identity, relations and revisions;
 authority; evidence requirements and acceptance; references to external executions;
@@ -123,6 +129,9 @@ daemon, no queue, no leases, no fan-out engine.**
 | Ambient user config is **part of the execution identity** for Codex | `~/.codex/config.toml` supplied `gpt-5.6-luna` on a dispatch that requested nothing | N7 |
 | Copilot **has** a proven noninteractive path and the best binding of the four | `copilot -p … --allow-all-tools --output-format json`; `model.call_start` precedes the call | N12, N13 |
 | `base.py`'s "never inspect output for meaning" contract is the obstacle to binding assurance | every read-back above requires inspecting output; reconciliation belongs *just above* the adapter | N5, N6–N13 |
+| Deleting on `main` **cannot** break the running devbox daemon | devbox has its own checkout, pinned fail-closed to `ab0dfb7` — a revision that is not an ancestor of `main`; adoption needs two explicit acts | deletion-order doc |
+| `cli.py` is a **daemon dependency via subprocess**, with zero import edges | `daemon_clients` shells `actionctl_bin`; the tmux unit runs `actionctl check-compatibility` before start | deletion-order doc |
+| Import closure alone is **not** a deletion criterion here | it misses `cli.py` (subprocess), `migrations/` (package data), `vuoro.py` (imported out of process) and `server.py` (cluster deployment) | deletion-order doc |
 | Providers are **not fungible** for subscription work | OpenCode cannot use Claude Pro/Max; Agentic Workflows use provider credentials | plan doc |
 | Work state stays ours | adopting GitHub Issues means adopting its meaning of open/closed in place of `ready\|claimed\|blocked\|accepted\|rejected\|superseded\|integrated` | plan doc |
 
@@ -173,6 +182,9 @@ perform.
 - **Redirecting `2>&1` while probing a `--output-format json` CLI manufactures false findings.**
   Copilot writes its `--model` rejection to stderr and keeps stdout valid JSONL; merging the
   streams made it look like a broken JSON contract. Keep the streams separate.
+- **`actionq/migrations/` reads as unreachable and is live.** Its `__init__.py` is one line and
+  nothing imports the package; it holds the twelve `.sql` assets `schema.py` applies as package
+  data. Never delete a package on import-graph evidence alone.
 - **Never `pgrep -f` a pattern your own command line contains.** A cleanup loop matched its
   own ssh invocation and killed its own session mid-run. Use `[b]in/postgres` style.
 - **Disposable test clusters leak on abnormal exit.** `pytest_unconfigure` does not run under
@@ -202,8 +214,14 @@ perform.
   - `opencode.py` stays unverified until one turn completes somewhere; fix the missing `--`
     prompt separator and pass `--format json` when it does.
   - Model reconciliation belongs **above** the adapter, per `base.py`'s contract (N5, point 3).
-- **PR #29 is open** on `evidence/native-harness-qualification`, now carrying both
-  qualification records and the probe. Merge it before starting step 3.
+- **Step 3 is gated on two decisions that are yours, not further measurement.** The evidence for
+  both is already recorded; waiting cannot add to it.
+  1. **Remove the `actionq-server` cluster deployment?** Unblocks tranche 2 (416 LOC). It is
+     declared in `appservice/.../actionq-server/` with `prune: true`; deleting the directory
+     deletes the workload. *Not verified live from this host — no appservice kubecontext here.*
+  2. **Stop `actionq-dispatch.service` on devbox for good?** Unblocks tranche 3 — **4,480 LOC**,
+     the execution plane proper, and the point of the whole goal. F9 is the argument; F4–F8 showed
+     the fence held with nothing noticing. It runs today only because it was resumed by decision.
 - ~~Audit `actionq-dispatcher`'s remote branches~~ **done, clean** — one remote branch, PR #1
   MERGED, 0 commits not in `main`. The earlier `gh pr list` failure was the repo-name mismatch
   in §4, not an unaudited backlog.
