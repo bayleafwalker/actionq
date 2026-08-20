@@ -288,13 +288,11 @@ def _statements(asset: MigrationAsset, schema: str) -> tuple[str, ...]:
     return tuple(statement.strip() for statement in rendered.split(";") if statement.strip())
 
 
-def _row(row: Any, key: str, index: int = 0) -> Any:
-    return row[key] if isinstance(row, dict) else row[index]
+_row = db.row_value
 
 
 def _ledger_exists(conn: Any, schema: str) -> bool:
-    row = conn.execute("SELECT to_regclass(%s) AS relation", (db.qname(schema, MIGRATION_TABLE),)).fetchone()
-    return bool(row and _row(row, "relation"))
+    return db.migration_ledger_exists(conn, schema, MIGRATION_TABLE)
 
 
 def _strip_pg_catalog_qualifier(text: str) -> str:

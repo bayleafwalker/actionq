@@ -349,6 +349,17 @@ def qname(schema: str, table: str) -> str:
     return f'"{schema}"."{table}"'
 
 
+def row_value(row: Any, key: str, index: int = 0) -> Any:
+    """Read a psycopg row cell by name (dict rows) or position (tuple rows)."""
+    return row[key] if isinstance(row, dict) else row[index]
+
+
+def migration_ledger_exists(conn: Any, schema: str, table: str) -> bool:
+    """Whether a domain's migration ledger table exists in ``schema``."""
+    row = conn.execute("SELECT to_regclass(%s) AS relation", (qname(schema, table),)).fetchone()
+    return bool(row and row_value(row, "relation"))
+
+
 def connect(url: str | None = None):
     db_url = url or os.environ.get("ACTIONQ_URL")
     if not db_url:
