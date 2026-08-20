@@ -76,8 +76,18 @@ is no GitHub review thread to resolve. This revision adjudicates every supplied 
 | Catalog transition was abstract | Choose clean-break `federation/v1`, served beside frozen `execution/v1`, with exact global revision and release order below. |
 | Test commands were not executable contracts | Use `ACTIONQ_TEST_URL`; give the Vuoro validator exact `MANIFEST`/`WHEEL_DIRECTORY` arguments and pin its source revision per W4. |
 | W1 inventory was prose only | Require a checked-in machine-readable reachability manifest and a completeness test. |
-| `actionq-runner` was deferred indefinitely | Make its retire/extract/transfer decision and zero-root-reach proof a final closure dependency before W7. |
+| `actionq-runner` was deferred indefinitely | Make its retire/extract/transfer decision and zero-root-reach proof a W6 closure dependency. |
 | README/HANDOFF mixed repository and deployment state | Separate repository truth from historical deployment observations; no deployment claim is refreshed by this PR. |
+
+The coordinator's second review blocked head `0561685` on executable consistency. Its four
+findings are adjudicated as follows:
+
+| Finding | Adjudication frozen here |
+|---|---|
+| Actor authority and database roles were conflated; ownership/supersede was incomplete | Separate end-actor ACL from service/migration/archive PG roles; immutable creator ownership, no v1 transfer, and explicit owner-scoped `federation.supersede`. |
+| W4 proved only a mutable/current four-domain tree | Preserve an immutable four-domain baseline and require an exact future candidate SHA, released-wheel fetch/digest stage, and new five-domain whole-composition validator. |
+| W5 mixed repository intent with deployment truth; W7 implied deletion authority | Require fresh environment-bound auditctl evidence for every writer/credential/grant/denial surface; explicitly leave W7 unauthorized pending a separate destructive plan. |
+| Release order admitted ambiguous partial rollout | Freeze ActionQ merge → exact wheel publish → migration → exact Vuoro candidate validation → Vuoro merge/release/deploy → rediscovery → current evidence → W5 fence; dormant source merge is distinct from serving. |
 
 ## Reachability inventory
 
@@ -99,7 +109,7 @@ deletion.
 | CLI | `actionctl migrate`, compatibility, queue/group/claim/settle/publication/event/session commands | operators, Vuoro migration Job, Vuoro cloud/preflight, gitops/devbox scripts, q-spec | Retain migration/compatibility and federation/evidence/reconciliation reads/writes. Version and deprecate legacy commands before removal. Never silently reinterpret `claim` as resource CAS. |
 | Vuoro adapter | `actionq.vuoro`, 26-operation execution catalog and compatibility record | Vuoro composition and released-adapter pin validators; specialized composition verification | Publish a new catalog version containing federation resources, refs, evidence, acceptance and reconciliation only. Claim/renew/settle, enqueue/managed dispatch and execution groups do not cross the new boundary. Old hashes remain pinned for archive compatibility until explicit cutover. |
 | Migration assets | execution-domain `actionq/migrations/001`–`012`; loaded as `actionq` package data; ledger uses domain/version/name/checksum | wheel packaging, migration CLI, deployment migration Job, schema tests | Freeze bytes, names, versions, order, `DOMAIN=execution`, `API_VERSION=v1`, and maximum 12. Federation starts at its own v1 migration/schema domain and never adds execution migration 013. |
-| `actionq-runner` workspace package | separate portable executor/publisher/candidate code, reachable from its own scripts/tests, not from the retained federation root | package-specific consumers and tests | Out of the storage package, but not indefinitely deferred. A reviewed retire/extract/transfer disposition and proof that federation roots do not reach it are mandatory W6/W7 closure gates. |
+| `actionq-runner` workspace package | separate portable executor/publisher/candidate code, reachable from its own scripts/tests, not from the retained federation root | package-specific consumers and tests | Out of the storage package, but not indefinitely deferred. A reviewed retire/extract/transfer disposition and proof that federation roots do not reach it are mandatory W6 closure gates. |
 | Retired dispatcher | `actionq-dispatcher` tombstone PR #2 merged at `510822a`; release `actionq-dispatcher-v0.2.0` publishes the retirement | stale q-spec, ActionQ historical protocol/README language, root and generated agent guidance | Retired, not a compatibility launcher. No tranche-4 work may dispatch through it. Remove stale normative references under their owning repositories; preserve historical receipts as evidence. |
 | Vuoro repository | `packages/vuoro-service/.../composition.py`; adapter pins; released catalog validators; pre-migration script; migration Job | deployed and release composition | Blocking consumer. W4 must land coordinated pins/composition before W5 removes legacy catalog operations. Deployment mutation remains separate operator work. |
 | q-spec | `actionq-spec.md` and `dispatcher-spec.md` still define claim/daemon/CLI queue as a normative contract | architectural readers | Stale after dispatcher retirement. Supersede in q-spec in a separately owned change, explicitly citing the tombstone release and native-runtime/ActionQ-federation boundary; do not treat either file as a tranche-4 oracle or implementation contract. |
@@ -184,8 +194,11 @@ but can never infer v1 acceptance or settlement.
 
 ### Actor and ACL matrix
 
-Authorization is evaluated before aggregate transition rules; expected-revision CAS only
-prevents concurrent overwrite and never grants authority.
+Authenticated actor authority and PostgreSQL role privilege are separate layers. Vuoro/CLI
+authenticates the end actor; the federation command service evaluates the authority below in
+the same transaction that durably records its accepted/rejected decision, before any aggregate
+change. End actors receive no database credentials. Expected-revision CAS only prevents
+concurrent overwrite and never grants authority.
 
 | Actor class | Allowed v1 commands | Forbidden even with current revision |
 |---|---|---|
@@ -194,15 +207,37 @@ prevents concurrent overwrite and never grants authority.
 | evidence ingester (`federation.evidence.ingest`) | record verified evidence | acceptance, settlement, relation ownership changes |
 | acceptance reviewer (`federation.acceptance.decide`) | accepted/rejected decision under named policy | execution control, Sprintctl mutation, schema/archive writes |
 | reconciler (`federation.settlement.record`) | record ActionQ-local settlement against cited facts | native terminal transition, Sprintctl mutation |
+| owning superseder (`federation.supersede`) | supersede a resource whose immutable owner is the actor | ownership transfer, target mutation, execution/Sprintctl control |
 | federation reader (`federation.read`) | unredacted authorized federation reads | all writes |
 | archive reader (`execution.archive.read`) | redacted legacy projection after W5 | raw secrets/receipts/proofs and all writes |
 | backfill principal (`federation.backfill`) | deterministic provenance import before cutover | acceptance/settlement inference, normal serving |
-| migration principal | DDL and migration-ledger writes for its selected domain | application decisions |
+| migration principal | DDL and its selected domain's migration ledger only | resource, change, command-decision, acceptance and settlement writes |
 
 Relations are directed (`source_ref`, `relation_type`, `target_ref`). The source aggregate owns
-the edge; creation requires write authority on the source and does not mutate or increment the
-target. V1 types are `parent-of`, `depends-on`, `derived-from`, and `supersedes`; self-edges are
-invalid, and `parent-of`/`depends-on` cycle checks run in the same transaction.
+the edge; creation requires `federation.relate` plus equality between the authenticated actor's
+stable `principal_id` and the source's immutable `owner_principal_id`. `create` stores the
+authenticated creator as owner. V1 has **no ownership transfer**; correction requires creating
+a new resource and relating/superseding the old one under both commands' ACLs. The edge does
+not mutate or increment the target. V1 types are `parent-of`, `depends-on`, `derived-from`, and
+`supersedes`; self-edges are invalid, and `parent-of`/`depends-on` cycle checks run atomically.
+
+PostgreSQL roles are frozen separately:
+
+| Database role | Direct database privilege |
+|---|---|
+| federation migration principal | federation-schema DDL and federation migration-ledger writes only |
+| execution migration principal | frozen execution-schema DDL path and execution migration-ledger writes only; no federation access |
+| federation command service | narrowly scoped transactional DML on federation resources, resource-change ledger, command-decision ledger and idempotency binding; no DDL/migration-ledger writes |
+| authenticated end actor | none; acts only through the federation service after authority evaluation |
+| legacy runtime credential | temporary execution-compatibility DML before W5 only; never federation DML; target privilege is zero direct DB access after W5 |
+| archive reader | after W5, SELECT on redacted archive views only; no base-table, sequence or federation write privilege |
+
+Only the federation command service may atomically write a resource projection, its resource-
+change ledger row, and its command-decision row. Its database privilege does not bypass actor
+authorization: missing/denied actor authority produces a durable rejected command decision and
+no resource/change write. The target state gives both end actors and legacy runtime credentials
+zero direct database write privilege; the pre-W5 execution-only grant is the explicitly bounded
+compatibility exception removed by W5.
 
 ### Command-decision ledger
 
@@ -234,8 +269,10 @@ does not inspect or mutate aggregate state.
    a lease deadline, or an execution-schema foreign key.
 3. Backfill is restartable and monotonic. A source row maps to a stable destination identity
    and digest; a retry produces no second logical resource or change.
-4. The migration principal retains DDL/ledger authority. Runtime/federation principals get
-   only the minimum table/sequence capabilities and never schema `CREATE` or ledger writes.
+4. Each migration principal has DDL plus writes to its own migration ledger only. The
+   federation command service alone gets minimum resource/change/decision DML and never schema
+   `CREATE` or migration-ledger writes. End actors have no DB role; legacy runtime credentials
+   never receive federation access and reach zero direct DB privilege at W5.
 5. Execution and federation migration selections are explicit CLI/config inputs; an execution
    v12 compatibility result never claims federation readiness. Moving either loader later
    requires byte-identical assets and compatibility against copied schemas.
@@ -282,11 +319,23 @@ does not inspect or mutate aggregate state.
    discovered global revision; a missing or mismatched revision is rejected as `stale-catalog` before
    authorization, handler, or decision-ledger execution, with no ActionQ write. Clients must
    rediscover and issue a new deliberate request; Vuoro never transparently retries a mutation.
-4. Release order is fixed: ActionQ release with federation schema/application/catalog support;
-   federation migration by its migration principal; released ActionQ wheel and full SHA;
-   Vuoro manifest PR pinning that artifact and adding the separate descriptor; Vuoro release;
-   client rediscovery; zero-writer evidence; W5 database fence. A later Vuoro release may
-   remove `execution/v1`, causing another global revision change. No partial order is supported.
+4. Release/cutover order is fixed:
+   1. merge dormant ActionQ federation source;
+   2. build and publish the exact ActionQ wheel, recording full source SHA, artifact URL and
+      SHA-256;
+   3. run the federation migration job using that exact released wheel;
+   4. validate the exact-SHA five-domain Vuoro candidate manifest/composition against the
+      fetched/digest-verified wheel set;
+   5. merge Vuoro, then release and deploy that validated composition;
+   6. require clients to rediscover the new global catalog revision;
+   7. capture current durable-authoritative zero-writer evidence;
+   8. execute the W5 database privilege fence.
+
+   Preparatory source may be merged while its serving path is dormant; what is forbidden is
+   partial serving or cutover (serving federation before migration, serving an unvalidated or
+   unpinned composition, fencing before deployment/rediscovery/evidence, or silently removing
+   `execution/v1`). A later separately validated Vuoro release may remove `execution/v1`,
+   causing another global revision change.
 5. Root imports and `actionctl migrate` remain compatibility facades while Vuoro and operator
    consumers cut over. The facade must delegate without importing application or execution
    policy into the storage boundary.
@@ -377,9 +426,12 @@ ACTIONQ_TEST_URL="$DISPOSABLE_URL" uv run --extra dev pytest \
 Falsifier: execution bytes/checksums/maximum drift; execution 013 exists; federation root
 requires execution schema; expected-absence or stale revision writes; denied/rejected command
 changes a resource or is absent from the decision ledger; relation mutates its target; retry
-after response loss changes response; runtime role writes either ledger; or execution v12 and
-federation v1 cannot be checked independently. `$DISPOSABLE_URL` names a task-owned disposable
-database/schema only.
+after response loss changes response; owner mismatch writes or ownership can transfer; an end
+actor or legacy runtime credential directly writes a federation resource, resource-change
+ledger, command-decision ledger, idempotency binding, or federation migration ledger; the
+migration principal writes the resource-change or command-decision ledger; the command service
+writes either execution/federation migration ledger; or execution v12 and federation v1 cannot
+be checked independently. `$DISPOSABLE_URL` names a task-owned disposable database/schema only.
 
 ### W3 — deterministic backfill and rebuild
 
@@ -401,25 +453,64 @@ objective cannot be restored.
 ### W4 — dual-read application and clean Vuoro catalog
 
 Add separate `federation/v1` application/catalog while retaining `execution/v1` byte-for-byte.
-Coordinate Vuoro composition/pins in its own repository and PR. The validator baseline is
-Vuoro revision `9dc7efa8d3f546851218f49da7653f806d5e8ca4`; changing it requires an oracle amendment.
+Coordinate Vuoro composition/pins in its own repository and PR. Validation has two distinct
+gates; the immutable four-domain baseline is not evidence for the future five-domain candidate.
 
 ```bash
 uv run --extra dev pytest tests/test_vuoro_adapter_integration.py \
   tests/test_federation_catalog_contract.py tests/test_dispatch_v2_contract.py -q
-test "$(git -C /projects/dev/vuoro rev-parse HEAD)" = \
-  9dc7efa8d3f546851218f49da7653f806d5e8ca4
-MANIFEST=/projects/dev/vuoro/packages/vuoro-service/composition/adapter-pins.json
-WHEEL_DIRECTORY=/tmp/actionq-vuoro-release-wheels
-uv run --project /projects/dev/vuoro python \
-  /projects/dev/vuoro/scripts/validate_released_execution_adapter.py \
-  "$MANIFEST" "$WHEEL_DIRECTORY"
+
+# Baseline: immutable Vuoro commit; proves four domains and frozen execution/v1.
+VUORO_BASELINE_SHA=9dc7efa8d3f546851218f49da7653f806d5e8ca4
+VUORO_BASELINE_TREE=/tmp/vuoro-baseline-9dc7efa8
+git -C /projects/dev/vuoro worktree add --detach "$VUORO_BASELINE_TREE" "$VUORO_BASELINE_SHA"
+BASELINE_MANIFEST="$VUORO_BASELINE_TREE/packages/vuoro-service/composition/adapter-pins.json"
+BASELINE_WHEELS=/tmp/vuoro-baseline-wheels-9dc7efa8
+uv run --project "$VUORO_BASELINE_TREE" python \
+  "$VUORO_BASELINE_TREE/scripts/fetch_pinned_adapters.py" \
+  "$BASELINE_MANIFEST" "$BASELINE_WHEELS"
+uv run --project "$VUORO_BASELINE_TREE" python \
+  "$VUORO_BASELINE_TREE/scripts/validate_released_execution_adapter.py" \
+  "$BASELINE_MANIFEST" "$BASELINE_WHEELS"
+uv run --project "$VUORO_BASELINE_TREE" python \
+  "$VUORO_BASELINE_TREE/scripts/validate_released_catalog_composition.py"
+
+# Candidate: work-packet coordinator supplies a literal full commit SHA, never HEAD/branch/tag.
+test "${VUORO_CANDIDATE_SHA:?exact 40-hex candidate SHA required}" != HEAD
+[[ "$VUORO_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+VUORO_CANDIDATE_TREE="/tmp/vuoro-candidate-$VUORO_CANDIDATE_SHA"
+git -C /projects/dev/vuoro worktree add --detach \
+  "$VUORO_CANDIDATE_TREE" "$VUORO_CANDIDATE_SHA"
+CANDIDATE_MANIFEST="$VUORO_CANDIDATE_TREE/packages/vuoro-service/composition/adapter-pins.json"
+CANDIDATE_WHEELS="/tmp/vuoro-candidate-wheels-$VUORO_CANDIDATE_SHA"
+uv run --project "$VUORO_CANDIDATE_TREE" python \
+  "$VUORO_CANDIDATE_TREE/scripts/fetch_pinned_adapters.py" \
+  "$CANDIDATE_MANIFEST" "$CANDIDATE_WHEELS"
+uv run --project "$VUORO_CANDIDATE_TREE" python \
+  "$VUORO_CANDIDATE_TREE/scripts/validate_released_federation_composition.py" \
+  "$CANDIDATE_MANIFEST" "$CANDIDATE_WHEELS" \
+  --source-revision "$VUORO_CANDIDATE_SHA"
 ```
 
-Falsifier: new catalog uses `execution/*`; contains claim/lease/managed-dispatch/group/harness
-fields; old hashes drift; stale global revision reaches ActionQ; external execution ref is a
-launch instruction; mutation omits expected revision; manifest pin lacks exact ActionQ/Vuoro
-SHAs, wheel digest or separate federation descriptor; or release order differs from above.
+`fetch_pinned_adapters.py` is the required fetch/stage procedure: it accepts only canonical
+GitHub release-wheel URLs from the manifest, downloads each exact artifact into the supplied
+task-owned directory, verifies every manifest SHA-256, and rejects an existing mismatched file.
+The candidate version must require exactly the five selected domains rather than the baseline
+script's four. The new whole-composition validator is a required Vuoro-candidate deliverable. It must prove
+exactly five descriptors (`work`, frozen `execution/v1`, `federation/v1`, `knowledge`, `audit`),
+legacy execution operation bytes/hashes, a changed global revision, federation actor ACL and
+expected-revision schemas, and stale-catalog rejection before any ActionQ write.
+It emits a validation record bound to the literal `VUORO_CANDIDATE_SHA` passed above; branch,
+tag, working-tree state and symbolic `HEAD` are never source-revision proof.
+
+Falsifier: baseline is not the literal pinned commit or fails its four-domain/global-revision/
+execution-v1 assertions; candidate uses a mutable ref or lacks a literal full SHA; a wheel was
+not fetched from the manifest and digest-verified; candidate lacks the five-domain validator;
+new catalog uses `execution/*` or contains claim/lease/managed-dispatch/group/harness fields;
+old execution hashes drift; global revision is unchanged; stale revision reaches ActionQ;
+external execution ref is a launch instruction; mutation omits expected revision/ACL; manifest
+lacks exact ActionQ/Vuoro SHAs, wheel digest or separate federation descriptor; or release
+order differs from below.
 
 ### W5 — consumer cutover and legacy-write fence
 
@@ -429,15 +520,38 @@ legacy writer credentials, revoke DML/sequence privileges from runtime roles, an
 distinct archive-reader role only redacted views that exclude claim receipts, runner proofs,
 request payload secrets and credentials. Database grants—not Python routing—are the fence.
 
+W5 requires a fresh, durable-authoritative evidence set. Pre-fence records 1–4 are captured
+after Vuoro deployment/client rediscovery and no more than one hour before the fence. Post-fence
+records 3–7 are recaptured/completed no more than one hour after it; W5 is incomplete until
+they pass. Each auditctl record binds `captured_at`, environment/cluster identifier, database
+endpoint fingerprint (no secret), ActionQ/Vuoro release and deployment revisions, actor,
+command/tool versions and result digest. The required records are:
+
+1. complete consumer inventory plus a machine diff against the W1 reachability manifest;
+2. served catalog and installed CLI writer-surface scans proving no supported legacy writer;
+3. database role **and credential** inventory, including owner/membership inheritance;
+4. effective table and sequence grants for execution base tables, archive views, federation
+   tables, resource-change ledger, command-decision ledger and both migration ledgers;
+5. denial receipts using each former runtime credential for direct table DML and sequence use;
+6. denial receipts from the actually installed old ActionQ wheel, not a source-tree simulation;
+7. archive-reader receipts proving required redaction and denial of base-table/federation writes.
+
+Repository tests below prove code intent only. They are not current deployment evidence and
+cannot substitute for the timestamped, environment-bound auditctl records. A host-local bundle
+may index the records but is not the durable authority.
+
 ```bash
 uv run --extra dev pytest tests/test_legacy_write_fence.py \
   tests/test_repository_retirement_contract.py tests/test_release_contract.py -q
 ```
 
-Falsifier: claim/renew/settle/enqueue/group mutation is reachable from a supported surface; an
+Falsifier: any required audit record is missing, stale, environment-unbound, lacks a result
+digest, or differs from the current releases/deployment; consumer diff is nonempty;
+claim/renew/settle/enqueue/group mutation is reachable from a supported surface; an
 old installed binary or direct SQL using former runtime credentials can insert/update/delete
 legacy rows or use sequences; archive reader sees raw fenced fields or writes base tables; the
-fence changes historical rows; or rollback silently re-grants legacy execution ownership.
+fence changes historical rows; a repository test is presented as deployment evidence; or
+rollback silently re-grants legacy execution ownership.
 
 ### W6 — internal storage boundary and closure dependencies
 
@@ -457,12 +571,15 @@ Falsifier: execution asset/ledger changes; domains cannot migrate/check independ
 imports policy/execution modules; root facade changes output; rollback loses a federation fact;
 federation imports `actionq-runner`; or runner disposition/zero-reach evidence is absent.
 
-### W7 — archive retirement (later operator decision)
+### W7 — destructive archive retirement (not authorized)
 
-Delete legacy mutation code only after the pre-W3 retention contract, zero-consumer proof,
-durable-authoritative export/restore rehearsal, and final `actionq-runner` disposition. Archive
-row deletion, old catalog removal and execution migration-loader compatibility removal are
-separate irreversible decisions, not implied by W1–W6.
+This oracle does **not** authorize W7, archive row deletion, old catalog removal, execution
+migration-loader removal, credential destruction, or retention expiry. W7 requires a separate
+ratified destructive-retirement plan after W1–W6, the pre-W3 retention/export/restore contract,
+current zero-consumer evidence, restore rehearsal, and final `actionq-runner` disposition. That
+future plan must name exact targets, backups, restore tests, evidence freshness, rollback point,
+operator approvals and destruction commands. Until it is approved, the archive and its redacted
+read path remain.
 
 ## Dispatch and review graph
 
@@ -488,11 +605,12 @@ W5 zero-consumer proof + legacy-write fence -> operator cutover decision
 W6 internal storage seam + runner disposition -> R5 boundary/closure review
                          |
                          v
-W7 archive retirement -> separate retention/destruction authorization
+W7 destructive retirement -> NOT AUTHORIZED; separate ratified plan required
 ```
 
 W1 and W2 are ActionQ owner work. W3 should be implemented independently from its reviewer.
-W4 has separate ActionQ and Vuoro owners but cannot merge as a partial catalog cutover. The
+W4 has separate ActionQ and Vuoro owners. Dormant prerequisite source can merge in the frozen
+order, but no partial catalog may be served or cut over. The
 q-spec supersession and root/agentops generated-guidance cleanup are separate documentation
 work packets owned outside this branch; both must cite the dispatcher tombstone rather than
 preserve a compatibility-launcher fiction. W5 requires current external-consumer evidence.
@@ -509,5 +627,7 @@ The following are real decisions and are intentionally not guessed here:
 4. Approve any deployment/schema migration execution; this plan authorizes none.
 5. If a second real consumer appears, decide whether it justifies superseding the chosen
    internal `actionq.storage` boundary with a published distribution.
-6. Before W7, ratify the separate retire/extract/transfer disposition of `actionq-runner`;
-   unresolved ownership blocks tranche-4 closure.
+6. Before W6 closes, ratify the separate retire/extract/transfer disposition of
+   `actionq-runner`; unresolved ownership blocks tranche-4 closure.
+7. Decide whether to commission and ratify a separate destructive W7 plan. This oracle leaves
+   retirement unauthorized; indefinite redacted archive retention is the safe default.
