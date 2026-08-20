@@ -60,7 +60,11 @@ class _EndpointLockGate:
             ):
                 state["n"] += 1
                 if state["n"] == 2:
-                    self.barrier.wait()
+                    # A bounded timeout turns "the other side errored out
+                    # before reaching its second endpoint lock" into a clear
+                    # BrokenBarrierError instead of hanging the test (and the
+                    # whole run) indefinitely.
+                    self.barrier.wait(timeout=30)
             return result
 
         conn.execute = gated_execute
@@ -153,6 +157,24 @@ def test_snapshot_requires_authenticated_federation_read_authority(postgres_urls
     with pytest.raises(db.ActionQError):
         authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref="not-a-federation-ref")
     assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=resource)["resource_ref"] == resource
+
+
+def test_unserializable_request_argument_raises_public_error_not_a_bare_typeerror(postgres_urls) -> None:
+    # _execute() canonicalizes the whole request dict to derive request_digest
+    # before any transaction opens, so a caller argument that json.dumps
+    # cannot serialize (e.g. bytes where a resource_ref str is expected)
+    # cannot become a durable "malformed-command" decision the way a bad
+    # value *inside* apply() does -- there is no digest to key it with. It
+    # must still surface as the module's public exception, not leak the
+    # underlying TypeError the way every other command-argument failure in
+    # this module does not.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    owner = _principal("owner", "federation.supersede")
+
+    with pytest.raises(db.ActionQError):
+        authority.supersede(principal=owner, idempotency_key="bad-arg", resource_ref=b"not-a-string", expected_revision=0)
 
 
 def test_malformed_command_with_valid_idempotency_identity_is_durable_and_replayable(postgres_urls) -> None:
@@ -451,7 +473,8 @@ def test_disjoint_endpoint_relation_attempts_cannot_jointly_create_a_cycle(postg
             executor.submit(relate, owners["b"], "b-to-c", nodes["b"], nodes["c"], 1),
             executor.submit(relate, owners["d"], "d-to-a", nodes["d"], nodes["a"], 1),
         ]
-        decisions = [future.result() for future in results]
+        decisions = [future.result(timeout=30) for future in results]
+    gate.armed = False
 
     assert sorted(decision.status for decision in decisions) == ["accepted", "rejected"]
     assert {decision.code for decision in decisions} == {"accepted", "relation-cycle"}

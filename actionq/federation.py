@@ -195,7 +195,18 @@ class FederationAuthority:
                  request: dict[str, Any], apply: Callable[[Any], tuple[str, int | None, int | None]]) -> CommandDecision:
         if not idempotency_key:
             raise ValueError("federation commands require a non-empty idempotency key")
-        request_bytes = canonical_bytes(request)
+        try:
+            request_bytes = canonical_bytes(request)
+        except (TypeError, ValueError) as malformed:
+            # This cannot become a durable "malformed-command" rejected
+            # decision the way apply()'s failures do: request_digest, the
+            # value that keys that decision, is exactly what failed to
+            # compute. Raise a public exception instead of letting the
+            # underlying TypeError (e.g. "Object of type bytes is not JSON
+            # serializable") leak straight from a caller's malformed
+            # argument -- every other command-argument failure in this
+            # module surfaces as db.ActionQError or a rejected decision.
+            raise db.ActionQError(f"command request could not be serialized: {malformed}") from malformed
         request_digest = _digest(request_bytes)
         with self.connection() as conn, conn.transaction():
             federation_schema.require_compatible(conn, self.schema)
