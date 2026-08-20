@@ -559,7 +559,7 @@ Create internal `actionq.storage` modules, retain root compatibility facades and
 schema rollback. Do **not** create a distribution or inspect a new storage wheel without a
 second real consumer and separately ratified packaging RFC. Resolve `actionq-runner` by a
 separate reviewed retire/extract/transfer decision and prove federation roots have no reach to
-it; unresolved disposition blocks W7.
+it; unresolved disposition blocks W6 closure.
 
 ```bash
 uv run --extra dev pytest tests/test_storage_boundary.py \
