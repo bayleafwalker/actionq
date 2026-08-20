@@ -438,6 +438,15 @@ class FederationAuthority:
             state = str(row["state"])
             if outcome not in {"accepted", "rejected"} or not isinstance(policy_ref, str) or not policy_ref:
                 raise _Rejected("invalid-acceptance", "outcome and named policy are required", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            if evidence_ref is not None and not isinstance(evidence_ref, str):
+                # Checked unconditionally, not only on the accepted branch
+                # below: on the rejected branch evidence_ref (nullable) goes
+                # straight to the INSERT with no type guard at all, so a
+                # non-str/non-None value either got silently assignment-cast
+                # and durably stored under a status="accepted" response, or
+                # (for a type psycopg can't cast at all) leaked a bare
+                # psycopg error past _execute's durability handler.
+                raise _Rejected("invalid-evidence-reference", "evidence_ref must be a string or None", resource_ref=resource_ref, before_revision=int(row["revision"]))
             allowed = state == "evidence-recorded" if outcome == "accepted" else state in {"registered", "evidence-recorded"}
             if not allowed:
                 raise _Rejected("invalid-state-transition", "acceptance decision is invalid for current state", resource_ref=resource_ref, before_revision=int(row["revision"]))

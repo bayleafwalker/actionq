@@ -333,6 +333,40 @@ def test_non_string_free_form_fields_are_rejected_not_silently_stored_or_crashed
         ).fetchone()["n"] == 0
 
 
+def test_decide_acceptance_type_checks_evidence_ref_on_the_rejected_path_too(postgres_urls) -> None:
+    # evidence_ref was only isinstance-checked inside the outcome=="accepted"
+    # branch; on the rejected branch a non-str/non-None value went straight
+    # to the INSERT with no guard, either getting silently assignment-cast
+    # and durably stored under a command decision that reports the command
+    # itself succeeded, or (for a type PostgreSQL can't cast at all) leaking
+    # a bare psycopg error past _execute's durability handler.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("owner", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+
+    decision = authority.decide_acceptance(
+        principal=_principal("reviewer", "federation.acceptance.decide"), idempotency_key="bad-evidence-ref",
+        resource_ref=resource, outcome="rejected", policy_ref="policy:v1",
+        evidence_ref=12345, expected_revision=1,
+    )
+    assert decision.status == "rejected" and decision.code == "invalid-evidence-reference"
+    with db.connect(postgres_urls["admin"]) as conn:
+        assert conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_acceptance_decisions')}"
+        ).fetchone()["n"] == 0
+    # None must remain legal on the rejected path -- the column is nullable
+    # and rejection commonly carries no evidence at all.
+    none_evidence = authority.decide_acceptance(
+        principal=_principal("reviewer", "federation.acceptance.decide"), idempotency_key="no-evidence",
+        resource_ref=resource, outcome="rejected", policy_ref="policy:v1",
+        evidence_ref=None, expected_revision=1,
+    )
+    assert none_evidence.status == "accepted" and none_evidence.after_revision == 2
+
+
 def test_missing_assurance_type_is_distinguished_from_evidence_or_reference_mismatch(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
