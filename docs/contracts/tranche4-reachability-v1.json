@@ -1,0 +1,1020 @@
+{
+  "contract_id": "actionq/tranche4-reachability-v1",
+  "status": "w1-reachability-pinned-no-code-movement",
+  "basis": {
+    "actionq_commit": "89ec87607d71af1156771db2e0c927d74017f5a0",
+    "w0_contract": "docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md",
+    "scope": "Static reachability and consumer classification only. This record does not authorize W2, code movement, schema, migration, catalog, deployment, runtime, or appservice mutation.",
+    "w0_ratification": {"decision_url":"https://github.com/bayleafwalker/actionq/pull/31#issuecomment-5353774023","decision_comment_id":5353774023,"independent_review_accepted_head":"f6750e47edeb9f3a60c23059cd638604ac0d40a4","nonblocking_final_editorial":"2d0e4abdcf673a8831a9e754b32264bde8a6f438","merge":"89ec87607d71af1156771db2e0c927d74017f5a0","ci_run":"32347566284","ci_job":"96359442888","status":"R0-owner-ratified-and-merged-before-W1"}
+  },
+  "dispositions": [
+    "retain-as-frozen-archive",
+    "replace-by-federation",
+    "historicalize/delete",
+    "unresolved-owner-decision"
+  ],
+  "import_groups": [
+    {
+      "id": "retained-seams-to-replace",
+      "edges": [
+        "actionq.action_resource|from|actionq|db",
+        "actionq.application|from|actionq.application_completion|CompletionService",
+        "actionq.application|from|actionq.application_core|ACTION_RESOURCE_NOT_FOUND,ActionQCore,AuthenticatedActionResourcePrincipal,InvocationProvenance",
+        "actionq.application|from|actionq.application_enqueue|EnqueueService",
+        "actionq.application|from|actionq.application_outbox|OutboxService",
+        "actionq.application_completion|from|actionq.application_core|*",
+        "actionq.application_completion|from|actionq.application_core|_json_value",
+        "actionq.application_core|from|actionq|db",
+        "actionq.application_core|from|actionq.action_resource|ActionResourceOwner,ResourceNotFound,serialize_envelope",
+        "actionq.application_core|from|actionq.cas|_DaemonCAS",
+        "actionq.application_core|from|actionq.completion_log|CompletionLog",
+        "actionq.application_enqueue|from|actionq.application_core|*",
+        "actionq.application_outbox|from|actionq.application_core|*",
+        "actionq.cli|from|actionq|__version__",
+        "actionq.cli|from|actionq|db",
+        "actionq.cli|from|actionq|schema",
+        "actionq.cli|from|actionq.application|ActionQApplication",
+        "actionq.completion_log|from|actionq|db",
+        "actionq.completion_log|from|actionq|schema",
+        "actionq.db|from|actionq|schema",
+        "actionq.db|from|actionq.cas|_DaemonCAS",
+        "actionq.schema|from|actionq|db",
+        "actionq.vuoro|from|actionq|db",
+        "actionq.vuoro|from|actionq.application|ActionQApplication,InvocationProvenance",
+        "actionq.vuoro|from|actionq_contracts|DISPATCH_STOP_REASONS,DISPATCH_TERMINAL_STATUSES"
+      ],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "A new or missing local edge is absent from the AST scan, or future storage imports application, CLI, Vuoro, runner, or execution policy."
+    },
+    {
+      "id": "legacy-execution-import-edges",
+      "edges": [
+        "actionq.application|from|actionq.application_claim|ClaimService",
+        "actionq.application|from|actionq.application_dispatch|DispatchService",
+        "actionq.application|from|actionq.application_groups|GroupService",
+        "actionq.application_claim|from|actionq.application_core|*",
+        "actionq.application_core|from|actionq.managed_dispatch|ManagedDispatchPolicy",
+        "actionq.application_core|from|actionq.runner_auth|VerifiedRunner,verify_runner_proof",
+        "actionq.application_dispatch|from|actionq.application_core|*",
+        "actionq.application_dispatch|from|actionq.application_core|CANONICALIZATION_VERSION,_DISPATCH_V2_FIELDS,_HARNESSES,_KIND_TO_ACTION_TYPE,_OUTPUT_EXPECTATIONS,_PRIORITIES",
+        "actionq.application_dispatch|from|actionq.managed_dispatch|admit_managed_enqueue",
+        "actionq.application_groups|from|actionq.application_core|*",
+        "actionq.db|from|actionq_contracts|ACTION_CREATION_REQUEST_V1,DISPATCH_RESULT_V1,EXECUTION_ENVELOPE_V1,canonical_bytes,require_compatible,sha256_digest",
+        "actionq.managed_dispatch|from|actionq.application_dispatch|DispatchService",
+        "actionq.runner_auth|from|actionq|db",
+        "actionq.runner_auth|from|actionq_contracts|RUNNER_AUTH_V1,canonical_bytes,require_compatible"
+      ],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "Claim, lease, managed dispatch, group, or runner-proof imports remain reachable from federation roots after their staged removal."
+    },
+    {
+      "id": "actionq-runner-import-graph",
+      "edges": [
+        "actionq_runner|from|actionq_runner.candidate_execution|integrate_wave,verify_candidate",
+        "actionq_runner|from|actionq_runner.identity|sign_runner_request",
+        "actionq_runner|from|actionq_runner.oci|OciPolicyError,oci_execute,oci_preflight",
+        "actionq_runner|from|actionq_runner.publisher|ArtifactStore,FilesystemCAS,acknowledge_settlement,artifact_ref,list_publications,publish,query_settlement,recover_publication,resume_publication",
+        "actionq_runner|from|actionq_runner.staging|AttemptSpool,collect,mark_reconciled,open_staging,quarantine,receive,seal,staging_dir",
+        "actionq_runner.acp|from|actionq_runner.acp.backends|AcpBackend,Billing,BindingAssurance,BindingChannel,ModelResolutionError,REGISTRY,binding_is_trustworthy,check_model_allowed,verify_bound_model",
+        "actionq_runner.acp|from|actionq_runner.acp.jsonrpc|JsonRpcError,JsonRpcTimeout,StdioJsonRpc",
+        "actionq_runner.acp|from|actionq_runner.acp.v1|AcpError,AcpExecutionAdapter,AgentCapabilities,ModelBindingError,PROTOCOL_VERSION",
+        "actionq_runner.acp|from|actionq_runner.context_policy|ContextPlan,verify_context_policy",
+        "actionq_runner.acp|from|actionq_runner.execution_boundary|BoundaryCheck,BoundaryReport,BoundaryViolation",
+        "actionq_runner.acp|from|actionq_runner.execution_contract|Assurance,BindingStatus,ContextUsage,ModelBinding",
+        "actionq_runner.acp.backends|from|actionq_runner.acp.v1|ModelBindingError",
+        "actionq_runner.acp.telemetry|from|actionq_runner.execution_contract|EventKind,ExecutionEvent",
+        "actionq_runner.acp.v1|from|actionq_runner.acp.jsonrpc|JsonRpcError,StdioJsonRpc",
+        "actionq_runner.acp.v1|from|actionq_runner.acp.telemetry|normalize_inbound",
+        "actionq_runner.acp.v1|from|actionq_runner.context_policy|ContextPlan,TokenCounter,verify_context_policy",
+        "actionq_runner.acp.v1|from|actionq_runner.execution_boundary|BaselineState,BoundaryCheck,BoundaryReport,snapshot_baseline,verify_after_completion,verify_before_dispatch",
+        "actionq_runner.acp.v1|from|actionq_runner.execution_contract|Assurance,BindingStatus,ContextUsage,EventKind,ExecutionEnvelope,ExecutionEvent,ExecutionOutcome,ModelBinding,PermissionDecision,RuntimeHandle,ToolCall",
+        "actionq_runner.candidate_execution|from|actionq_contracts|CANDIDATE_INTEGRATION_RESULT_V1,CANDIDATE_INTEGRATION_SPEC_V1,CANDIDATE_VERIFICATION_RESULT_V1,CANDIDATE_VERIFICATION_SPEC_V1,PUBLICATION_V1,VERIFICATION_PROFILE_V1,artifact_digest,canonical_bytes,require_compatible,sha256_digest",
+        "actionq_runner.candidate_execution|from|actionq_runner.candidates|CandidateRecoveryJournal,resolve_exact_contract",
+        "actionq_runner.candidate_execution|from|actionq_runner.publisher|ArtifactStore,artifact_ref",
+        "actionq_runner.candidates|from|actionq_contracts|canonical_bytes,require_compatible",
+        "actionq_runner.candidates|from|actionq_runner.publisher|ArtifactStore,_fsync_dir,artifact_ref",
+        "actionq_runner.cli|from|actionq_runner.executor|execute",
+        "actionq_runner.cli|from|actionq_runner.identity|sign_runner_request,verify_runner_request",
+        "actionq_runner.cli|from|actionq_runner.oci|oci_execute,oci_preflight",
+        "actionq_runner.cli|from|actionq_runner.publisher|acknowledge_settlement,list_publications,publish,query_settlement,recover_publication,resume_publication",
+        "actionq_runner.cli|from|actionq_runner.staging|mark_reconciled,open_staging",
+        "actionq_runner.context_policy|from|actionq_runner.execution_boundary|BoundaryCheck,BoundaryReport",
+        "actionq_runner.context_policy|from|actionq_runner.execution_contract|Assurance,ContextAddress,ContextPolicy,ContextTier,ContextUsage",
+        "actionq_runner.execution_boundary|from|actionq_runner.execution_contract|ExecutionInvariants",
+        "actionq_runner.execution_boundary|from|actionq_runner.executor|_changed_paths",
+        "actionq_runner.executor|from|actionq_contracts|require_compatible",
+        "actionq_runner.executor|from|actionq_runner.staging|quarantine,receive,seal,staging_dir",
+        "actionq_runner.identity|from|actionq_contracts|RUNNER_AUTH_V1,RunnerAuth,canonical_bytes",
+        "actionq_runner.oci|from|actionq_contracts|EXECUTION_ENVELOPE_V1,require_compatible",
+        "actionq_runner.publisher|from|actionq_contracts|CANDIDATE_V1,Candidate,EXECUTION_ENVELOPE_V1,EXECUTION_V1,PUBLICATION_V1,Publication,VERIFICATION_V1,Verification,canonical_bytes,require_compatible",
+        "actionq_runner.review|from|actionq_contracts|ACTION_CREATION_REQUEST_V1,CANDIDATE_REVIEW_RESULT_V1,CANDIDATE_REVIEW_SPEC_V1,CANDIDATE_VERIFICATION_RESULT_V1,PUBLICATION_V1,artifact_digest,canonical_bytes,require_compatible",
+        "actionq_runner.review|from|actionq_runner.candidates|resolve_exact_contract",
+        "actionq_runner.review|from|actionq_runner.publisher|ArtifactStore,artifact_ref"
+      ],
+      "disposition": "unresolved-owner-decision",
+      "owner": "actionq-runner-decision-owner-pending-ratification",
+      "falsifying_test": "Runner gains an import edge to the root actionq package, or W6 closes without a reviewed retire/extract/transfer decision and zero federation reach."
+    },
+    {
+      "id": "frozen-execution-contract-package-edge",
+      "edges": [
+        "actionq_contracts|from|actionq_contracts.execution|ACTION_CREATION_REQUEST_V1,CANDIDATE_INTEGRATION_RESULT_V1,CANDIDATE_INTEGRATION_SPEC_V1,CANDIDATE_REVIEW_RESULT_V1,CANDIDATE_REVIEW_SPEC_V1,CANDIDATE_V1,CANDIDATE_VERIFICATION_RESULT_V1,CANDIDATE_VERIFICATION_SPEC_V1,CLAIM_V1,Candidate,Claim,ContractRecord,DISPATCH_RESULT_V1,DISPATCH_STOP_REASONS,DISPATCH_TERMINAL_STATUSES,DispatchResult,EXECUTION_ENVELOPE_V1,EXECUTION_V1,Execution,ExecutionEnvelope,PUBLICATION_V1,Publication,RUNNER_AUTH_V1,RunnerAuth,SUPPORTED_CONTRACT_IDS,VERIFICATION_PROFILE_V1,VERIFICATION_V1,Verification,artifact_digest,canonical_bytes,require_compatible,sha256_digest"
+      ],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "The execution/v1 contract export changes before the runner decision and coordinated catalog cutover."
+    }
+  ],
+  "console_script_groups": [
+    {
+      "id": "actionq-compatible-facades",
+      "scripts": [
+        "pyproject.toml|actionctl|actionq.cli:cli",
+        "pyproject.toml|actionq-completion-outbox|actionq.completion_outbox:main"
+      ],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "A root console script disappears, changes target, or silently maps a legacy write name to federation semantics."
+    },
+    {
+      "id": "actionq-runner-console-script",
+      "scripts": [
+        "packages/actionq-runner/pyproject.toml|actionq-runner|actionq_runner.cli:main"
+      ],
+      "disposition": "unresolved-owner-decision",
+      "owner": "actionq-runner-decision-owner-pending-ratification",
+      "falsifying_test": "The runner script survives W6 without a reviewed retire/extract/transfer decision or becomes reachable from federation roots."
+    }
+  ],
+  "cli_command_groups": [
+    {
+      "id": "legacy-cli-writes",
+      "commands": [
+        "add|actionq.cli:add",
+        "cancel|actionq.cli:cancel",
+        "cancel-ack|actionq.cli:cancel_ack",
+        "claim|actionq.cli:claim",
+        "complete|actionq.cli:complete",
+        "emit|actionq.cli:emit",
+        "fail|actionq.cli:fail",
+        "group|actionq.cli:execution_group",
+        "group realize|actionq.cli:group_realize",
+        "group stop-new-claims|actionq.cli:group_stop",
+        "reject|actionq.cli:reject",
+        "renew|actionq.cli:renew",
+        "settle|actionq.cli:settle",
+        "sweep|actionq.cli:sweep"
+      ],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "A supported federation CLI exposes queue, claim, renewal, terminal execution, cancellation, sweep, group-control, or arbitrary coordinator-event writes."
+    },
+    {
+      "id": "legacy-cli-archive-reads",
+      "commands": [
+        "events|actionq.cli:events",
+        "group ls|actionq.cli:group_list",
+        "group show|actionq.cli:group_show",
+        "ls|actionq.cli:list_cmd",
+        "sessions|actionq.cli:sessions",
+        "show|actionq.cli:show"
+      ],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "Archive reads mutate execution rows, expose fenced secrets, or are removed before zero-consumer and retention proof."
+    },
+    {
+      "id": "cli-federation-successors",
+      "commands": [
+        "check-compatibility|actionq.cli:check_compatibility",
+        "migrate|actionq.cli:migrate",
+        "register-publication|actionq.cli:register_publication"
+      ],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Migration/compatibility cannot check execution and federation independently, or publication remains claim-authorized rather than evidence-authorized."
+    }
+  ],
+  "catalog_operation_groups": [
+    {
+      "id": "legacy-catalog-writes",
+      "operations": [
+        "execution.action.cancel",
+        "execution.action.claim",
+        "execution.action.complete",
+        "execution.action.enqueue",
+        "execution.action.fail",
+        "execution.action.reject",
+        "execution.action.renew",
+        "execution.action.settle",
+        "execution.action.sweep",
+        "execution.dispatch.enqueue",
+        "execution.dispatch.enqueue.v1",
+        "execution.group.realize",
+        "execution.group.stop-new-claims",
+        "execution.managed-dispatch.enqueue",
+        "execution.session.record"
+      ],
+      "disposition": "historicalize/delete",
+      "owner": "actionq+vuoro",
+      "falsifying_test": "Any queue/claim/lease/settlement/cancellation/group/managed-dispatch/session execution write crosses federation/v1 or aliases to a new name."
+    },
+    {
+      "id": "legacy-catalog-archive-reads",
+      "operations": [
+        "execution.action.list",
+        "execution.action.show",
+        "execution.dispatch.list",
+        "execution.event.list",
+        "execution.group.list",
+        "execution.group.show",
+        "execution.session.list"
+      ],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq+vuoro",
+      "falsifying_test": "Execution/v1 read operation bytes/hashes drift before explicit catalog removal or an archive read writes either domain."
+    },
+    {
+      "id": "catalog-evidence-and-observation-successors",
+      "operations": [
+        "execution.action.create-immutable-candidate",
+        "execution.session-completion.health",
+        "execution.session-completion.ingest",
+        "execution.session-completion.list",
+        "execution.session-completion.replay"
+      ],
+      "disposition": "replace-by-federation",
+      "owner": "actionq+vuoro",
+      "falsifying_test": "Evidence/completion observations are lost, retain claim/runner authority, or enter federation/v1 without stale-catalog rejection and exact global revision."
+    }
+  ],
+  "catalog_handler_bindings": {
+    "execution.action.cancel": "cancel",
+    "execution.action.claim": "claim",
+    "execution.action.complete": "complete",
+    "execution.action.create-immutable-candidate": "create_immutable_action",
+    "execution.action.enqueue": "enqueue",
+    "execution.action.fail": "fail",
+    "execution.action.list": "list_actions",
+    "execution.action.reject": "reject",
+    "execution.action.renew": "renew",
+    "execution.action.settle": "settle",
+    "execution.action.show": "show_action",
+    "execution.action.sweep": "sweep",
+    "execution.dispatch.enqueue": "enqueue_dispatch_v2",
+    "execution.dispatch.enqueue.v1": "dispatch",
+    "execution.dispatch.list": "list_dispatches",
+    "execution.event.list": "list_events",
+    "execution.group.list": "list_execution_groups",
+    "execution.group.realize": "realize_execution_group",
+    "execution.group.show": "show_execution_group",
+    "execution.group.stop-new-claims": "stop_execution_group",
+    "execution.managed-dispatch.enqueue": "enqueue_managed_dispatch",
+    "execution.session-completion.health": "session_completion_health",
+    "execution.session-completion.ingest": "ingest_session_completion",
+    "execution.session-completion.list": "list_session_completions",
+    "execution.session-completion.replay": "list_session_completions",
+    "execution.session.list": "list_sessions",
+    "execution.session.record": "record_session"
+  },
+  "migration_groups": [
+    {
+      "id": "immutable-execution-v1-migrations",
+      "migrations": [
+        {"path": "actionq/migrations/001_init.sql", "version": 1, "domain": "execution", "api_version": "v1", "sha256": "3551f71fc3516e30e3e98181c1d74f03dcf2db0e25046465390a75f73e230096"},
+        {"path": "actionq/migrations/002_claim_receipts.sql", "version": 2, "domain": "execution", "api_version": "v1", "sha256": "b11c502eeb80b8c3555b43deffc0cd31d59353e4c04170f63932ad6085c5e100"},
+        {"path": "actionq/migrations/003_dispatch_request_v2.sql", "version": 3, "domain": "execution", "api_version": "v1", "sha256": "eb253555f00990f77bbe8015e2db5520c7f52fff9468ce8a5bc65f0a15ee9ac8"},
+        {"path": "actionq/migrations/004_cancellation_fencing.sql", "version": 4, "domain": "execution", "api_version": "v1", "sha256": "51c4f2f76528e9cbe5b9d131d217973ef38d7113642bb2a5ce888a9e6c7201b0"},
+        {"path": "actionq/migrations/005_execution_groups.sql", "version": 5, "domain": "execution", "api_version": "v1", "sha256": "37ee95f27c60a3aae026d572b7d8c5f149bc5cc0ce427945ea57c3337878b586"},
+        {"path": "actionq/migrations/006_immutable_candidate_actions.sql", "version": 6, "domain": "execution", "api_version": "v1", "sha256": "b3a9edfcddb421c196893d6f906d8773a37a5660212da35750a0df7d85d7b9be"},
+        {"path": "actionq/migrations/007_dispatch_observation_watermarks.sql", "version": 7, "domain": "execution", "api_version": "v1", "sha256": "87cae21b94854fa221fb33a24d2ae8d56c94beccb710e6e71b2150f02058a5fe"},
+        {"path": "actionq/migrations/008_dispatch_v2_quarantine.sql", "version": 8, "domain": "execution", "api_version": "v1", "sha256": "770cbbed520d5f789a87349dcc25c7f474f60038dd7ea77d3d910e4ceed30a90"},
+        {"path": "actionq/migrations/009_action_resource_owner.sql", "version": 9, "domain": "execution", "api_version": "v1", "sha256": "5725d5b260e89655f87a0ee24dda1f0ca9832a5b80b6ce58d47ca4dbe22d1471"},
+        {"path": "actionq/migrations/010_claim_attempt_binding.sql", "version": 10, "domain": "execution", "api_version": "v1", "sha256": "de129bdeb9360f4f2ed65fd4bc74bbea2753584c1d03ff746b59a293b0c9cb93"},
+        {"path": "actionq/migrations/011_session_completion_log.sql", "version": 11, "domain": "execution", "api_version": "v1", "sha256": "cb2e8d388b27c4ff2486bdaadaeec75df45c875319d7e34b4391dd64e5653f56"},
+        {"path": "actionq/migrations/012_managed_dispatch_envelopes.sql", "version": 12, "domain": "execution", "api_version": "v1", "sha256": "443326a6e8a76ada34c8633c8b94808152253dbbc4bd6e1e83158cf545fa03ec"}
+      ],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "A migration byte, name, version, order, checksum, domain, API version, or maximum changes, or execution migration 013 appears."
+    }
+  ],
+  "workspace_package_groups": [
+    {
+      "id": "actionq-runner-mandatory-w6-decision",
+      "paths": [
+        "packages/actionq-runner/Containerfile.oci",
+        "packages/actionq-runner/README.md",
+        "packages/actionq-runner/actionq_runner/__init__.py",
+        "packages/actionq-runner/actionq_runner/acp/__init__.py",
+        "packages/actionq-runner/actionq_runner/acp/backends.py",
+        "packages/actionq-runner/actionq_runner/acp/jsonrpc.py",
+        "packages/actionq-runner/actionq_runner/acp/telemetry.py",
+        "packages/actionq-runner/actionq_runner/acp/v1.py",
+        "packages/actionq-runner/actionq_runner/candidate_execution.py",
+        "packages/actionq-runner/actionq_runner/candidates.py",
+        "packages/actionq-runner/actionq_runner/cli.py",
+        "packages/actionq-runner/actionq_runner/context_policy.py",
+        "packages/actionq-runner/actionq_runner/execution_boundary.py",
+        "packages/actionq-runner/actionq_runner/execution_contract.py",
+        "packages/actionq-runner/actionq_runner/executor.py",
+        "packages/actionq-runner/actionq_runner/identity.py",
+        "packages/actionq-runner/actionq_runner/oci.py",
+        "packages/actionq-runner/actionq_runner/oci_wrapper.py",
+        "packages/actionq-runner/actionq_runner/publisher.py",
+        "packages/actionq-runner/actionq_runner/review.py",
+        "packages/actionq-runner/actionq_runner/staging.py",
+        "packages/actionq-runner/pyproject.toml"
+      ],
+      "disposition": "unresolved-owner-decision",
+      "owner": "actionq-runner-decision-owner-pending-ratification",
+      "blocks": ["W6-closure"],
+      "allowed_outcomes": ["retire", "extract", "transfer"],
+      "falsifying_test": "W6 closes without a reviewed disposition, the runner becomes reachable from federation roots, or files/scripts change without reclassification."
+    },
+    {
+      "id": "frozen-actionq-execution-contracts",
+      "paths": [
+        "packages/actionq-contracts/README.md",
+        "packages/actionq-contracts/actionq_contracts/__init__.py",
+        "packages/actionq-contracts/actionq_contracts/execution.py",
+        "packages/actionq-contracts/pyproject.toml"
+      ],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "The execution/v1 contract package changes before runner disposition and coordinated catalog compatibility proof."
+    }
+  ],
+  "repository_scans": {
+    "api_consumers": {
+      "pattern": "(?:from actionq\\b|import actionq\\b|from actionq_(?:runner|contracts)\\b|import actionq_(?:runner|contracts)\\b|actionq\\.db\\b|\\bactionctl\\b|\\bactionq-runner\\b|execution\\.(?:action|dispatch|group|event|session))",
+      "purpose": "Pin every tracked source, packaging, script, test, verification, and maintained-document path that consumes a current ActionQ API or execution catalog anchor."
+    },
+    "retired_plane": {
+      "pattern": "(?:actionq-daemon|actionq-server|dispatcher-once|session[_-]wrapper)",
+      "purpose": "Make every surviving deleted-plane name explicit so a new stale normative/runtime anchor fails closed. Historical evidence is excluded from this maintained-surface scan."
+    }
+  },
+  "repository_consumer_groups": [
+    {
+      "id": "repository-federation-or-facade-successors",
+      "paths": [
+        ".agents/overlays/actionq.state-protocols.md",
+        "AGENTS.md",
+        "HANDOFF.md",
+        "README.md",
+        "actionq/application_completion.py",
+        "actionq/application_core.py",
+        "actionq/application_enqueue.py",
+        "actionq/application_outbox.py",
+        "actionq/cli.py",
+        "actionq/db.py",
+        "actionq/schema.py",
+        "actionq/vuoro.py",
+        "docs/contracts/action-resource-owner-v1.md",
+        "docs/contracts/dispatch-result-v1.md",
+        "docs/contracts/vuoro-execution-adapter.md",
+        "docs/operations/schema-migrations.md",
+        "docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md",
+        "pyproject.toml",
+        "tests/conftest.py",
+        "tests/test_action_resource_owner.py",
+        "tests/test_application_structure.py",
+        "tests/test_completion_log_integration.py",
+        "tests/test_completion_outbox.py",
+        "tests/test_integration_immutable_actions.py",
+        "tests/test_integration_postgres.py",
+        "tests/test_release_contract.py",
+        "tests/test_release_version.py",
+        "tests/test_repository_retirement_contract.py",
+        "tests/test_schema.py",
+        "tests/test_unit.py",
+        "tests/test_vuoro_adapter_integration.py"
+      ],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "A maintained consumer/callable disappears without a facade, or retained evidence/CAS/completion/schema behavior is not represented in the new federation boundary."
+    },
+    {
+      "id": "repository-legacy-execution-consumers",
+      "paths": [
+        "actionq.dispatch.json",
+        "actionq/application_claim.py",
+        "actionq/application_dispatch.py",
+        "actionq/application_groups.py",
+        "actionq/runner_auth.py",
+        "tests/test_claim_authority.py",
+        "tests/test_dispatch_result_contract.py",
+        "tests/test_dispatch_settlement_postgres.py",
+        "tests/test_dispatch_v2_contract.py",
+        "tests/test_execution_groups.py",
+        "tests/test_managed_dispatch.py",
+        "tests/test_runner_auth.py"
+      ],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "A supported federation root or catalog retains queue, claim, lease, terminal execution, group, managed-dispatch, runner-proof, or dispatcher-gate authority."
+    },
+    {
+      "id": "repository-frozen-execution-archive-consumers",
+      "paths": [
+        "actionq/migrations/003_dispatch_request_v2.sql",
+        "docs/plans/2026-08-19-execution-plane-deletion-constraint.md",
+        "docs/plans/2026-08-20-execution-plane-deletion-order.md",
+        "docs/plans/actionq-server-daemon-workstream-c-plan.md",
+        "docs/plans/vuoro-served-execution-alignment.md",
+        "docs/protocols/action-lifecycle.md",
+        "docs/verification/2026-08-13-adapter-kit-depth-2-survey.md",
+        "tests/fixtures/actionq_legacy_v1.sql",
+        "tests/test_immutable_action_contracts.py"
+      ],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "Historical facts or immutable execution assets are rewritten/deleted, or an archived document is treated as current federation authority."
+    },
+    {
+      "id": "repository-runner-decision-consumers",
+      "paths": [
+        ".agents/overlays/actionq.hybrid-worker.md",
+        "docs/protocols/portable-runner.md",
+        "packages/actionq-runner/Containerfile.oci",
+        "packages/actionq-runner/README.md",
+        "packages/actionq-runner/actionq_runner/candidate_execution.py",
+        "packages/actionq-runner/actionq_runner/candidates.py",
+        "packages/actionq-runner/actionq_runner/cli.py",
+        "packages/actionq-runner/actionq_runner/executor.py",
+        "packages/actionq-runner/actionq_runner/identity.py",
+        "packages/actionq-runner/actionq_runner/oci.py",
+        "packages/actionq-runner/actionq_runner/publisher.py",
+        "packages/actionq-runner/actionq_runner/review.py",
+        "packages/actionq-runner/pyproject.toml",
+        "tests/test_acp_adapter.py",
+        "tests/test_acp_agent_divergence.py",
+        "tests/test_acp_backends.py",
+        "tests/test_acp_conformance_live.py",
+        "tests/test_acp_fungibility_live.py",
+        "tests/test_acp_wire_shapes.py",
+        "tests/test_candidate_artifacts.py",
+        "tests/test_candidate_execution.py",
+        "tests/test_candidate_review.py",
+        "tests/test_context_policy.py",
+        "tests/test_execution_boundary.py",
+        "tests/test_immutable_publication.py",
+        "tests/test_oci_integration.py",
+        "tests/test_oci_runner.py",
+        "tests/test_portable_runner.py"
+      ],
+      "disposition": "unresolved-owner-decision",
+      "owner": "actionq-runner-decision-owner-pending-ratification",
+      "falsifying_test": "Runner packaging/tests/docs change or W6 closes before a reviewed retire/extract/transfer outcome and zero federation reach proof."
+    }
+  ],
+  "retired_plane_anchor_groups": [
+    {
+      "id": "production-and-generated-retired-plane-anchors",
+      "paths": [
+        "actionq.dispatch.json",
+        "actionq/completion_outbox.py"
+      ],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "A new production/generated anchor invokes or names the deleted daemon/server/session-wrapper plane as current authority."
+    },
+    {
+      "id": "intentional-retirement-history-and-gates",
+      "paths": [
+        "HANDOFF.md",
+        "docs/plans/2026-08-19-execution-plane-deletion-constraint.md",
+        "docs/plans/2026-08-20-execution-plane-deletion-order.md",
+        "docs/plans/actionq-server-daemon-workstream-c-plan.md",
+        "tests/test_release_contract.py",
+        "tests/test_repository_retirement_contract.py"
+      ],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "Historical rollout hazards or deletion gates are presented as live execution instructions, or their evidence is rewritten."
+    },
+    {
+      "id": "runner-and-hybrid-retired-plane-anchors",
+      "paths": [
+        ".agents/overlays/actionq.hybrid-worker.md",
+        "packages/actionq-runner/actionq_runner/executor.py",
+        "packages/actionq-runner/actionq_runner/oci.py"
+      ],
+      "disposition": "unresolved-owner-decision",
+      "owner": "actionq-runner-decision-owner-pending-ratification",
+      "falsifying_test": "A blocked-name safety check becomes a launcher, or runner/hybrid guidance survives W6 without the reviewed runner disposition."
+    }
+  ],
+  "critical_reachability": [
+    {
+      "id": "claim-lease-queue-and-settlement",
+      "paths": ["actionq/db.py", "actionq/application_claim.py", "actionq/application_completion.py", "actionq/application_dispatch.py", "actionq/application_enqueue.py", "actionq/application_groups.py", "actionq/cli.py", "actionq/vuoro.py"],
+      "symbols": ["actionq/db.py#claim", "actionq/db.py#_claim_schema3", "actionq/db.py#renew", "actionq/db.py#_transition_terminal", "actionq/db.py#complete", "actionq/db.py#fail", "actionq/db.py#reject", "actionq/db.py#settle_dispatch_result", "actionq/db.py#cancel", "actionq/db.py#acknowledge_cancellation", "actionq/db.py#reap_cancellations", "actionq/db.py#sweep", "actionq/db.py#enqueue", "actionq/db.py#realize_execution_group", "actionq/db.py#stop_execution_group", "actionq/application_claim.py#ClaimService.claim", "actionq/application_claim.py#ClaimService.renew", "actionq/application_completion.py#CompletionService.settle", "actionq/application_dispatch.py#DispatchService.enqueue_managed_dispatch"],
+      "operations": ["actionctl claim/renew/complete/fail/reject/settle/cancel/cancel-ack/sweep/add/group", "execution.action.claim/renew/complete/fail/reject/settle/cancel/sweep/enqueue", "execution.dispatch.enqueue/enqueue.v1", "execution.managed-dispatch.enqueue", "execution.group.realize/stop-new-claims"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "Any listed worker/claim/lease/queue/group/settlement authority crosses federation roots or disappears from the compatibility inventory before W5 fencing."
+    },
+    {
+      "id": "coupled-resource-to-federation-successor",
+      "paths": ["actionq/action_resource.py", "actionq/application_core.py", "actionq/migrations/009_action_resource_owner.sql", "verification/run_action_resource_history.py", "verification/validate_action_resource_owner_v1.py", "verification/contexts/action-resource-owner-v1.json", "verification/fixtures/action-resource-owner-v1/manifest.json"],
+      "symbols": ["actionq/action_resource.py#ActionResourceOwner.enqueue", "actionq/action_resource.py#ActionResourceOwner.snapshot", "actionq/action_resource.py#ActionResourceOwner.changes", "actionq/action_resource.py#ActionResourceOwner.project_state", "actionq/action_resource.py#ActionResourceOwner.prune", "actionq/application_core.py#AuthenticatedActionResourcePrincipal.derive", "actionq/application_core.py#ActionQCore.enqueue_action_resource", "actionq/application_core.py#ActionQCore.project_action_resource"],
+      "operations": ["revision/change cursor", "recovery floor", "principal-scoped idempotency", "current action-row/claim projection coupling"],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "The successor requires an action row/claim receipt, treats CAS as authorization, prunes v1 changes, or loses deterministic projection."
+    },
+    {
+      "id": "runner-proof-and-cancellation-fences",
+      "paths": ["actionq/runner_auth.py", "actionq/db.py", "actionq/application_completion.py"],
+      "symbols": ["actionq/runner_auth.py#verify_runner_proof", "actionq/db.py#consume_runner_request", "actionq/db.py#receipt_digest", "actionq/db.py#cancel", "actionq/db.py#acknowledge_cancellation", "actionq/db.py#reap_cancellations", "actionq/application_completion.py#CompletionService.acknowledge_cancellation"],
+      "operations": ["signed runner proof", "claim-attempt binding", "cancel request/acknowledgement/reap"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "Runner proof or cancellation acknowledgement grants federation mutation or the historical fence is omitted from archive/backfill coverage."
+    },
+    {
+      "id": "publication-evidence-and-cas",
+      "paths": ["actionq/cas.py", "actionq/db.py", "actionq/application_completion.py"],
+      "symbols": ["actionq/cas.py#artifact_ref", "actionq/cas.py#_DaemonCAS.put", "actionq/cas.py#_DaemonCAS.get", "actionq/db.py#create_immutable_action", "actionq/db.py#register_publication", "actionq/db.py#validate_dispatch_result", "actionq/db.py#_verify_dispatch_result_referent", "actionq/application_completion.py#CompletionService.register_publication"],
+      "operations": ["immutable candidate", "publication record", "content-addressed referent verification", "dispatch observation watermark/quarantine"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Evidence bytes are accepted without digest verification, publication remains claim-coupled, or historical candidate/publication facts are lost."
+    },
+    {
+      "id": "completion-replay-and-rebuild",
+      "paths": ["actionq/completion_log.py", "actionq/completion_outbox.py"],
+      "symbols": ["actionq/completion_log.py#CompletionLog.ingest", "actionq/completion_log.py#CompletionLog.list", "actionq/completion_log.py#CompletionLog.compact", "actionq/completion_outbox.py#CompletionOutbox.record", "actionq/completion_outbox.py#CompletionOutbox.retry", "actionq/completion_outbox.py#recover_capsules"],
+      "operations": ["completion event identity/digest", "cursor/recovery floor", "response-loss retry", "capsule recovery", "resource projection/rebuild"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Replay accepts gaps/duplicates/digest conflicts, rebuild differs from live projection, or completion observation is treated as proof ActionQ executed work."
+    },
+    {
+      "id": "schema-migration-and-packaging",
+      "paths": ["actionq/schema.py", "actionq/db.py", "pyproject.toml", "uv.lock", ".github/workflows/ci.yml", ".github/workflows/release-actionq-wheel.yaml", ".github/scripts/verify-release-image-tag.py", "verification/validate_release_contract.py"],
+      "symbols": ["actionq/schema.py#load_migrations", "actionq/schema.py#check_compatibility", "actionq/schema.py#migrate", "actionq/db.py#migrate", "actionq/db.py#check_compatibility"],
+      "operations": ["execution v1 migrations 001-012", "schema compatibility facade", "wheel package data", "root and workspace console scripts"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Migration assets/order/checksums drift, execution 013 exists, package data omits frozen assets, or an unclassified console script appears."
+    },
+    {
+      "id":"frozen-execution-migration-assets",
+      "paths":["actionq/migrations/001_init.sql","actionq/migrations/002_claim_receipts.sql","actionq/migrations/003_dispatch_request_v2.sql","actionq/migrations/004_cancellation_fencing.sql","actionq/migrations/005_execution_groups.sql","actionq/migrations/006_immutable_candidate_actions.sql","actionq/migrations/007_dispatch_observation_watermarks.sql","actionq/migrations/008_dispatch_v2_quarantine.sql","actionq/migrations/009_action_resource_owner.sql","actionq/migrations/010_claim_attempt_binding.sql","actionq/migrations/011_session_completion_log.sql","actionq/migrations/012_managed_dispatch_envelopes.sql"],
+      "symbols":[],
+      "operations":["immutable execution/v1 history and archive schema"],
+      "disposition":"retain-as-frozen-archive",
+      "owner":"actionq",
+      "falsifying_test":"Any execution migration is reclassified as federation successor schema, omitted, mutated, or extended by 013."
+    }
+  ],
+  "external_consumers": [
+    {
+      "id": "vuoro-composition",
+      "repository": "https://github.com/bayleafwalker/vuoro.git",
+      "commit_refs": {
+        "w0_immutable_baseline": "9dc7efa8d3f546851218f49da7653f806d5e8ca4"
+      },
+      "paths": [
+        "packages/vuoro-service/composition/adapter-pins.json",
+        "packages/vuoro-service/src/vuoro_service/composition.py",
+        "packages/vuoro-service/src/vuoro_service/execution_provenance.py",
+        "scripts/fetch_pinned_adapters.py",
+        "scripts/validate_released_execution_adapter.py",
+        "scripts/validate_released_catalog_composition.py",
+        "scripts/verify_pre_migration_startup.py"
+      ],
+      "pins": {
+        "actionq_source_revision": "0f13e76f953bcacafbf16c41d29e830ffd84f755",
+        "actionq_version": "0.1.26",
+        "actionq_wheel_sha256": "c0307882804a5e49fdbf6208cffc113ae17aa6cdb72cfb5880c28d9762a85d43",
+        "actionq_contracts_source_revision": "0e8b21325a7fd3d59a989110e61ce80476c51dea",
+        "actionq_contracts_version": "0.1.1",
+        "actionq_contracts_wheel_sha256": "23236d0f662a1dc58eacbc7c5d9a3dcd27f11fb34be2b725945518452119d3df",
+        "adapter_kit_source_revision":"a002e5031b4235779462314c125903300636c5f1",
+        "adapter_kit_version":"0.1.0",
+        "adapter_kit_sha256": "0037898a4c9f01720a42302365b0172ecd203732070326ea2abdf549a44bf0c2",
+        "schema_runtime_source_revision":"a002e5031b4235779462314c125903300636c5f1",
+        "schema_runtime_version":"0.1.0",
+        "schema_runtime_sha256": "b66c9357c99aa9e1a7353991ce54105a8621958ecfac47f8c121d80b90b77912",
+        "catalog_metadata_sha256": "8d434e8b347e804c90e48a6598304be84b12f2a61ebc2dbed00a26053239a778",
+        "composition_global_revision": "23cfc276ed1fb4a51b94864a963cfd4b0e70a02a73dc3522e13a96e0c9b33c9a",
+        "execution_schema": "actionq-schema/v12",
+        "legacy_catalog_default_operation_count": 26,
+        "legacy_catalog_policy_enabled_operation_count": 27,
+        "sole_conditional_operation": "execution.managed-dispatch.enqueue",
+        "managed_dispatch_operation_is_policy_conditional": true
+      },
+      "released_operation_sha256":{"execution.action.enqueue":"93e95dbd9371537ab76a2bd89dda0fd0bcbbe9db7169bfd0c3dc2226eba4f21a","execution.dispatch.enqueue":"6f203830b9932b3a6fb63b35aae2a5d80fb89a1834e1ba09d54953f98f6b826d","execution.action.create-immutable-candidate":"f8b6b56d86d4876db3c8dafcfbf09208709b7f2d7f9a052f8e81f9f7d786f7ef","execution.action.list":"e6b03f3b38cd806264803a40fb0b8f490052f849db9f72e030c5923f4b09d002","execution.action.show":"9ff4d4d856cc82c9141f749b98dfe95d0d287b49997f24d33a10e3a394d808bf","execution.group.realize":"cae0d3c53d7864d0bd102f858d841b75b5cfd8c2f8c73a3d95edb4e15300182f","execution.group.stop-new-claims":"e6a7dee48f2f3dbea96ca0522e6d4dfd723e3c2689b86d095ab30bf08c98726b","execution.group.show":"9425426ef4ac455425a4aebee69006e5f88939b85d30e4e0b699a30c74bfda38","execution.group.list":"abf1ce35800a1a6df1e111c8a5664b2e792f85533ec338965a95fd2d9aa2c819","execution.action.claim":"4430ebe7242cc8a218a38f26fa7008b5215c6c2ad30a656d60d663a7c2f41bd7","execution.action.renew":"2f65f3ace025a1878c216ec2762fa1ced2700f73809858e4bc35fe79f9c43f59","execution.action.settle":"4cc8fe17422de69ca6e53999dd39db99f5d07ec18458eca32625ed250b61fab3","execution.action.complete":"025fc42e54a540a25d6b3e05c2b8ea000abeb3afe19629a43e3e1c97a6bc03a9","execution.action.fail":"13790b9273509614e353ad980b47495ddaf6255dfbd0acf366fad4a9187295a2","execution.action.reject":"aff131e3134df96ad8cdf0d804475b220c48aa164335bbbb5e05c9bcf12cbde5","execution.action.cancel":"715efc1f5bf36f35050a6afd61d91804165684a07f70b0934fe7956116c31992","execution.action.sweep":"9d5ec1b34b507158a4c211a2dfe306d704dbb1aa12d3936806c8255881264057","execution.event.list":"5e07346bee06617eda570f78a71f1427cb98c800c6c3c9f3e51db8d39abd5064","execution.session.list":"9fdb3d138d04c32b00a8d20bc273f224b92aef0c49ddbc0b3def7fb6375c89e6","execution.session.record":"a4accddacbdbc661c4d3ef932362e0b9c2e73fa7dfb49e23ced24bf8503006f2","execution.dispatch.enqueue.v1":"859fc0f1a63f864593ede2985186b3a7f38fed73380be842954c05120d381975","execution.dispatch.list":"c002545391fab83fcbb6b4d56cd9d3b9045ed0c2b171ac49d3b6dc1caa7e5748"},
+      "outcomes":{"frozen-execution-wheel-schema-catalog-and-operation-pins":"retain-as-frozen-archive","federation-v1-fifth-domain":"replace-by-federation"},
+      "operations": ["released-wheel fetch/digest", "execution/v1 registration", "four-domain composition", "pre-migration compatibility", "catalog global revision"],
+      "disposition": "replace-by-federation",
+      "owner": "vuoro",
+      "falsifying_test": "W4 lacks literal full ActionQ/Vuoro SHAs and fetched wheel digests, execution/v1 bytes drift, federation/v1 is not a separate fifth domain, or stale catalog reaches ActionQ."
+    },
+    {
+      "id": "actionq-dispatcher-tombstone",
+      "repository": "https://github.com/bayleafwalker/actionq-dispatch.git",
+      "commit_refs": {
+        "retirement_merge_and_tag_target": "510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4"
+      },
+      "release": "actionq-dispatcher-v0.2.0",
+      "paths": ["pyproject.toml", "actionq_dispatcher/cli.py", "docs/retirement-release.md", "docs/runbook.md"],
+      "operations": ["dispatcher-once deterministic nonzero tombstone only", "no executable resolution", "no queue access", "no process creation"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq-dispatcher",
+      "falsifying_test": "The tombstone resolves or starts actionq-daemon, reads queue/config, returns success, or is described as a compatibility launcher."
+    },
+    {
+      "id": "q-spec-stale-normative-contracts",
+      "repository": "workspace-unversioned:/projects/dev/q-spec",
+      "revision_kind": "unversioned-file-digests",
+      "file_sha256": {
+        "actionq-spec.md": "61181fb5f3916fe008cfc055004b4b00f75355340dd46a1b98e1e0dace64a4ff",
+        "dispatcher-spec.md": "5ece7f9c6af0eaf96867e1a8ab98d8f4e17774549c283d1f785510d363e14c16",
+        "sprintctl-spec.md": "25f74910b9af050fc3fabf0579bcc8f4e4b600c8c662722b0fc81b84648c0fe3"
+      },
+      "paths": ["actionq-spec.md", "dispatcher-spec.md", "sprintctl-spec.md"],
+      "operations": ["queue/claim/daemon normative contract", "dispatcher claim loop", "queued-dispatch ownership statement"],
+      "disposition": "historicalize/delete",
+      "owner": "q-spec",
+      "falsifying_test": "A stale q-spec is used as tranche-4 implementation authority or supersession omits the dispatcher tombstone and native-runtime/federation boundary."
+    },
+    {
+      "id":"sprintctl-actionq-lifecycle",
+      "repository":"https://github.com/bayleafwalker/sprintctl.git",
+      "commit_refs":{"released_baseline":"15afc8762ce99beb3ec0239a5ce4a8713dd6f934","current_origin_main":"db52e2fdc219eeb6b15a7667e079779e22128d4e"},
+      "paths":["sprintctl/commands/lifecycle.py","tests/test_takeup.py","tests/test_takeup_pg_contract.py","docs/advanced/takeup.md"],
+      "operations":["_load_active_actionq_session_ids","takeup sweep archive-session liveness"],
+      "disposition":"unresolved-owner-decision",
+      "owner":"sprintctl",
+      "falsifying_test":"Archive-session reads are removed before takeup sweep has a native lifecycle source and migration tests."
+    },
+    {
+      "id": "agentops-generated-guidance",
+      "repository": "https://github.com/bayleafwalker/agentops.git",
+      "commit_refs": {
+        "canonical_program_record": "6c01869b8a0c5ad3dfaf3313385f9a162900dab8"
+      },
+      "paths": [
+        "apps/web/lib/cockpit/actionq.js",
+        "apps/web/lib/cockpit/dispatch.js",
+        "apps/web/lib/cockpit/env.js",
+        "apps/web/app/cockpit/api/claims/route.js",
+        "apps/web/app/cockpit/api/dispatch/route.js",
+        "apps/web/app/cockpit/api/dispatches/route.js",
+        "apps/web/app/cockpit/api/mcp/route.js",
+        "apps/web/tests/actionq-contract.test.js",
+        "apps/web/tests/route-shapes.test.js",
+        "apps/web/tests/write-surface.test.js"
+      ],
+      "operations": ["generated workspace guidance", "hybrid dispatch manifests", "historical daemon plans with supersession markers"],
+      "outcomes":{"cockpit-actionq-write-api":"historicalize/delete","cockpit-archive-session-and-dispatch-reads":"retain-as-frozen-archive","reconciliation-successor":"replace-by-federation"},
+      "disposition": "replace-by-federation",
+      "owner": "agentops",
+      "falsifying_test": "Generated current guidance instructs starting the retired daemon/dispatcher or a historical plan lacks an explicit native-runtime/federation supersession boundary."
+    },
+    {
+      "id": "gitops-nixos-daemon-retirement",
+      "repository": "https://github.com/bayleafwalker/gitops-nixos.git",
+      "commit_refs": {
+        "inspected_origin_main": "0df071a9d536d3244faa6a368532cc894eb453e9",
+        "held_pr16_head": "50bc3d5b26cce703df52a1a90595121f6fdd8787"
+      },
+      "pull_request": 16,
+      "paths": [
+        "modules/system/actionq-dispatch.nix",
+        "scripts/actionq-daemon-tmux.sh",
+        "scripts/actionq-handoff.sh",
+        "scripts/update-agentops-tools.sh",
+        "modules/system/agentops-client-tools.nix",
+        "scripts/check-actionq-retirement.sh",
+        "docs/runbooks/actionq-devbox-dispatch.md"
+      ],
+      "operations": ["nix-managed daemon/unit retirement", "client-only actionctl refresh", "runner install removal", "retirement gate"],
+      "outcomes":{"daemon-unit-scripts-runbook":"historicalize/delete","actionctl-client-tools":"retain-as-frozen-archive"},
+      "ci_status":"failing-payment-or-spending-limit-no-steps-executed-at-W1-inspection",
+      "merge_gate": "operator-after-appservice-phase2",
+      "disposition": "historicalize/delete",
+      "owner": "gitops-nixos+operator",
+      "falsifying_test": "PR16 merges/deploys before ordered appservice proof and interactive service disable, or a refresh script reinstalls a daemon/runner entry point."
+    },
+    {
+      "id": "appservice-ordered-retirement",
+      "repository": "appservice-private-workspace",
+      "commit_refs": {
+        "inspected_main": "72a145b03472fd3b00c912f84c9a5c86fc3a1e1c",
+        "phase1_namespace_transfer": "7e24a9d6a4a2a1953754922d4cf44eb82c1ea6f8",
+        "phase2_server_removal": "565c5343895ce6c19860a981c343a876723a840b"
+      },
+      "paths": [
+        "clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml",
+        "clusters/main/kubernetes/apps/actionq-db/app/actionq-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/agent-cockpit/app/deployment.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared/app/deployment.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev/app/deployment.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared/app/managed-dispatch-policy.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migration.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-read-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-migration.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-read-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-migrate-v1.yaml"
+      ],
+      "operations": ["namespace ownership transfer", "runner identity registry transfer", "server removal", "cockpit URL removal", "execution v12 migration job", "database runtime roles"],
+      "outcomes":{"actionq-server":"historicalize/delete","database-and-frozen-archive":"retain-as-frozen-archive","federation-successor":"replace-by-federation","actionq-runner":"unresolved-owner-decision","managed-policy-credentials-vuoro-deployments-roles-jobs":"unresolved-owner-decision"},
+      "operator_only": true,
+      "required_order": [
+        "merge-and-reconcile-phase1",
+        "prove-vscode-namespace-cnpg-and-cockpit-health",
+        "merge-and-reconcile-phase2",
+        "prove-server-removal",
+        "disable-and-stop-devbox-actionq-dispatch-service",
+        "merge-and-deploy-gitops-nixos-pr16"
+      ],
+      "disposition": "unresolved-owner-decision",
+      "owner": "operator+appservice",
+      "falsifying_test": "Phase 2 precedes phase 1 health proof, namespace pruning deletes vscode/CNPG/cockpit, or any non-operator session mutates/reconciles the cluster."
+    }
+  ],
+  "external_atomic_path_dispositions": [
+    {"consumer_id":"vuoro-composition","disposition":"retain-as-frozen-archive","paths":["packages/vuoro-service/composition/adapter-pins.json","scripts/validate_released_execution_adapter.py","scripts/validate_released_catalog_composition.py","scripts/verify_pre_migration_startup.py"]},
+    {"consumer_id":"vuoro-composition","disposition":"replace-by-federation","paths":["packages/vuoro-service/src/vuoro_service/composition.py","packages/vuoro-service/src/vuoro_service/execution_provenance.py","scripts/fetch_pinned_adapters.py"]},
+    {"consumer_id":"actionq-dispatcher-tombstone","disposition":"historicalize/delete","paths":["pyproject.toml","actionq_dispatcher/cli.py","docs/retirement-release.md","docs/runbook.md"]},
+    {"consumer_id":"q-spec-stale-normative-contracts","disposition":"historicalize/delete","paths":["actionq-spec.md","dispatcher-spec.md","sprintctl-spec.md"]},
+    {"consumer_id":"agentops-generated-guidance","disposition":"historicalize/delete","paths":["apps/web/lib/cockpit/actionq.js","apps/web/lib/cockpit/dispatch.js","apps/web/app/cockpit/api/claims/route.js","apps/web/app/cockpit/api/dispatch/route.js"]},
+    {"consumer_id":"agentops-generated-guidance","disposition":"retain-as-frozen-archive","paths":["apps/web/app/cockpit/api/dispatches/route.js","apps/web/tests/actionq-contract.test.js"]},
+    {"consumer_id":"agentops-generated-guidance","disposition":"replace-by-federation","paths":["apps/web/lib/cockpit/env.js","apps/web/app/cockpit/api/mcp/route.js","apps/web/tests/route-shapes.test.js","apps/web/tests/write-surface.test.js"]},
+    {"consumer_id":"sprintctl-actionq-lifecycle","disposition":"unresolved-owner-decision","paths":["sprintctl/commands/lifecycle.py","tests/test_takeup.py","tests/test_takeup_pg_contract.py","docs/advanced/takeup.md"]},
+    {"consumer_id":"gitops-nixos-daemon-retirement","disposition":"historicalize/delete","paths":["modules/system/actionq-dispatch.nix","scripts/actionq-daemon-tmux.sh","scripts/actionq-handoff.sh","scripts/check-actionq-retirement.sh","docs/runbooks/actionq-devbox-dispatch.md"]},
+    {"consumer_id":"gitops-nixos-daemon-retirement","disposition":"retain-as-frozen-archive","paths":["scripts/update-agentops-tools.sh","modules/system/agentops-client-tools.nix"]},
+    {"consumer_id":"appservice-ordered-retirement","disposition":"historicalize/delete","paths":["clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml"]},
+    {"consumer_id":"appservice-ordered-retirement","disposition":"retain-as-frozen-archive","paths":["clusters/main/kubernetes/apps/actionq-db/app/actionq-runtime.secret.yaml"]},
+    {"consumer_id":"appservice-ordered-retirement","disposition":"unresolved-owner-decision","paths":["clusters/main/kubernetes/apps/agent-cockpit/app/deployment.yaml","clusters/main/kubernetes/apps/vuoro-shared/app/deployment.yaml","clusters/main/kubernetes/apps/vuoro-dev/app/deployment.yaml","clusters/main/kubernetes/apps/vuoro-shared/app/managed-dispatch-policy.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migration.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-read-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-migration.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-read-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-migrate-v1.yaml"]}
+  ],
+  "external_baseline_bytes": [
+    {"consumer_id":"vuoro-composition","commit":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/composition/adapter-pins.json","sha256":"6d2f9739c1ffa1a5fa3a9cfdf8dd22b81ed71d5a93eff211fa1db134ae8902f1"},
+    {"consumer_id":"agentops-generated-guidance","commit":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/actionq.js","sha256":"ba9050d863420c8c364b42edc44e265933c1be51af7372aba6ce8cd59dd7b456"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","commit":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"sprintctl/commands/lifecycle.py","sha256":"18b3b2a42af6195a264fb6b8d3d7a02bc3ba7703fac83a1dec7879f3f29fb9c5"},
+    {"consumer_id":"appservice-ordered-retirement","commit":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml","sha256":"dbe82ae71c60941f77398a07e48059beb2b43b63f78d6e6a6ab3a6184f6a66e8"}
+  ],
+  "external_path_proofs": [
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/composition/adapter-pins.json","sha256":"6d2f9739c1ffa1a5fa3a9cfdf8dd22b81ed71d5a93eff211fa1db134ae8902f1"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/src/vuoro_service/composition.py","sha256":"d2e89e1751d9ce509bb63cb1eda96186f43d0a716219ea9966877b5bd4360af6"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/src/vuoro_service/execution_provenance.py","sha256":"6e399d1ab065638b48946f62a4ef98c4085cc9b96c8b45ddabf451487f6c827e"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/fetch_pinned_adapters.py","sha256":"f99b9dc1ecdb921d7a81727e0c7892b0ba925e1e369c00d6e36ff784bde94ad8"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/validate_released_execution_adapter.py","sha256":"30ce353f4cebe1df0d73e03c09f07d5a4315bba70c5a141cad33ed07444f1d75"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/validate_released_catalog_composition.py","sha256":"55256e27b8667d7e5ec8a9b86de32d37ee6bf9e4eed7c92ee739623e72a0e2a1"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/verify_pre_migration_startup.py","sha256":"e1eb6d8d5ddf1e2ec8a8c47f6d02a6d6570fc5f720034038a25c37424bd9224c"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"pyproject.toml","sha256":"d74e83a875fc124b01f8a270570168ff7b51e4cbdbf467f3c90f76f8b60f6610"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"actionq_dispatcher/cli.py","sha256":"68f8add3876c7a75598c3cefc2260605129740a298387e0d74a9e8ee26ae4f02"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"docs/retirement-release.md","sha256":"6efaf123d0bd97c9087c4edd0d0ac419ad913028a925bffcded53173acbdb9f5"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"docs/runbook.md","sha256":"6af7b261a0586ece445b45a35b4b315c9ac749904654354781fe9262ba1af183"},
+    {"consumer_id":"q-spec-stale-normative-contracts","ref":"unversioned-file-digest","path":"actionq-spec.md","sha256":"61181fb5f3916fe008cfc055004b4b00f75355340dd46a1b98e1e0dace64a4ff"},
+    {"consumer_id":"q-spec-stale-normative-contracts","ref":"unversioned-file-digest","path":"dispatcher-spec.md","sha256":"5ece7f9c6af0eaf96867e1a8ab98d8f4e17774549c283d1f785510d363e14c16"},
+    {"consumer_id":"q-spec-stale-normative-contracts","ref":"unversioned-file-digest","path":"sprintctl-spec.md","sha256":"25f74910b9af050fc3fabf0579bcc8f4e4b600c8c662722b0fc81b84648c0fe3"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"sprintctl/commands/lifecycle.py","sha256":"18b3b2a42af6195a264fb6b8d3d7a02bc3ba7703fac83a1dec7879f3f29fb9c5"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"tests/test_takeup.py","sha256":"6828c25b1da971ad78a7af8255b53aeb9545516342fc1ba9e4afd62d7a9fdf20"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"tests/test_takeup_pg_contract.py","sha256":"ea9bd80b1351d17ca30989ffb29ecd0a04914acfda57db3fc2c2749c805bb1e5"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"docs/advanced/takeup.md","sha256":"5fedaf7cefab10c445dd22035848d4fd23d9f7f95e916fa6318c95dc9ddc9fcc"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/actionq.js","sha256":"ba9050d863420c8c364b42edc44e265933c1be51af7372aba6ce8cd59dd7b456"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/dispatch.js","sha256":"26058b3adf324fa03c87a64e42a2d8d8a844c65caad9992e7cf6b1fb08eee751"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/env.js","sha256":"bc9f3ff931d6ab13ea2b9772d6b0b019b741cc9e841927445d1d72503b31c4bf"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/claims/route.js","sha256":"808213193efde760943869e310f5303b8c4b7c86f46563cdd013fdd4b8f6581f"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/dispatch/route.js","sha256":"7a29a68812c83e6a2a4fc32762ddf3836a42902bfc5a39bef3f2272b388fe825"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/dispatches/route.js","sha256":"572dcc811ba1b5d07f0b2873393fd76daad91f831968a217be0200b3243d7b2e"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/mcp/route.js","sha256":"1ed4b009725a8a1df690cb1a0e071d41b324ab3935cb04997eb5c8ac08886f33"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/tests/actionq-contract.test.js","sha256":"702887a1d94acba6c659c6f6ad5f154882c9a8cf1cd0fe205a3cb2ed01b6931a"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/tests/route-shapes.test.js","sha256":"116c16a77260dbf0a70a4e15118b9ddeeb90d2ba1e6880d16deaefff37f6c732"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/tests/write-surface.test.js","sha256":"27cc9d09e5d92a6314bd23ee393f08e4668026158e82296d0e7b13faaca662e9"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"0df071a9d536d3244faa6a368532cc894eb453e9","path":"modules/system/actionq-dispatch.nix","sha256":"1dd970da0f3923be96ea54c8bf9a19c446587f206d5a7f25b2e3591bf08108c1"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"0df071a9d536d3244faa6a368532cc894eb453e9","path":"scripts/actionq-daemon-tmux.sh","sha256":"693726ff60df93d0a96eb53c662465e0267c37acca7891a22a0b53219cf23a26"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"0df071a9d536d3244faa6a368532cc894eb453e9","path":"scripts/actionq-handoff.sh","sha256":"ebca10a6c6a192fc58fc081215b71dc04bd50eaf125f1a6d5f3d84625d90415d"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"scripts/update-agentops-tools.sh","sha256":"a19769055cc041366a39b534cc0f8f4428bbf911ee89c483758dab23f5692097"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"modules/system/agentops-client-tools.nix","sha256":"097a815a620ca94dad5b17dec60078a29ca8c1c3010c982616e01b760ef53a9a"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"scripts/check-actionq-retirement.sh","sha256":"59d1d124bb50918518eaee07f30a772c6fdfc743d8c8dd5a8585e612e054b8ed"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"docs/runbooks/actionq-devbox-dispatch.md","sha256":"663d12b6f405cef29c0f646ed81b3fc23ba99e8d605d56f929d5ea7866186f07"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml","sha256":"dbe82ae71c60941f77398a07e48059beb2b43b63f78d6e6a6ab3a6184f6a66e8"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/actionq-db/app/actionq-runtime.secret.yaml","sha256":"2b6126733a6df77eec4b9b8a6f7447a3dc508ce1be526bf41f4a98d326df6a98"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/agent-cockpit/app/deployment.yaml","sha256":"24a27f9fe4bcdcac659bcaca5f5f3f54358723a165623539be1bbdee19fef582"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared/app/deployment.yaml","sha256":"468f04b5508ad36d7914d8b9d525711736583970c45e6cc3911bc50881827ebf"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev/app/deployment.yaml","sha256":"52a834a7e95b3dd3f9b3799aa5837c7b1195fd9ba323059d11ca9487788a8f8c"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared/app/managed-dispatch-policy.yaml","sha256":"ba1324760229ca91568d915fe9134972a3cdb64042172ee94cc9b140db1e42e8"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-runtime.secret.yaml","sha256":"47b4ab94ba588fa45c4dc1311a64dbdfb09d57b8104871b32a0b8e6625ef469b"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migration.secret.yaml","sha256":"819e6648cc81daa56a549973c238d8f88d810e414e80533d86033569cd4b365f"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","sha256":"1d213f40bfb1f74a64b0660be3fea964382d65811ecfd50d0f1b3e019917cd4f"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-read-runtime.secret.yaml","sha256":"c2c195300116dd4bb82c8718b14bde22cc4b6c0c52db6c2a0a3ce367d889d2c7"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml","sha256":"e80fcf4afec5d8dfac4eaadd61a042c893e63b4735570993ecdb0af768c1294c"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-runtime.secret.yaml","sha256":"ecf49f134d677a21798a0b3099298d4d9d2d0087505c41af4b36be7635934d06"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-migration.secret.yaml","sha256":"c7c2ffe4fc1e4fe75339ce87afce3b44f39701b73e5110c6d59d3de0aa94ac53"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","sha256":"3f23a1ff36b22459c9fd4fc2db8cd3fe1bd68862a7186543a6eb8202ff052bbe"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-read-runtime.secret.yaml","sha256":"b5e8d349a4ac3a0a9106d149a66eecb6bd8640b6cc602c711eba7279415ebfca"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-migrate-v1.yaml","sha256":"334bb125574ac22a8e39c75284bc732f413f16d1622955fe34c14809155ee0b6"}
+  ],
+  "external_proof_bundle":{"path":"verification/fixtures/tranche4-external-paths-v1.tar.gz.base64","sha256":"1c3b37539a5bde36d812fe3a31430216235d0300be95bc875a1f79dfe646307c","member_count":51,"format":"base64(gzip(deterministic-ustar))","generation":"verification/fixtures/tranche4-external-paths-v1.md"},
+  "atomic_symbol_dispositions": [
+    {"path":"actionq/application_completion.py","disposition":"historicalize/delete","symbols":["CompletionService._terminal","CompletionService.complete","CompletionService.fail","CompletionService.reject","CompletionService.settle","CompletionService.cancel","CompletionService.sweep","CompletionService.acknowledge_cancellation"]},
+    {"path":"actionq/application_completion.py","disposition":"replace-by-federation","symbols":["CompletionService","CompletionService.register_publication"]},
+    {"path":"actionq/application_enqueue.py","disposition":"historicalize/delete","symbols":["EnqueueService.enqueue"]},
+    {"path":"actionq/application_enqueue.py","disposition":"replace-by-federation","symbols":["EnqueueService","EnqueueService.create_immutable_action"]},
+    {"path":"actionq/application_groups.py","disposition":"historicalize/delete","symbols":["GroupService.realize_execution_group","GroupService.stop_execution_group"]},
+    {"path":"actionq/application_groups.py","disposition":"retain-as-frozen-archive","symbols":["GroupService","GroupService.list_actions","GroupService.show_action","GroupService.show_execution_group","GroupService.list_execution_groups"]},
+    {"path":"actionq/application_outbox.py","disposition":"historicalize/delete","symbols":["OutboxService.emit_event","OutboxService.record_session"]},
+    {"path":"actionq/application_outbox.py","disposition":"retain-as-frozen-archive","symbols":["OutboxService","OutboxService.list_events","OutboxService.list_sessions"]},
+    {"path":"actionq/action_resource.py","disposition":"retain-as-frozen-archive","symbols":["ActionResourceOwner.enqueue","ActionResourceOwner._lookup","ActionResourceOwner.snapshot","ActionResourceOwner.changes","ActionResourceOwner.project_state","ActionResourceOwner.prune"]},
+    {"path":"actionq/application_core.py","disposition":"retain-as-frozen-archive","symbols":["AuthenticatedActionResourcePrincipal.derive","ActionQCore.enqueue_action_resource","ActionQCore.project_action_resource"]},
+    {"path":"actionq/completion_outbox.py","disposition":"historicalize/delete","symbols":["completion_fields","_duration_ms"]},
+    {"path":"actionq/completion_outbox.py","disposition":"replace-by-federation","symbols":["CompletionOutbox.record","CompletionOutbox.pending","CompletionOutbox.retry","CompletionOutbox.acknowledge","CompletionOutbox.contains_capsule","CompletionOutbox._verify_rows","recover_capsules","inspect_outbox"]},
+    {"path":"actionq/db.py","disposition":"historicalize/delete","symbols":["NoActionAvailable","ClaimRejected","ClaimRejected.__init__","receipt_digest","consume_runner_request","_rate_limited_source","enqueue","realize_execution_group","stop_execution_group","_validate_immutable_claim","claim","_claim_schema3","_renewal_rejection_reason","renew","_transition_terminal","complete","fail","reject","settle_dispatch_result","cancel","acknowledge_cancellation","reap_cancellations","sweep"]},
+    {"path":"actionq/db.py","disposition":"retain-as-frozen-archive","symbols":["get_action","redact_action","prune_dispatch_observation_events","list_actions","summarize_dispatches","list_dispatches","get_execution_group","list_execution_groups","action_events","summarize_sessions","list_events","follow_events","list_sessions"]},
+    {"path":"actionq/db.py","disposition":"replace-by-federation","symbols":["immutable_input_set_digest","_immutable_snapshot","immutable_spec_input_refs","create_immutable_action","register_publication","migrate","check_compatibility","require_compatible","insert_event","event_payload_with_provenance","validate_dispatch_result","_verify_dispatch_result_referent"]}
+  ],
+  "bound_constant_dispositions": [
+    {"path":"actionq/action_resource.py","names":["RESOURCE_RE","TERMINAL","OUTCOMES","PROJECTION_KEYS","SESSION_KEYS","EVENT_KEYS","ROOT_STORAGE_KEYS","SESSION_STORAGE_KEYS","EVENT_STORAGE_KEYS"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/schema.py","names":["DOMAIN","API_VERSION","MIN_SCHEMA_VERSION","MAX_SCHEMA_VERSION","PRE_MIGRATION_BRIDGE_VERSION","MIGRATION_TABLE","_MIGRATION_RE","_COLUMN_SHAPE","_REQUIRED_COLUMNS","_REQUIRED_CONSTRAINT_COUNTS","_REQUIRED_INDEXES","Migration"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/db.py","names":["MAX_CHAIN_DEPTH","DEFAULT_RATE_LIMIT_PER_HOUR","SCHEMA_RE","SESSION_EVENT_TYPES","_ARTIFACT_REF_RE","_GIT_OBJECT_RE","_ATTEMPT_ID_RE","_IMMUTABLE_REF_RE","_IMMUTABLE_DIGEST_RE","_IMMUTABLE_ROLE_CONTRACTS","_GROUP_CONTRACT_ID","_PLAN_REF_RE"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/completion_log.py","names":["SCHEMA_VERSION","_TERMINAL_REASONS"],"disposition":"replace-by-federation"},
+    {"path":"actionq/completion_outbox.py","names":["SCHEMA_VERSION","DEFAULT_OUTBOX_PATH","MAX_RETRY_SECONDS","DEFAULT_ACK_RETENTION_SECONDS","MAX_ACK_RETENTION_SECONDS","SQLITE_BUSY_TIMEOUT_SECONDS","SQLITE_LOCK_RETRY_SECONDS","_SAFE_ERROR_CLASSES"],"disposition":"replace-by-federation"},
+    {"path":"actionq/vuoro.py","names":["SCHEMA_FEATURES","API_VERSION","_object","_NULLABLE_STRING","_NULLABLE_INTEGER","_ACTION_SCHEMA","_EVENT_SCHEMA","_DECISION_SCHEMA","_DECISION_RESULT_SCHEMA","_DISPATCH_V2_RESULT_SCHEMA","_DISPATCH_V2_INPUT_SCHEMA","_MANAGED_DISPATCH_INPUT_SCHEMA","_DISPATCH_RESULT_SCHEMA","_EXECUTION_ENVELOPE_SCHEMA","_EXECUTION_GROUP_SCHEMA","_IMMUTABLE_CANDIDATE_ACTION_INPUT_SCHEMA","_COMPLETION_EVENT_SCHEMA","_COMPLETION_PAGE_SCHEMA","__all__"],"disposition":"historicalize/delete"}
+  ],
+  "atomic_import_dispositions": [
+    {"path":"actionq/db.py","names":["ACTION_CREATION_REQUEST_V1","DISPATCH_RESULT_V1","EXECUTION_ENVELOPE_V1","require_compatible as require_contract_compatible"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/db.py","names":["canonical_bytes as contract_canonical_bytes","sha256_digest as contract_digest"],"disposition":"replace-by-federation"},
+    {"path":"actionq/vuoro.py","names":["DISPATCH_STOP_REASONS","DISPATCH_TERMINAL_STATUSES"],"disposition":"historicalize/delete"}
+  ],
+  "semantic_assets": [
+    {"disposition":"retain-as-frozen-archive","paths":["tests/test_cancellation_model.py","tests/test_candidate_action_cancellation_model.py","tests/test_verification_contracts.py","verification/contexts/action-claim-concurrency.json","verification/contexts/dispatch-enqueue-v2-contract.json","verification/contexts/schema-migration-compatibility.json","verification/contexts/action-resource-owner-v1.json","verification/run_action_resource_history.py","verification/validate_action_resource_owner_v1.py","verification/fixtures/action-resource-owner-v1/manifest.json","verification/fixtures/action-resource-owner-v1/not-found.json","verification/fixtures/action-resource-owner-v1/protocol-responses.json","verification/fixtures/action-resource-owner-v1/required-histories.json","verification/history-receipts/bounded-wait.json","verification/history-receipts/fencing.json","verification/history-receipts/non-disclosure.json","verification/history-receipts/pruning.json","verification/history-receipts/redaction.json","verification/history-receipts/response-loss.json","verification/history-receipts/snapshot-race.json","verification/results/action-resource-owner-bounded-wait.json","verification/results/action-resource-owner-fencing.json","verification/results/action-resource-owner-non-disclosure.json","verification/results/action-resource-owner-pruning.json","verification/results/action-resource-owner-redaction.json","verification/results/action-resource-owner-response-loss.json","verification/results/action-resource-owner-snapshot-race.json"]},
+    {"disposition":"historicalize/delete","paths":["verification/capture_claude_acp.py","verification/probe_claude_acp_set_model.py","verification/probe_claude_acp_settings_binding.py","verification/probe_native_harness_binding.py","docs/operations/codex-luna-catalog-workaround.md","docs/plans/acp-execution-adapter.md","docs/verification/2026-08-13-adapter-kit-depth-2-survey.md","docs/verification/2026-08-13-schema-runtime-depth-2-survey.md",".agents/overlays/actionq.hybrid-worker.md"]},
+    {"disposition":"replace-by-federation","paths":["actionq/migrations/__init__.py","AGENTS.md"]},
+    {"disposition":"retain-as-frozen-archive","paths":["verification/fixtures/tranche4-external-paths-v1.tar.gz.base64","verification/fixtures/tranche4-external-paths-v1.md"]}
+  ],
+  "semantic_asset_inheritance":{"owner":"actionq","falsifying_test":"A selected semantic root is added, removed, or changes category without an explicit W1 disposition."},
+  "effective_disposition_rule":"atomic symbol/import/constant entries override their python-surface or import-group inventory default; critical_reachability is an index only and must reconcile every symbol to that single effective disposition; successor semantics must use distinct names and may not override frozen legacy symbols.",
+  "critical_file_dispositions":[{"disposition":"replace-by-federation","paths":["uv.lock",".github/workflows/ci.yml",".github/workflows/release-actionq-wheel.yaml",".github/scripts/verify-release-image-tag.py","verification/validate_release_contract.py"]}],
+  "host_local_anchors": [
+    {"path":"/projects/dev/AGENTS.md","sha256":"afda50a10c7dcd2df0c3193016b09170585a59dd2e6b5ea01c92f864d572093c","limitation":"host-local mutable workspace guidance","disposition":"historicalize/delete"}
+  ],
+  "python_surfaces": [
+    {
+      "id": "root-package-version-facade",
+      "path": "actionq/__init__.py",
+      "symbols": [],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "A new root callable or class appears without an explicit W1 disposition."
+    },
+    {
+      "id": "coupled-action-resource-owner",
+      "path": "actionq/action_resource.py",
+      "symbols": ["ResourceNotFound", "CursorExpired", "CursorExpired.__init__", "IdempotencyConflict", "canonical_request", "serialize_envelope", "new_resource_ref", "_iso", "_projection", "_event", "EnqueueResult", "ActionResourceOwner", "ActionResourceOwner.__init__", "ActionResourceOwner._cursor", "ActionResourceOwner._parse_cursor", "ActionResourceOwner.enqueue", "ActionResourceOwner._lookup", "ActionResourceOwner.snapshot", "ActionResourceOwner.changes", "ActionResourceOwner.project_state", "ActionResourceOwner.prune"],
+      "disposition": "retain-as-frozen-archive",
+      "owner": "actionq",
+      "falsifying_test": "The resource owner remains action-row/claim coupled, loses a callable during later facade work, or a symbol changes without updating this manifest."
+    },
+    {
+      "id": "mixed-application-facade",
+      "path": "actionq/application.py",
+      "symbols": ["ActionQApplication"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "The facade changes or disappears before retained federation and frozen archive callers have separately proven adapters."
+    },
+    {
+      "id": "legacy-claim-service",
+      "path": "actionq/application_claim.py",
+      "symbols": ["ClaimService", "ClaimService.claim", "ClaimService.renew"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "A federation root imports or exposes claim or lease-renewal authority."
+    },
+    {
+      "id": "mixed-completion-service",
+      "path": "actionq/application_completion.py",
+      "symbols": ["CompletionService", "CompletionService._terminal", "CompletionService.complete", "CompletionService.fail", "CompletionService.reject", "CompletionService.settle", "CompletionService.cancel", "CompletionService.sweep", "CompletionService.acknowledge_cancellation", "CompletionService.register_publication"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Claim-coupled terminal/cancellation behavior crosses the federation seam or evidence/publication behavior is lost while splitting the mixed service."
+    },
+    {
+      "id": "mixed-application-core",
+      "path": "actionq/application_core.py",
+      "symbols": ["InvocationProvenance", "InvocationProvenance.as_event_payload", "AuthenticatedActionResourcePrincipal", "AuthenticatedActionResourcePrincipal.derive", "_json_value", "_fingerprint", "_decision_ref", "ActionQCore", "ActionQCore.__init__", "ActionQCore._verified_result_store", "ActionQCore._project_owned_action", "ActionQCore._transition_owned_action", "ActionQCore._action_resource_owner", "ActionQCore.serialize_action_resource_envelope", "ActionQCore.enqueue_action_resource", "ActionQCore.action_resource_snapshot", "ActionQCore.action_resource_snapshot_response", "ActionQCore.action_resource_changes", "ActionQCore.project_action_resource", "ActionQCore._authorize", "ActionQCore._open", "ActionQCore.connection", "ActionQCore.compatibility", "ActionQCore._completion_log", "ActionQCore.ingest_session_completion", "ActionQCore.list_session_completions", "ActionQCore.session_completion_health", "ActionQCore.compact_session_completions", "ActionQCore._read", "ActionQCore._prior_decision", "ActionQCore._lifecycle_event_refs", "ActionQCore._decision_result", "ActionQCore._idempotency_conflict", "ActionQCore._mutate"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Federation policy inherits runner proof, managed dispatch, claim settlement, or an unpinned callable disappears."
+    },
+    {
+      "id": "legacy-dispatch-service",
+      "path": "actionq/application_dispatch.py",
+      "symbols": ["DispatchService", "DispatchService.list_dispatches", "DispatchService.dispatch", "DispatchService._normalize_dispatch_v2", "DispatchService.enqueue_dispatch_v2", "DispatchService.enqueue_managed_dispatch", "DispatchService.dispatch_action_snapshot", "DispatchService._latest_event_id", "DispatchService.dispatch_action_changes"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "Dispatch/enqueue authority is reachable from federation application roots."
+    },
+    {
+      "id": "mixed-enqueue-service",
+      "path": "actionq/application_enqueue.py",
+      "symbols": ["EnqueueService", "EnqueueService.enqueue", "EnqueueService.create_immutable_action"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Queue enqueue is reinterpreted as federation create, or immutable evidence/candidate behavior is lost during separation."
+    },
+    {
+      "id": "legacy-group-service",
+      "path": "actionq/application_groups.py",
+      "symbols": ["GroupService", "GroupService.list_actions", "GroupService.show_action", "GroupService.realize_execution_group", "GroupService.stop_execution_group", "GroupService.show_execution_group", "GroupService.list_execution_groups"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "Execution-group launch or stop authority appears in federation application/catalog roots."
+    },
+    {
+      "id": "mixed-event-session-outbox",
+      "path": "actionq/application_outbox.py",
+      "symbols": ["OutboxService", "OutboxService.list_events", "OutboxService.emit_event", "OutboxService.list_sessions", "OutboxService.record_session"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Legacy coordinator/session writes survive as federation authority or required archive reads disappear without a replacement."
+    },
+    {
+      "id": "daemon-named-cas",
+      "path": "actionq/cas.py",
+      "symbols": ["artifact_ref", "fsync_directory", "_DaemonCAS", "_DaemonCAS.__init__", "_DaemonCAS._ensure_directory", "_DaemonCAS._path", "_DaemonCAS.put", "_DaemonCAS.get"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Content-address verification changes, or the renamed seam grants execution authority instead of proving evidence bytes."
+    },
+    {
+      "id": "mixed-actionctl-facade",
+      "path": "actionq/cli.py",
+      "symbols": ["ActionQGroup", "ActionQGroup.invoke", "_schema", "_app", "_connect", "_echo_json", "cli", "migrate", "check_compatibility", "add", "list_cmd", "show", "execution_group", "group_realize", "group_show", "group_list", "group_stop", "claim", "renew", "complete", "fail", "reject", "settle", "cancel", "cancel_ack", "register_publication", "sweep", "events", "sessions", "emit"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "A legacy command silently aliases federation semantics, or a callable disappears before versioned deprecation and cutover."
+    },
+    {
+      "id": "completion-observation-repository",
+      "path": "actionq/completion_log.py",
+      "symbols": ["CompletionValidationError", "CompletionConflictError", "CompletionConflictError.__init__", "CompletionCursorExpired", "CompletionCursorExpired.__init__", "canonical_bytes", "payload_digest", "_require_string", "_reject_prohibited", "_utc", "validate_event", "_cursor", "_safe_limit", "_event_row", "CompletionLog", "CompletionLog.__init__", "CompletionLog._q", "CompletionLog._require_compatible", "CompletionLog.ingest", "CompletionLog._quarantine", "CompletionLog._quarantine_durable", "CompletionLog.list", "CompletionLog.health", "CompletionLog.compact"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Completion identity/digest conflict, cursor ordering, recovery floor, or quarantine behavior is lost in the federation repository."
+    },
+    {
+      "id": "completion-observation-outbox",
+      "path": "actionq/completion_outbox.py",
+      "symbols": ["_now", "canonical_bytes", "payload_digest", "CompletionOutbox", "CompletionOutbox.__init__", "CompletionOutbox._connect", "CompletionOutbox._initialize", "CompletionOutbox._enable_wal", "CompletionOutbox.stream_id", "CompletionOutbox.record", "CompletionOutbox.pending", "CompletionOutbox.retry", "CompletionOutbox.acknowledge", "CompletionOutbox.compact", "CompletionOutbox.health", "CompletionOutbox.status", "CompletionOutbox.contains_capsule", "CompletionOutbox._verify_rows", "CompletionConflictError", "_error_class", "completion_fields", "_duration_ms", "recover_capsules", "inspect_outbox", "main"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Response-loss recovery, digest verification, retry, acknowledgement, or capsule rebuild evidence is lost or treated as native execution authority."
+    },
+    {
+      "id": "monolithic-db-seam",
+      "path": "actionq/db.py",
+      "symbols": ["ActionQError", "NoActionAvailable", "ClaimRejected", "ClaimRejected.__init__", "receipt_digest", "consume_runner_request", "immutable_input_set_digest", "_immutable_snapshot", "immutable_spec_input_refs", "create_immutable_action", "register_publication", "_import_psycopg", "schema_name", "qname", "connect", "json_default", "to_json", "parse_json", "_event_payload", "_text", "_parse_timestamp", "_session_deadline", "summarize_sessions", "migrate", "check_compatibility", "require_compatible", "insert_event", "event_payload_with_provenance", "get_action", "redact_action", "_rate_limited_source", "enqueue", "prune_dispatch_observation_events", "list_actions", "_json_list", "summarize_dispatches", "list_dispatches", "_group_projection", "get_execution_group", "list_execution_groups", "realize_execution_group", "stop_execution_group", "action_events", "_validate_immutable_claim", "claim", "_runtime_schema_version", "_claim_schema3", "_renewal_rejection_reason", "renew", "_transition_terminal", "complete", "fail", "reject", "settle_dispatch_result", "validate_dispatch_result", "_verify_dispatch_result_referent", "cancel", "acknowledge_cancellation", "reap_cancellations", "sweep", "list_events", "follow_events", "list_sessions"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Later splitting loses a current facade callable, preserves claim/lease in storage, or leaves db/schema circular through the new storage seam."
+    },
+    {
+      "id": "managed-dispatch-policy",
+      "path": "actionq/managed_dispatch.py",
+      "symbols": ["ManagedDispatchRejected", "ManagedAdmission", "ManagedEnqueueAdmission", "ManagedDispatchPolicy", "load_managed_dispatch_policy", "canonical", "digest", "_deny_model_secrets", "_render_prompt", "_validate_capsule", "admit_managed_request", "admit_managed_enqueue"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "Harness/model/prompt routing or managed enqueue crosses the federation seam."
+    },
+    {
+      "id": "legacy-runner-proof-authority",
+      "path": "actionq/runner_auth.py",
+      "symbols": ["VerifiedRunner", "_registry", "verify_runner_proof"],
+      "disposition": "historicalize/delete",
+      "owner": "actionq",
+      "falsifying_test": "Runner proof becomes permission to create or mutate a federation resource."
+    },
+    {
+      "id": "execution-schema-and-migration-mechanics",
+      "path": "actionq/schema.py",
+      "symbols": ["SchemaCompatibilityError", "SchemaMigrationError", "Compatibility", "Compatibility.as_dict", "_migration_root", "load_migrations", "_render", "_statements", "_row_value", "_ledger_exists", "_applied_migrations", "_ledger_report", "_require_schema8_dispatch_root_quiescence", "_lock_schema8_dispatch_roots", "_data_tables_exist", "_canonical_sql", "_without_redundant_outer_parentheses", "_canonical_default", "_runtime_principal_issue", "_shape_issues", "_unversioned_v1_shape_issues", "_schema3_bridge_shape_issues", "_has_legacy_v1_status_constraint", "check_compatibility", "require_compatible", "_grant_runtime_privileges", "_completion_role", "_grant_completion_privileges", "migrate"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Execution migration bytes/order/checksums drift, execution 013 appears, or schema mechanics keep importing the monolithic db after seam extraction."
+    },
+    {
+      "id": "legacy-vuoro-execution-adapter",
+      "path": "actionq/vuoro.py",
+      "symbols": ["_transport", "AdapterOperation", "_definition", "_provenance", "build_operations", "catalog_metadata", "compatibility_record", "register_operations"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq+vuoro",
+      "falsifying_test": "The 26-operation execution/v1 catalog drifts before coordinated cutover or a new federation catalog inherits legacy execution authority."
+    }
+  ]
+}

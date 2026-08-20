@@ -11,9 +11,9 @@ direct SQL, or import internal database functions to enqueue, claim, complete,
 reject, cancel, sweep, or emit action events.
 
 The behavioral contract is `../q-spec/actionq-spec.md`. Product-native runtimes
-own worker execution. The sibling `actionq-dispatcher` package is a historical
-compatibility launcher for the retired daemon and must not be used with this
-revision. Sprintctl owns sprint and work-item state; appservice owns deployment
+own worker execution. The sibling `actionq-dispatcher` package is a deterministic
+retirement tombstone: it does not launch, resolve, or provide compatibility for
+the retired daemon. Sprintctl owns sprint and work-item state; appservice owns deployment
 and cluster mutation.
 
 ## Development workflow
