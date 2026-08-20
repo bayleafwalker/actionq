@@ -31,6 +31,42 @@ def _migrate(url: str, selected: str) -> None:
         federation_schema.migrate(conn, selected)
 
 
+class _EndpointLockGate:
+    """Connection factory that deterministically synchronizes two concurrent
+    add_relation() calls right after both of their endpoint advisory locks
+    are taken -- the exact window a relation-type-scoped cycle lock has to
+    close. Relying only on a barrier before add_relation() is called leaves
+    several unsynchronized round trips (schema check, idempotency binding)
+    before that window, so plain thread scheduling can accidentally
+    serialize the two calls and let the race go unexercised. Gating is
+    disabled (`armed=False`) during setup so seeding calls are not blocked.
+    """
+
+    def __init__(self, url: str):
+        self._url = url
+        self.armed = False
+        self.barrier = Barrier(2)
+
+    def __call__(self):
+        conn = db.connect(self._url)
+        real_execute = conn.execute
+        state = {"n": 0}
+
+        def gated_execute(query, params=None, **kwargs):
+            result = real_execute(query, params, **kwargs)
+            if (
+                self.armed and isinstance(query, str) and "pg_advisory_xact_lock" in query
+                and params and str(params[0]).startswith("federation-resource/v1:")
+            ):
+                state["n"] += 1
+                if state["n"] == 2:
+                    self.barrier.wait()
+            return result
+
+        conn.execute = gated_execute
+        return conn
+
+
 def test_domain_assets_and_execution_migrations_are_independent(postgres_urls) -> None:
     selected = _new_schema()
     execution_root = Path(__file__).parents[1] / "actionq" / "migrations"
@@ -289,6 +325,34 @@ def test_acl_cas_state_machine_and_rejected_decisions_do_not_change_projection(p
         assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_command_decisions')} WHERE status='rejected'").fetchone()["n"] == 4
 
 
+def test_invalid_relation_type_is_rejected_before_any_resource_lookup(postgres_urls) -> None:
+    # relation_type must be validated before the endpoint locks (its value
+    # picks the cycle-lock key), so this decision durably records with no
+    # resource_ref/before_revision, and it is checked ahead of stale-revision,
+    # owner-mismatch, and resource-not-found -- unlike every other rejection
+    # in this module, which carries the source resource's identity.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    owner = _principal("owner", "federation.create", "federation.relate")
+    source = authority.create(principal=owner, idempotency_key="create", expected_revision=0).resource_ref
+    assert source
+
+    decision = authority.add_relation(
+        principal=owner, idempotency_key="bad-type", source_ref=source,
+        relation_type="not-a-real-type", target_ref="aqf1_" + "Z" * 43, expected_revision=99,
+    )
+    assert decision.code == "invalid-relation-type"
+    assert decision.resource_ref is None
+    assert decision.before_revision is None
+    assert decision.after_revision is None
+    replay = authority.add_relation(
+        principal=owner, idempotency_key="bad-type", source_ref=source,
+        relation_type="not-a-real-type", target_ref="aqf1_" + "Z" * 43, expected_revision=99,
+    )
+    assert replay.replayed is True and replay.response_digest == decision.response_digest
+
+
 def test_relations_are_source_owned_directed_and_do_not_mutate_target(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
@@ -357,7 +421,8 @@ def test_disjoint_endpoint_relation_attempts_cannot_jointly_create_a_cycle(postg
     # a cyclic relation type are also serialized against each other.
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
-    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    gate = _EndpointLockGate(postgres_urls["admin"])
+    authority = FederationAuthority(connection=gate, schema=selected)
     owners = {name: _principal(name, "federation.create", "federation.relate") for name in "abcd"}
     nodes = {
         name: authority.create(principal=owners[name], idempotency_key=name, expected_revision=0).resource_ref
@@ -373,10 +438,9 @@ def test_disjoint_endpoint_relation_attempts_cannot_jointly_create_a_cycle(postg
         relation_type="parent-of", target_ref=nodes["d"], expected_revision=1,
     )
     assert seed_ab.status == "accepted" and seed_cd.status == "accepted"
-    barrier = Barrier(2)
+    gate.armed = True
 
     def relate(principal, key, source, target, expected_revision):
-        barrier.wait()
         return authority.add_relation(
             principal=principal, idempotency_key=key, source_ref=source,
             relation_type="parent-of", target_ref=target, expected_revision=expected_revision,

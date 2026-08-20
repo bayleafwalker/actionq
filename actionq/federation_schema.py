@@ -143,10 +143,52 @@ _REQUIRED_CONSTRAINT_COUNTS: dict[str, dict[str, int]] = {
     "federation_command_decisions": {"p": 1, "c": 5},
 }
 
-# Non-primary-key indexes: index name -> (table, ordered column tuple).
-_REQUIRED_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
-    "federation_relations_target_idx": ("federation_relations", ("target_ref", "relation_type", "source_ref")),
-    "federation_changes_order_idx": ("federation_resource_changes", ("resource_ref", "revision")),
+# Exact CHECK constraint bodies (pg_get_constraintdef output, deparsed by
+# PostgreSQL itself) per table. A count match alone lets any CHECK be
+# swapped for a same-count vacuous one (e.g. CHECK (true)) without being
+# noticed, so the deparsed expression is compared too.
+_REQUIRED_CHECK_EXPRESSIONS: dict[str, frozenset[str]] = {
+    MIGRATION_TABLE: frozenset({"CHECK ((version > 0))"}),
+    "federation_resources": frozenset({
+        "CHECK ((state = ANY (ARRAY['registered'::text, 'evidence-recorded'::text, 'accepted'::text, 'rejected'::text, 'superseded'::text])))",
+        "CHECK ((revision > 0))",
+        "CHECK ((recovery_floor = 0))",
+    }),
+    "federation_resource_changes": frozenset({
+        "CHECK ((revision > 0))",
+        "CHECK ((state = ANY (ARRAY['registered'::text, 'evidence-recorded'::text, 'accepted'::text, 'rejected'::text, 'superseded'::text])))",
+        "CHECK ((payload_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+    }),
+    "federation_relations": frozenset({
+        "CHECK ((relation_type = ANY (ARRAY['parent-of'::text, 'depends-on'::text, 'derived-from'::text, 'supersedes'::text])))",
+        "CHECK ((source_revision > 0))",
+        "CHECK ((source_ref <> target_ref))",
+    }),
+    "federation_execution_refs": frozenset({"CHECK ((source_revision > 0))"}),
+    "federation_evidence": frozenset({
+        "CHECK ((evidence_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+        "CHECK ((source_revision > 0))",
+    }),
+    "federation_acceptance_decisions": frozenset({
+        "CHECK ((outcome = ANY (ARRAY['accepted'::text, 'rejected'::text])))",
+        "CHECK ((source_revision > 0))",
+    }),
+    "federation_settlements": frozenset({"CHECK ((source_revision > 0))"}),
+    "federation_idempotency_bindings": frozenset({"CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text))"}),
+    "federation_command_decisions": frozenset({
+        "CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+        "CHECK ((status = ANY (ARRAY['accepted'::text, 'rejected'::text])))",
+        "CHECK ((response_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+        "CHECK (((before_revision IS NULL) OR (before_revision >= 0)))",
+        "CHECK (((after_revision IS NULL) OR (after_revision >= 0)))",
+    }),
+}
+
+# Non-primary-key indexes: index name -> (table, unique?, ordered column/
+# expression tuple as pg_get_indexdef renders each key, partial predicate).
+_REQUIRED_INDEXES: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {
+    "federation_relations_target_idx": ("federation_relations", False, ("target_ref", "relation_type", "source_ref"), None),
+    "federation_changes_order_idx": ("federation_resource_changes", False, ("resource_ref", "revision"), None),
 }
 
 _DEFAULT_CAST_RE = re.compile(r"::[A-Za-z0-9_ \"]+(\([^)]*\))?\s*$")
@@ -263,22 +305,26 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
     issues: list[str] = []
     tables = tuple(_REQUIRED_CONSTRAINT_COUNTS)
     rows = conn.execute(
-        """SELECT relation.relname AS table_name, constraint_record.contype AS contype, count(*) AS n
+        """SELECT relation.relname AS table_name, constraint_record.contype AS contype,
+                  pg_get_constraintdef(constraint_record.oid) AS definition
            FROM pg_constraint constraint_record
            JOIN pg_class relation ON relation.oid=constraint_record.conrelid
            JOIN pg_namespace namespace_record ON namespace_record.oid=relation.relnamespace
-           WHERE namespace_record.nspname=%s AND relation.relname = ANY(%s)
-           GROUP BY relation.relname, constraint_record.contype""",
+           WHERE namespace_record.nspname=%s AND relation.relname = ANY(%s)""",
         (schema, list(tables)),
     ).fetchall()
-    observed: dict[str, dict[str, int]] = {table: {} for table in tables}
+    counts: dict[str, dict[str, int]] = {table: {} for table in tables}
+    checks: dict[str, set[str]] = {table: set() for table in tables}
     for row in rows:
         table = str(_row(row, "table_name"))
         contype = str(_row(row, "contype", 1))
-        if table in observed:
-            observed[table][contype] = int(_row(row, "n", 2))
+        if table not in counts:
+            continue
+        counts[table][contype] = counts[table].get(contype, 0) + 1
+        if contype == "c":
+            checks[table].add(str(_row(row, "definition", 2)))
     for table, expected_counts in _REQUIRED_CONSTRAINT_COUNTS.items():
-        actual_counts = observed.get(table, {})
+        actual_counts = counts.get(table, {})
         for contype, expected_n in expected_counts.items():
             actual_n = actual_counts.get(contype, 0)
             if actual_n != expected_n:
@@ -288,6 +334,14 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
             # nullability instead; anything else unexpected is a real drift.
             if contype != "n" and contype not in expected_counts and actual_n:
                 issues.append(f"constraint-unexpected:{table}.{contype}")
+    for table, expected_checks in _REQUIRED_CHECK_EXPRESSIONS.items():
+        # A count match alone lets any CHECK be swapped for a same-count
+        # vacuous one (e.g. CHECK (true)); compare PostgreSQL's own
+        # deparsed expression text so a body swap is caught even when the
+        # count above is unchanged.
+        actual_checks = checks.get(table, set())
+        if actual_checks != expected_checks:
+            issues.append(f"check-expression:{table}")
     return issues
 
 
@@ -296,24 +350,35 @@ def _index_issues(conn: Any, schema: str) -> list[str]:
     tables = tuple(_COLUMN_SHAPE)
     rows = conn.execute(
         """SELECT index_class.relname AS index_name, table_class.relname AS table_name,
-                  array_agg(attribute_record.attname ORDER BY key_record.position) AS columns
+                  index_record.indisunique AS is_unique,
+                  pg_get_expr(index_record.indpred, index_record.indrelid, true) AS predicate,
+                  index_record.indexrelid AS index_oid, index_record.indrelid AS table_oid,
+                  index_record.indnatts AS key_count
            FROM pg_index index_record
            JOIN pg_class index_class ON index_class.oid=index_record.indexrelid
            JOIN pg_class table_class ON table_class.oid=index_record.indrelid
            JOIN pg_namespace namespace_record ON namespace_record.oid=table_class.relnamespace
-           JOIN unnest(index_record.indkey) WITH ORDINALITY AS key_record(attnum, position) ON true
-           JOIN pg_attribute attribute_record
-             ON attribute_record.attrelid=table_class.oid AND attribute_record.attnum=key_record.attnum
-           WHERE namespace_record.nspname=%s AND table_class.relname = ANY(%s) AND NOT index_record.indisprimary
-           GROUP BY index_class.relname, table_class.relname""",
+           WHERE namespace_record.nspname=%s AND table_class.relname = ANY(%s) AND NOT index_record.indisprimary""",
         (schema, list(tables)),
     ).fetchall()
-    observed: dict[str, tuple[str, tuple[str, ...]]] = {}
+    observed: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {}
     for row in rows:
         name = str(_row(row, "index_name"))
         table = str(_row(row, "table_name", 1))
-        columns = tuple(_row(row, "columns", 2) or ())
-        observed[name] = (table, columns)
+        is_unique = bool(_row(row, "is_unique", 2))
+        predicate = _row(row, "predicate", 3)
+        index_oid = _row(row, "index_oid", 4)
+        key_count = int(_row(row, "key_count", 6))
+        # pg_get_indexdef per key position renders both plain columns and
+        # expression keys as text, unlike joining pg_attribute directly
+        # (which silently drops expression keys, attnum=0).
+        keys = tuple(
+            str(_row(conn.execute(
+                "SELECT pg_get_indexdef(%s, %s, true) AS key", (index_oid, position),
+            ).fetchone(), "key"))
+            for position in range(1, key_count + 1)
+        )
+        observed[name] = (table, is_unique, keys, str(predicate) if predicate is not None else None)
     for name, expected in _REQUIRED_INDEXES.items():
         actual = observed.get(name)
         if actual is None:

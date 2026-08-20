@@ -234,7 +234,15 @@ class FederationAuthority:
                     request_digest=request_digest, status="rejected", code=rejected.code, message=rejected.message,
                     resource_ref=rejected.resource_ref, before_revision=rejected.before_revision, after_revision=None,
                 )
-            except (TypeError, ValueError, AttributeError, re.error) as malformed:
+            except db.ActionQError:
+                # A real service-level failure (e.g. the schema became
+                # incompatible mid-transaction) is not a malformed *command*
+                # -- it must keep normal exception/retry semantics instead of
+                # being durably recorded as a permanently-replayed rejection.
+                # db.ActionQError subclasses ValueError, so it has to be
+                # excluded explicitly before the broad except below.
+                raise
+            except (TypeError, ValueError, AttributeError) as malformed:
                 # A malformed payload must still be durably recorded once its
                 # idempotency identity is bound above -- otherwise a retry with
                 # the same identity re-attempts the same crash on every call
@@ -441,7 +449,7 @@ class FederationAuthority:
         return self._execute(principal=principal, operation="supersede", idempotency_key=idempotency_key, request=request, apply=apply)
 
     def snapshot(self, *, principal: FederationPrincipal, resource_ref: str) -> dict[str, Any]:
-        if not RESOURCE_RE.fullmatch(resource_ref):
+        if not isinstance(resource_ref, str) or not RESOURCE_RE.fullmatch(resource_ref):
             raise db.ActionQError("resource_ref is not a federation v1 reference")
         if "federation.read" not in principal.authorities:
             raise db.ActionQError("federation.read authority is required")
