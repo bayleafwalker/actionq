@@ -202,6 +202,35 @@ def test_foreign_key_check_is_immune_to_schema_name_and_search_path_rendering(po
                 conn.execute(f'DROP TABLE IF EXISTS "public"."{table}" CASCADE')
 
 
+def test_strip_pg_catalog_qualifier_normalizes_defaults_and_check_bodies() -> None:
+    # A search_path that demotes pg_catalog behind a schema shadowing a
+    # built-in function name (e.g. a same-named now()) makes PostgreSQL
+    # qualify every reference to the real built-in to disambiguate it -- a
+    # rendering difference with no bearing on the schema's actual shape.
+    assert federation_schema._canonical_default("pg_catalog.now()") == "now()"
+    assert federation_schema._canonical_default("'0'::pg_catalog.bigint") == "0"
+    assert federation_schema._strip_pg_catalog_qualifier(
+        "CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::pg_catalog.text))"
+    ) == "CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text))"
+
+
+def test_column_default_check_tolerates_a_shadowed_now_function(postgres_urls) -> None:
+    selected = _new_schema("fed_now_shadow")
+    _migrate(postgres_urls["admin"], selected)
+    shadow_schema = "fed_now_shadow_ns_" + uuid.uuid4().hex[:10]
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f'CREATE SCHEMA "{shadow_schema}"')
+        conn.execute(f'CREATE FUNCTION "{shadow_schema}".now() RETURNS timestamptz AS \'SELECT pg_catalog.now()\' LANGUAGE sql')
+    try:
+        with db.connect(postgres_urls["admin"]) as conn:
+            conn.execute(f'SET search_path TO "{shadow_schema}", pg_catalog, public')
+            result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "compatible", result.detail
+    finally:
+        with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+            conn.execute(f'DROP SCHEMA "{shadow_schema}" CASCADE')
+
+
 def test_snapshot_requires_authenticated_federation_read_authority(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)

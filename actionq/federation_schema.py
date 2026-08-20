@@ -237,6 +237,7 @@ _REQUIRED_INDEXES: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {
 }
 
 _DEFAULT_CAST_RE = re.compile(r"::[A-Za-z0-9_ \"]+(\([^)]*\))?\s*$")
+_PG_CATALOG_QUALIFIER_RE = re.compile(r"\bpg_catalog\.")
 
 
 class FederationSchemaError(db.ActionQError):
@@ -292,10 +293,27 @@ def _ledger_exists(conn: Any, schema: str) -> bool:
     return bool(row and _row(row, "relation"))
 
 
+def _strip_pg_catalog_qualifier(text: str) -> str:
+    """Undo PostgreSQL's pg_catalog-demoted rendering of built-in types and
+    functions (e.g. '...'::pg_catalog.text instead of '...'::text,
+    pg_catalog.now() instead of now()).
+
+    A connection whose search_path explicitly reorders pg_catalog behind a
+    schema that shadows a built-in name (deliberately, or via a same-named
+    object elsewhere) makes PostgreSQL qualify every reference to the real
+    built-in to disambiguate it -- a rendering difference with no bearing
+    on the schema's actual shape. Every expected string in this module
+    (_REQUIRED_CHECK_EXPRESSIONS, this function's own "now()" check below)
+    is written unqualified, so the observed text needs the same
+    normalization before comparison.
+    """
+    return _PG_CATALOG_QUALIFIER_RE.sub("", text)
+
+
 def _canonical_default(value: Any) -> str | None:
     if value is None:
         return None
-    text = str(value).strip()
+    text = _strip_pg_catalog_qualifier(str(value).strip())
     while True:
         match = _DEFAULT_CAST_RE.search(text)
         if match is None:
@@ -392,7 +410,7 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
             continue
         counts[table][contype] = counts[table].get(contype, 0) + 1
         if contype == "c":
-            checks[table].add(definition)
+            checks[table].add(_strip_pg_catalog_qualifier(definition))
         elif contype == "p":
             primary_keys[table] = definition
         elif contype == "f":
