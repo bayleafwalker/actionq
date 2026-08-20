@@ -201,30 +201,33 @@ _REQUIRED_PRIMARY_KEYS: dict[str, str] = {
     "federation_command_decisions": "PRIMARY KEY (environment, principal_id, operation, idempotency_key, request_digest)",
 }
 
-# Exact FOREIGN KEY bodies, same rationale. "{schema}" is substituted with
-# the schema under test before comparison -- pg_get_constraintdef always
-# qualifies the referenced table with its schema.
-_REQUIRED_FOREIGN_KEYS: dict[str, frozenset[str]] = {
-    "federation_resource_changes": frozenset({
-        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
-    }),
-    "federation_relations": frozenset({
-        "FOREIGN KEY (source_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
-        "FOREIGN KEY (target_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
-    }),
-    "federation_execution_refs": frozenset({
-        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
-    }),
-    "federation_evidence": frozenset({
-        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
-    }),
-    "federation_acceptance_decisions": frozenset({
-        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
-    }),
-    "federation_settlements": frozenset({
-        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
-    }),
+# Expected FOREIGN KEY shape: table -> set of local column tuples that must
+# each reference federation_resources(resource_ref) ON DELETE RESTRICT.
+#
+# This is deliberately structural (catalog OIDs and column names), not a
+# comparison against pg_get_constraintdef's rendered text. That text
+# qualifies the referenced table with its schema only when the table is NOT
+# already visible on search_path -- so the same, correct FK renders
+# differently depending on session search_path, the connecting role's name
+# (the implicit "$user" schema), or the federation schema simply being
+# "public". A schema=schema.federation_resources template (even with the
+# schema name quoted correctly) still hardcoded "always qualified" and
+# false-positived shape-mismatch -- or made migrate() itself unmigratable
+# when schema="public" -- on any of those. Comparing confrelid's actual
+# resolved (schema, table) and confkey's resolved column names sidesteps
+# rendering assumptions entirely: both are catalog lookups, never deparsed.
+_REQUIRED_FOREIGN_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "federation_resource_changes": (("resource_ref",),),
+    "federation_relations": (("source_ref",), ("target_ref",)),
+    "federation_execution_refs": (("resource_ref",),),
+    "federation_evidence": (("resource_ref",),),
+    "federation_acceptance_decisions": (("resource_ref",),),
+    "federation_settlements": (("resource_ref",),),
 }
+_FOREIGN_KEY_TARGET_TABLE = "federation_resources"
+_FOREIGN_KEY_TARGET_COLUMNS = ("resource_ref",)
+_FOREIGN_KEY_DELETE_ACTION = "r"  # RESTRICT (pg_constraint.confdeltype)
+_FOREIGN_KEY_UPDATE_ACTION = "a"  # NO ACTION, the unspecified-clause default
 
 # Non-primary-key indexes: index name -> (table, unique?, ordered column/
 # expression tuple as pg_get_indexdef renders each key, partial predicate).
@@ -348,17 +351,39 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
     tables = tuple(_REQUIRED_CONSTRAINT_COUNTS)
     rows = conn.execute(
         """SELECT relation.relname AS table_name, constraint_record.contype AS contype,
-                  pg_get_constraintdef(constraint_record.oid) AS definition
+                  pg_get_constraintdef(constraint_record.oid) AS definition,
+                  ARRAY(
+                      SELECT attribute_record.attname
+                      FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_record(attnum, position)
+                      JOIN pg_attribute attribute_record
+                        ON attribute_record.attrelid=constraint_record.conrelid AND attribute_record.attnum=key_record.attnum
+                      ORDER BY key_record.position
+                  ) AS local_columns,
+                  foreign_namespace.nspname AS foreign_schema,
+                  foreign_relation.relname AS foreign_table,
+                  ARRAY(
+                      SELECT foreign_attribute.attname
+                      FROM unnest(constraint_record.confkey) WITH ORDINALITY AS key_record(attnum, position)
+                      JOIN pg_attribute foreign_attribute
+                        ON foreign_attribute.attrelid=constraint_record.confrelid AND foreign_attribute.attnum=key_record.attnum
+                      ORDER BY key_record.position
+                  ) AS foreign_columns,
+                  constraint_record.confdeltype AS delete_action,
+                  constraint_record.confupdtype AS update_action
            FROM pg_constraint constraint_record
            JOIN pg_class relation ON relation.oid=constraint_record.conrelid
            JOIN pg_namespace namespace_record ON namespace_record.oid=relation.relnamespace
+           LEFT JOIN pg_class foreign_relation ON foreign_relation.oid=constraint_record.confrelid
+           LEFT JOIN pg_namespace foreign_namespace ON foreign_namespace.oid=foreign_relation.relnamespace
            WHERE namespace_record.nspname=%s AND relation.relname = ANY(%s)""",
         (schema, list(tables)),
     ).fetchall()
     counts: dict[str, dict[str, int]] = {table: {} for table in tables}
     checks: dict[str, set[str]] = {table: set() for table in tables}
     primary_keys: dict[str, str] = {}
-    foreign_keys: dict[str, set[str]] = {table: set() for table in tables}
+    # Structural FK identity (catalog OIDs and resolved column names), not
+    # rendered text -- see the comment on _REQUIRED_FOREIGN_KEYS for why.
+    foreign_keys: dict[str, set[tuple[tuple[str, ...], str, str, tuple[str, ...], str, str]]] = {table: set() for table in tables}
     for row in rows:
         table = str(_row(row, "table_name"))
         contype = str(_row(row, "contype", 1))
@@ -371,7 +396,14 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
         elif contype == "p":
             primary_keys[table] = definition
         elif contype == "f":
-            foreign_keys[table].add(definition)
+            foreign_keys[table].add((
+                tuple(_row(row, "local_columns", 3) or ()),
+                str(_row(row, "foreign_schema", 4)),
+                str(_row(row, "foreign_table", 5)),
+                tuple(_row(row, "foreign_columns", 6) or ()),
+                str(_row(row, "delete_action", 7)),
+                str(_row(row, "update_action", 8)),
+            ))
     for table, expected_counts in _REQUIRED_CONSTRAINT_COUNTS.items():
         actual_counts = counts.get(table, {})
         for contype, expected_n in expected_counts.items():
@@ -397,19 +429,13 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
     for table, expected_pk in _REQUIRED_PRIMARY_KEYS.items():
         if primary_keys.get(table) != expected_pk:
             issues.append(f"primary-key:{table}")
-    if _REQUIRED_FOREIGN_KEYS:
-        # pg_get_constraintdef quotes the schema qualifier only when the
-        # identifier needs it (mixed case, reserved word, ...); db.SCHEMA_RE
-        # permits both, so a raw f"{schema}." template would mismatch a
-        # correctly-migrated schema whose name happens to need quoting.
-        # quote_ident() asks PostgreSQL for the exact same rendering
-        # pg_get_constraintdef itself would use, rather than reimplementing
-        # its quoting rules.
-        quoted_schema = str(_row(conn.execute("SELECT quote_ident(%s) AS quoted", (schema,)).fetchone(), "quoted"))
-        for table, expected_fks in _REQUIRED_FOREIGN_KEYS.items():
-            expected = {template.format(schema=quoted_schema) for template in expected_fks}
-            if foreign_keys.get(table, set()) != expected:
-                issues.append(f"foreign-key:{table}")
+    for table, expected_local_columns in _REQUIRED_FOREIGN_KEYS.items():
+        expected = {
+            (columns, schema, _FOREIGN_KEY_TARGET_TABLE, _FOREIGN_KEY_TARGET_COLUMNS, _FOREIGN_KEY_DELETE_ACTION, _FOREIGN_KEY_UPDATE_ACTION)
+            for columns in expected_local_columns
+        }
+        if foreign_keys.get(table, set()) != expected:
+            issues.append(f"foreign-key:{table}")
     return issues
 
 
@@ -600,11 +626,13 @@ def configure_role_boundaries(
         if membership and bool(_row(membership, "member")):
             raise FederationSchemaError(f"{service_role} must not be a member of the federation object-owner role")
     for denied_role in denied_roles:
-        for service_role in (migration_role, command_role):
+        for service_role in (object_owner_role, migration_role, command_role):
             # REVOKE ALL below is issued directly against denied_role; a role
-            # that also inherits from migration_role/command_role would keep
-            # that role's privileges through inheritance regardless, making
-            # the direct REVOKE cosmetic rather than an actual denial.
+            # that also inherits from object_owner_role/migration_role/
+            # command_role would keep that role's privileges (ownership, in
+            # the object-owner case -- stronger than a mere grant) through
+            # inheritance regardless, making the direct REVOKE cosmetic
+            # rather than an actual denial.
             membership = conn.execute("SELECT pg_has_role(%s,%s,'MEMBER') AS member", (denied_role, service_role)).fetchone()
             if membership and bool(_row(membership, "member")):
                 raise FederationSchemaError(f"{denied_role} must not be a member of {service_role} (would inherit federation access despite the direct REVOKE)")
