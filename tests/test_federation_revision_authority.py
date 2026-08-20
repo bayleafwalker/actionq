@@ -138,6 +138,31 @@ def test_federation_compatibility_rejects_column_constraint_and_index_drift(post
         assert result.state == "shape-mismatch"
         assert "index-missing:federation_relations_target_idx" in result.detail
 
+    # A same-count PRIMARY KEY swap: constraint-count alone would not catch
+    # this (still exactly one 'p' constraint), the way it would not have
+    # caught a same-count CHECK swap before that gap was closed.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f"ALTER TABLE {db.qname(selected, 'federation_idempotency_bindings')} DROP CONSTRAINT federation_idempotency_bindings_pkey")
+        conn.execute(f"ALTER TABLE {db.qname(selected, 'federation_idempotency_bindings')} ADD PRIMARY KEY (environment, principal_id, operation, idempotency_key, request_digest)")
+        result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "shape-mismatch"
+        assert "primary-key:federation_idempotency_bindings" in result.detail
+
+    # A same-count FOREIGN KEY swap to a vacuous self-reference.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f"ALTER TABLE {db.qname(selected, 'federation_settlements')} DROP CONSTRAINT federation_settlements_resource_ref_fkey")
+        conn.execute(
+            f"ALTER TABLE {db.qname(selected, 'federation_settlements')} ADD FOREIGN KEY (resource_ref, source_revision) "
+            f"REFERENCES {db.qname(selected, 'federation_settlements')}(resource_ref, source_revision)"
+        )
+        result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "shape-mismatch"
+        assert "foreign-key:federation_settlements" in result.detail
+
 
 def test_snapshot_requires_authenticated_federation_read_authority(postgres_urls) -> None:
     selected = _new_schema()

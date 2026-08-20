@@ -184,6 +184,48 @@ _REQUIRED_CHECK_EXPRESSIONS: dict[str, frozenset[str]] = {
     }),
 }
 
+# Exact PRIMARY KEY bodies (pg_get_constraintdef output), same rationale as
+# _REQUIRED_CHECK_EXPRESSIONS: a count match alone lets a PK's column
+# composition be swapped for anything of the same count. This is the sole
+# uniqueness guarantee behind, e.g., "one idempotency key binds one digest".
+_REQUIRED_PRIMARY_KEYS: dict[str, str] = {
+    MIGRATION_TABLE: "PRIMARY KEY (domain, version)",
+    "federation_resources": "PRIMARY KEY (resource_ref)",
+    "federation_resource_changes": "PRIMARY KEY (resource_ref, revision)",
+    "federation_relations": "PRIMARY KEY (source_ref, relation_type, target_ref)",
+    "federation_execution_refs": "PRIMARY KEY (resource_ref, execution_ref)",
+    "federation_evidence": "PRIMARY KEY (resource_ref, evidence_ref)",
+    "federation_acceptance_decisions": "PRIMARY KEY (resource_ref, source_revision)",
+    "federation_settlements": "PRIMARY KEY (resource_ref, source_revision)",
+    "federation_idempotency_bindings": "PRIMARY KEY (environment, principal_id, operation, idempotency_key)",
+    "federation_command_decisions": "PRIMARY KEY (environment, principal_id, operation, idempotency_key, request_digest)",
+}
+
+# Exact FOREIGN KEY bodies, same rationale. "{schema}" is substituted with
+# the schema under test before comparison -- pg_get_constraintdef always
+# qualifies the referenced table with its schema.
+_REQUIRED_FOREIGN_KEYS: dict[str, frozenset[str]] = {
+    "federation_resource_changes": frozenset({
+        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
+    }),
+    "federation_relations": frozenset({
+        "FOREIGN KEY (source_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
+        "FOREIGN KEY (target_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
+    }),
+    "federation_execution_refs": frozenset({
+        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
+    }),
+    "federation_evidence": frozenset({
+        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
+    }),
+    "federation_acceptance_decisions": frozenset({
+        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
+    }),
+    "federation_settlements": frozenset({
+        "FOREIGN KEY (resource_ref) REFERENCES {schema}.federation_resources(resource_ref) ON DELETE RESTRICT",
+    }),
+}
+
 # Non-primary-key indexes: index name -> (table, unique?, ordered column/
 # expression tuple as pg_get_indexdef renders each key, partial predicate).
 _REQUIRED_INDEXES: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {
@@ -315,14 +357,21 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
     ).fetchall()
     counts: dict[str, dict[str, int]] = {table: {} for table in tables}
     checks: dict[str, set[str]] = {table: set() for table in tables}
+    primary_keys: dict[str, str] = {}
+    foreign_keys: dict[str, set[str]] = {table: set() for table in tables}
     for row in rows:
         table = str(_row(row, "table_name"))
         contype = str(_row(row, "contype", 1))
+        definition = str(_row(row, "definition", 2))
         if table not in counts:
             continue
         counts[table][contype] = counts[table].get(contype, 0) + 1
         if contype == "c":
-            checks[table].add(str(_row(row, "definition", 2)))
+            checks[table].add(definition)
+        elif contype == "p":
+            primary_keys[table] = definition
+        elif contype == "f":
+            foreign_keys[table].add(definition)
     for table, expected_counts in _REQUIRED_CONSTRAINT_COUNTS.items():
         actual_counts = counts.get(table, {})
         for contype, expected_n in expected_counts.items():
@@ -338,10 +387,20 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
         # A count match alone lets any CHECK be swapped for a same-count
         # vacuous one (e.g. CHECK (true)); compare PostgreSQL's own
         # deparsed expression text so a body swap is caught even when the
-        # count above is unchanged.
+        # count above is unchanged. The same applies to PRIMARY KEY and
+        # FOREIGN KEY column composition below -- e.g. a same-count PK swap
+        # would otherwise silently drop the sole DB-level guarantee that one
+        # idempotency key binds one request digest.
         actual_checks = checks.get(table, set())
         if actual_checks != expected_checks:
             issues.append(f"check-expression:{table}")
+    for table, expected_pk in _REQUIRED_PRIMARY_KEYS.items():
+        if primary_keys.get(table) != expected_pk:
+            issues.append(f"primary-key:{table}")
+    for table, expected_fks in _REQUIRED_FOREIGN_KEYS.items():
+        expected = {template.format(schema=schema) for template in expected_fks}
+        if foreign_keys.get(table, set()) != expected:
+            issues.append(f"foreign-key:{table}")
     return issues
 
 
