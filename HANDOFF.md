@@ -1,22 +1,24 @@
 # Handoff — actionq
 
 **As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged)
-**Suite:** 698 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
-deletes 20 tests with the code they covered)*
+**Suite:** 487 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
+deletes the tests along with the code they covered)*
+**`actionq/`: 13,169 → 8,273 LOC.** The execution plane is gone.
 
 ### Start here
 
-1. **Open PR #30**, branch `delete/session-wrapper-execution-plane` — step 3 tranche 1 (session
-   wrapper, 970 LOC) plus the deletion order. Merge or review it first; it is the base for
-   everything below.
-2. **Read `docs/plans/2026-08-20-execution-plane-deletion-order.md` before deleting anything.**
-   It lists four modules that look deletable and are not — a pure import-graph reading removes
-   all four and breaks the estate.
-3. **Steps 1 and 2 are closed.** Step 3 is in progress and **blocked on two decisions that are
-   the operator's, not on further measurement** (§5). If you have those answers, execute
-   tranche 2 or 3. If you do not, *ask* — do not go measure something else to fill the time.
+**All three steps are closed in code. What is left is applying it to running systems, in a
+specific order, and two of those acts need a human.** See §8 — read it before touching the
+cluster or devbox.
 
-Nothing here is waiting on evidence. That is the main thing to know.
+1. **Open PR #30**, branch `delete/session-wrapper-execution-plane` — all of step 3. Deletes the
+   session wrapper, the nine daemon modules, all seven harness adapters, `routing`,
+   `scope_iterate`, `usage_limit`, `git_evidence`, `harness_profiles` and `server.py`.
+2. **Read `docs/plans/2026-08-20-execution-plane-deletion-order.md` first.** It lists four
+   modules that look deletable and are not — a pure import-graph reading removes all four and
+   breaks the estate.
+3. **Two cluster branches in `/projects/dev/appservice` must merge in order** — phase 1 fully
+   reconciled *before* phase 2. Merging phase 2 alone deletes namespace `vscode`. §8.
 
 Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, then the two
 evidence records: `docs/evidence/2026-08-19-acp-v1-conformance.md` (A1–A19, the ACP bridge) and
@@ -114,12 +116,14 @@ justifies the next one. Ordered:
    OpenCode has never completed a turn here. The four adapters in `actionq/harnesses/` invoke
    vendor CLIs directly and *are* the integration points under this architecture — A12–A19
    characterise the ACP bridge, which should not be in Claude's path at all.
-3. **Delete, in an order that keeps devbox working.** ← **YOU ARE HERE.** Order and gates:
-   `docs/plans/2026-08-20-execution-plane-deletion-order.md`. Tranche 1 (session wrapper,
-   970 LOC) is done. Tranche 2 (`server.py`) is gated on removing a declared cluster
-   deployment; tranche 3 (the daemon-only execution plane, **4,480 LOC**) is gated on devbox
-   stopping `actionq-dispatch.service`; tranche 4 (lease/claim inside `db.py`/`schema.py`) is
-   extraction, not deletion, and comes last.
+3. ~~**Delete, in an order that keeps devbox working.**~~ **DONE in code** (PR #30). The
+   operator approved both gates on 2026-08-20: retire `actionq-dispatch.service`, and remove
+   the `actionq-server` deployment — accepting that cockpit's dispatch routes degrade, since
+   dispatch does not function without a fired execution plan. Tranches 1–3 are deleted:
+   **4,896 LOC out of `actionq/`**, no daemon, no queue worker, no harness adapters, no HTTP
+   server. Tranche 4 (lease/claim inside `db.py`/`schema.py`) is **extraction, not deletion**,
+   is reached by every remaining root including `vuoro`, and is the next real work.
+   **Rollout is not finished — see §8.**
 
 *Done when the whole thing is done:* what remains is work identity, relations and revisions;
 authority; evidence requirements and acceptance; references to external executions;
@@ -234,14 +238,11 @@ perform.
   - `opencode.py` stays unverified until one turn completes somewhere; fix the missing `--`
     prompt separator and pass `--format json` when it does.
   - Model reconciliation belongs **above** the adapter, per `base.py`'s contract (N5, point 3).
-- **Step 3 is gated on two decisions that are yours, not further measurement.** The evidence for
-  both is already recorded; waiting cannot add to it.
-  1. **Remove the `actionq-server` cluster deployment?** Unblocks tranche 2 (416 LOC). It is
-     declared in `appservice/.../actionq-server/` with `prune: true`; deleting the directory
-     deletes the workload. *Not verified live from this host — no appservice kubecontext here.*
-  2. **Stop `actionq-dispatch.service` on devbox for good?** Unblocks tranche 3 — **4,480 LOC**,
-     the execution plane proper, and the point of the whole goal. F9 is the argument; F4–F8 showed
-     the fence held with nothing noticing. It runs today only because it was resumed by decision.
+- **Step 3's code is done; its rollout is not.** Both gates were approved 2026-08-20. What
+  remains is §8 — two cluster merges in order, and stopping the devbox unit. Until then the
+  running estate still has a daemon and a server that `main` no longer contains.
+- **Tranche 4 is the next real work:** extract the lease/claim surface out of `db.py` (2,051) and
+  `schema.py` (1,588). Not deletion — every remaining root reaches them, `vuoro` included.
 - ~~Audit `actionq-dispatcher`'s remote branches~~ **done, clean** — one remote branch, PR #1
   MERGED, 0 commits not in `main`. The earlier `gh pr list` failure was the repo-name mismatch
   in §4, not an unaudited backlog.
@@ -295,3 +296,57 @@ delete anything.
   OpenCode hang (cause not isolated, sandbox artifact not excluded), and an apparent broken JSON
   contract that was an artifact of my own `2>&1`. If you find yourself about to cite any of
   them, don't.
+
+---
+
+## 8. Rollout — what is applied where, and the order that matters
+
+Code and running systems have **deliberately diverged**. `main`'s successor (PR #30) has no
+daemon and no server; devbox and the cluster still run both. Nothing here is broken — it is
+staged. Apply in this order.
+
+### 8.1 Cluster — two branches in `/projects/dev/appservice`, strictly ordered
+
+```
+retire/actionq-server-phase1   move ns/vscode + runner identity registry to actionq-db
+retire/actionq-server-phase2   remove the actionq-server app, drop cockpit's env var
+```
+
+**Merging phase 2 without phase 1 reconciled deletes namespace `vscode`, and with it
+agent-cockpit and the actionq CNPG cluster.** The `vscode` Namespace was declared *only* by the
+actionq-server app, whose Kustomization has `prune: true`. Phase 1 moves that declaration to
+`actionq-db`, which stays and which actionq-server already `dependsOn`.
+
+Neither branch is merged, and **neither was pushed to `main`** — Flux reconciles `main`, so a push
+is an apply. Merge phase 1, confirm `ns/vscode` is owned by the actionq-db Kustomization and
+`kubectl get ns vscode` is healthy, *then* merge phase 2.
+
+```bash
+export KUBECONFIG=/projects/dev/appservice/clusters/.kube/config   # per its .envrc
+kubectl get ns vscode; kubectl get deploy -n vscode
+```
+
+Expected end state: `actionq-server` gone; `agent-cockpit` and `actionq-cnpg-*` still running.
+Cockpit's actionq/dispatch routes stop working — **expected, per the operator.**
+
+### 8.2 devbox — `actionq-dispatch.service` is still running
+
+**Not stopped.** It needs interactive sudo, which this session could not supply. Run:
+
+```bash
+ssh devbox-agent 'sudo systemctl disable --now actionq-dispatch.service'
+```
+
+`disable` matters as much as `stop`: without it the unit returns on the next boot. Note the unit
+is **nix-managed**, so the durable retirement is removing it from
+`gitops-nixos/modules/system/actionq-dispatch.nix` — a `systemctl` stop is undone by the next
+`nixos-rebuild`. That module change has **not** been made; it is the last piece of step 3.
+
+### 8.3 Why the running daemon is not at risk from any of this
+
+Devbox has its own checkout pinned to `ab0dfb7` (§0), and the refresh unit fails closed unless
+HEAD matches *and* the tree is clean. Deleting code on `main` cannot reach it. After PR #30
+merges, that pin can never be satisfied by `main` again — which is the intended end state, not a
+fault. Do not "fix" it by bumping `ACTIONQ_REQUIRED_REVISION` to a post-deletion revision: that
+would install a package with no `actionq-daemon` entry point under a unit that expects one.
+Retire the unit (8.2) instead.
