@@ -164,6 +164,19 @@ def test_federation_compatibility_rejects_column_constraint_and_index_drift(post
         assert "foreign-key:federation_settlements" in result.detail
 
 
+def test_foreign_key_check_tolerates_schema_names_pg_get_constraintdef_quotes(postgres_urls) -> None:
+    # pg_get_constraintdef quotes the schema qualifier only when the
+    # identifier needs it (mixed case, a reserved word, ...); db.SCHEMA_RE
+    # permits both, so an unmigrated-looking "compatible" schema whose name
+    # happens to need quoting must not be reported as drifted just because
+    # the FK-body comparison built its expected string unquoted.
+    for selected in (_new_schema(prefix="FedMixedCase"), "select"):
+        _migrate(postgres_urls["admin"], selected)
+        with db.connect(postgres_urls["admin"]) as conn:
+            result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "compatible", (selected, result.detail)
+
+
 def test_snapshot_requires_authenticated_federation_read_authority(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
@@ -660,3 +673,27 @@ def test_postgres_roles_separate_migration_command_and_end_actor_authority(postg
             assert privileges(role, "federation_resources") == (False, False, False)
             assert privileges(role, "federation_command_decisions") == (False, False, False)
             assert privileges(role, "federation_idempotency_bindings") == (False, False, False)
+
+
+def test_configure_role_boundaries_rejects_a_denied_role_that_inherits_command_role(postgres_urls) -> None:
+    # REVOKE ALL is issued directly against each denied role; a denied role
+    # that also inherits command_role's grants via role membership would
+    # keep those privileges regardless, making the direct REVOKE cosmetic.
+    selected = _new_schema("fed_acl_inherit")
+    suffix = uuid.uuid4().hex[:10]
+    owner_role = f"fed_owner_{suffix}"
+    migrator_role = f"fed_migrate_{suffix}"
+    command_role = f"fed_command_{suffix}"
+    inheriting_denied_role = f"fed_shadow_{suffix}"
+    admin_url = postgres_urls["admin"]
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        for role in (owner_role, migrator_role, command_role):
+            conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(role)))
+        conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN IN ROLE {}").format(sql.Identifier(inheriting_denied_role), sql.Identifier(command_role)))
+    _migrate(admin_url, selected)
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        with pytest.raises(federation_schema.FederationSchemaError):
+            federation_schema.configure_role_boundaries(
+                conn, selected, object_owner_role=owner_role, migration_role=migrator_role,
+                command_role=command_role, denied_roles=(inheriting_denied_role,),
+            )

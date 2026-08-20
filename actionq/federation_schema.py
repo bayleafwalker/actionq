@@ -397,10 +397,19 @@ def _constraint_issues(conn: Any, schema: str) -> list[str]:
     for table, expected_pk in _REQUIRED_PRIMARY_KEYS.items():
         if primary_keys.get(table) != expected_pk:
             issues.append(f"primary-key:{table}")
-    for table, expected_fks in _REQUIRED_FOREIGN_KEYS.items():
-        expected = {template.format(schema=schema) for template in expected_fks}
-        if foreign_keys.get(table, set()) != expected:
-            issues.append(f"foreign-key:{table}")
+    if _REQUIRED_FOREIGN_KEYS:
+        # pg_get_constraintdef quotes the schema qualifier only when the
+        # identifier needs it (mixed case, reserved word, ...); db.SCHEMA_RE
+        # permits both, so a raw f"{schema}." template would mismatch a
+        # correctly-migrated schema whose name happens to need quoting.
+        # quote_ident() asks PostgreSQL for the exact same rendering
+        # pg_get_constraintdef itself would use, rather than reimplementing
+        # its quoting rules.
+        quoted_schema = str(_row(conn.execute("SELECT quote_ident(%s) AS quoted", (schema,)).fetchone(), "quoted"))
+        for table, expected_fks in _REQUIRED_FOREIGN_KEYS.items():
+            expected = {template.format(schema=quoted_schema) for template in expected_fks}
+            if foreign_keys.get(table, set()) != expected:
+                issues.append(f"foreign-key:{table}")
     return issues
 
 
@@ -590,6 +599,15 @@ def configure_role_boundaries(
         membership = conn.execute("SELECT pg_has_role(%s,%s,'MEMBER') AS member", (service_role, object_owner_role)).fetchone()
         if membership and bool(_row(membership, "member")):
             raise FederationSchemaError(f"{service_role} must not be a member of the federation object-owner role")
+    for denied_role in denied_roles:
+        for service_role in (migration_role, command_role):
+            # REVOKE ALL below is issued directly against denied_role; a role
+            # that also inherits from migration_role/command_role would keep
+            # that role's privileges through inheritance regardless, making
+            # the direct REVOKE cosmetic rather than an actual denial.
+            membership = conn.execute("SELECT pg_has_role(%s,%s,'MEMBER') AS member", (denied_role, service_role)).fetchone()
+            if membership and bool(_row(membership, "member")):
+                raise FederationSchemaError(f"{denied_role} must not be a member of {service_role} (would inherit federation access despite the direct REVOKE)")
     owner = sql.Identifier(object_owner_role)
     migrator = sql.Identifier(migration_role)
     command = sql.Identifier(command_role)
