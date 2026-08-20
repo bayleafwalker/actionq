@@ -234,6 +234,17 @@ class FederationAuthority:
                     request_digest=request_digest, status="rejected", code=rejected.code, message=rejected.message,
                     resource_ref=rejected.resource_ref, before_revision=rejected.before_revision, after_revision=None,
                 )
+            except (TypeError, ValueError, AttributeError, re.error) as malformed:
+                # A malformed payload must still be durably recorded once its
+                # idempotency identity is bound above -- otherwise a retry with
+                # the same identity re-attempts the same crash on every call
+                # instead of replaying a stored decision.
+                return self._record_decision(
+                    conn, principal=principal, operation=operation, idempotency_key=idempotency_key,
+                    request_digest=request_digest, status="rejected", code="malformed-command",
+                    message=f"command payload could not be validated: {malformed}",
+                    resource_ref=None, before_revision=None, after_revision=None,
+                )
             return self._record_decision(
                 conn, principal=principal, operation=operation, idempotency_key=idempotency_key,
                 request_digest=request_digest, status="accepted", code="accepted", message="federation command recorded",
@@ -338,10 +349,18 @@ class FederationAuthority:
     def record_evidence(self, *, principal: FederationPrincipal, idempotency_key: str,
                         resource_ref: str, evidence_ref: str, evidence_bytes: bytes,
                         assurance_type: str, expected_revision: int) -> CommandDecision:
-        actual_digest = _digest(evidence_bytes)
+        # evidence_bytes may be malformed (wrong type); the digest still has to
+        # be deterministic over the raw request so idempotency replay is
+        # correct, and the type is validated inside apply() so a bad type is
+        # durably recorded as a rejected decision rather than raised before
+        # the command even reaches the idempotency machinery.
+        valid_evidence_bytes = isinstance(evidence_bytes, (bytes, bytearray))
+        actual_digest = _digest(bytes(evidence_bytes)) if valid_evidence_bytes else _digest(repr(evidence_bytes).encode("utf-8"))
         request = {"resource_ref": resource_ref, "evidence_ref": evidence_ref, "evidence_digest": actual_digest, "assurance_type": assurance_type, "expected_revision": expected_revision}
         def apply(conn: Any) -> tuple[str, int, int]:
             self._require_authority(principal, "federation.evidence.ingest")
+            if not valid_evidence_bytes:
+                raise _Rejected("invalid-evidence-bytes", "evidence_bytes must be bytes")
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision)
             if str(row["state"]) not in {"registered", "evidence-recorded"}:
                 raise _Rejected("invalid-state-transition", "evidence may only be recorded before acceptance", resource_ref=resource_ref, before_revision=int(row["revision"]))
@@ -406,8 +425,10 @@ class FederationAuthority:
             return resource_ref, before, after
         return self._execute(principal=principal, operation="supersede", idempotency_key=idempotency_key, request=request, apply=apply)
 
-    def snapshot(self, *, resource_ref: str) -> dict[str, Any]:
+    def snapshot(self, *, principal: FederationPrincipal, resource_ref: str) -> dict[str, Any]:
         self._require_resource_ref(resource_ref)
+        if "federation.read" not in principal.authorities:
+            raise db.ActionQError("federation.read authority is required")
         with self.connection() as conn, conn.transaction():
             federation_schema.require_compatible(conn, self.schema)
             row = self._resource(conn, resource_ref, lock=False)

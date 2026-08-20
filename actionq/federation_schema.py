@@ -32,6 +32,125 @@ REQUIRED_TABLES = (
     "federation_idempotency_bindings", "federation_command_decisions",
 )
 
+# Column shape: table -> column -> (data_type, is_nullable, canonical_default).
+# canonical_default is compared against information_schema.column_default after
+# stripping type casts and quoting -- None means "no default".
+_COLUMN_SHAPE: dict[str, dict[str, tuple[str, str, str | None]]] = {
+    MIGRATION_TABLE: {
+        "domain": ("text", "NO", None),
+        "version": ("integer", "NO", None),
+        "name": ("text", "NO", None),
+        "checksum": ("text", "NO", None),
+        "applied_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_resources": {
+        "resource_ref": ("text", "NO", None),
+        "owner_principal_id": ("text", "NO", None),
+        "state": ("text", "NO", None),
+        "revision": ("bigint", "NO", None),
+        "recovery_floor": ("bigint", "NO", "0"),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+        "updated_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_resource_changes": {
+        "resource_ref": ("text", "NO", None),
+        "revision": ("bigint", "NO", None),
+        "operation": ("text", "NO", None),
+        "state": ("text", "NO", None),
+        "actor_principal_id": ("text", "NO", None),
+        "payload_bytes": ("bytea", "NO", None),
+        "payload_digest": ("text", "NO", None),
+        "occurred_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_relations": {
+        "source_ref": ("text", "NO", None),
+        "relation_type": ("text", "NO", None),
+        "target_ref": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_execution_refs": {
+        "resource_ref": ("text", "NO", None),
+        "execution_ref": ("text", "NO", None),
+        "assurance_type": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_evidence": {
+        "resource_ref": ("text", "NO", None),
+        "evidence_ref": ("text", "NO", None),
+        "evidence_digest": ("text", "NO", None),
+        "assurance_type": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_acceptance_decisions": {
+        "resource_ref": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "outcome": ("text", "NO", None),
+        "policy_ref": ("text", "NO", None),
+        "evidence_ref": ("text", "YES", None),
+        "decided_by": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_settlements": {
+        "resource_ref": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "fact_ref": ("text", "NO", None),
+        "reconciled_by": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_idempotency_bindings": {
+        "environment": ("text", "NO", None),
+        "principal_id": ("text", "NO", None),
+        "operation": ("text", "NO", None),
+        "idempotency_key": ("text", "NO", None),
+        "request_digest": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_command_decisions": {
+        "environment": ("text", "NO", None),
+        "principal_id": ("text", "NO", None),
+        "operation": ("text", "NO", None),
+        "idempotency_key": ("text", "NO", None),
+        "request_digest": ("text", "NO", None),
+        "status": ("text", "NO", None),
+        "code": ("text", "NO", None),
+        "message": ("text", "NO", None),
+        "response_bytes": ("bytea", "NO", None),
+        "response_digest": ("text", "NO", None),
+        "resource_ref": ("text", "YES", None),
+        "before_revision": ("bigint", "YES", None),
+        "after_revision": ("bigint", "YES", None),
+        "decided_at": ("timestamp with time zone", "NO", "now()"),
+    },
+}
+
+# Constraint counts by pg_constraint.contype ('p'=primary key, 'f'=foreign key,
+# 'c'=check, 'u'=unique). PostgreSQL 18 also emits 'n' (not-null) catalog
+# entries for every NOT NULL column; those are validated via the nullability
+# field in _COLUMN_SHAPE instead, so 'n' is deliberately excluded here.
+_REQUIRED_CONSTRAINT_COUNTS: dict[str, dict[str, int]] = {
+    MIGRATION_TABLE: {"p": 1, "c": 1},
+    "federation_resources": {"p": 1, "c": 3},
+    "federation_resource_changes": {"p": 1, "f": 1, "c": 3},
+    "federation_relations": {"p": 1, "f": 2, "c": 3},
+    "federation_execution_refs": {"p": 1, "f": 1, "c": 1},
+    "federation_evidence": {"p": 1, "f": 1, "c": 2},
+    "federation_acceptance_decisions": {"p": 1, "f": 1, "c": 2},
+    "federation_settlements": {"p": 1, "f": 1, "c": 1},
+    "federation_idempotency_bindings": {"p": 1, "c": 1},
+    "federation_command_decisions": {"p": 1, "c": 5},
+}
+
+# Non-primary-key indexes: index name -> (table, ordered column tuple).
+_REQUIRED_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "federation_relations_target_idx": ("federation_relations", ("target_ref", "relation_type", "source_ref")),
+    "federation_changes_order_idx": ("federation_resource_changes", ("resource_ref", "revision")),
+}
+
+_DEFAULT_CAST_RE = re.compile(r"::[A-Za-z0-9_ \"]+(\([^)]*\))?\s*$")
+
 
 class FederationSchemaError(db.ActionQError):
     """The selected federation schema cannot be migrated or served safely."""
@@ -86,12 +205,140 @@ def _ledger_exists(conn: Any, schema: str) -> bool:
     return bool(row and _row(row, "relation"))
 
 
+def _canonical_default(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    while True:
+        match = _DEFAULT_CAST_RE.search(text)
+        if match is None:
+            break
+        text = text[: match.start()].strip()
+    if len(text) >= 2 and text.startswith("'") and text.endswith("'"):
+        text = text[1:-1]
+    if text.lower().startswith("now("):
+        return "now()"
+    return text
+
+
+def _column_issues(conn: Any, schema: str) -> list[str]:
+    issues: list[str] = []
+    tables = tuple(_COLUMN_SHAPE)
+    rows = conn.execute(
+        "SELECT table_name, column_name, data_type, is_nullable, column_default "
+        "FROM information_schema.columns WHERE table_schema=%s AND table_name = ANY(%s)",
+        (schema, list(tables)),
+    ).fetchall()
+    observed: dict[str, dict[str, tuple[str, str, str | None]]] = {table: {} for table in tables}
+    for row in rows:
+        table = str(_row(row, "table_name"))
+        column = str(_row(row, "column_name", 1))
+        if table not in observed:
+            continue
+        if column not in _COLUMN_SHAPE[table]:
+            issues.append(f"column-unexpected:{table}.{column}")
+            continue
+        observed[table][column] = (
+            str(_row(row, "data_type", 2)),
+            str(_row(row, "is_nullable", 3)),
+            _canonical_default(_row(row, "column_default", 4)),
+        )
+    for table, columns in _COLUMN_SHAPE.items():
+        for column, expected in columns.items():
+            actual = observed[table].get(column)
+            if actual is None:
+                issues.append(f"column-missing:{table}.{column}")
+                continue
+            expected_type, expected_nullable, expected_default = expected
+            if actual[0] != expected_type:
+                issues.append(f"column-type:{table}.{column}")
+            if actual[1] != expected_nullable:
+                issues.append(f"column-nullability:{table}.{column}")
+            if actual[2] != expected_default:
+                issues.append(f"column-default:{table}.{column}")
+    return issues
+
+
+def _constraint_issues(conn: Any, schema: str) -> list[str]:
+    issues: list[str] = []
+    tables = tuple(_REQUIRED_CONSTRAINT_COUNTS)
+    rows = conn.execute(
+        """SELECT relation.relname AS table_name, constraint_record.contype AS contype, count(*) AS n
+           FROM pg_constraint constraint_record
+           JOIN pg_class relation ON relation.oid=constraint_record.conrelid
+           JOIN pg_namespace namespace_record ON namespace_record.oid=relation.relnamespace
+           WHERE namespace_record.nspname=%s AND relation.relname = ANY(%s)
+           GROUP BY relation.relname, constraint_record.contype""",
+        (schema, list(tables)),
+    ).fetchall()
+    observed: dict[str, dict[str, int]] = {table: {} for table in tables}
+    for row in rows:
+        table = str(_row(row, "table_name"))
+        contype = str(_row(row, "contype", 1))
+        if table in observed:
+            observed[table][contype] = int(_row(row, "n", 2))
+    for table, expected_counts in _REQUIRED_CONSTRAINT_COUNTS.items():
+        actual_counts = observed.get(table, {})
+        for contype, expected_n in expected_counts.items():
+            actual_n = actual_counts.get(contype, 0)
+            if actual_n != expected_n:
+                issues.append(f"constraint-count:{table}.{contype}:{actual_n}!={expected_n}")
+        for contype, actual_n in actual_counts.items():
+            # 'n' (not-null) catalog entries are validated via column
+            # nullability instead; anything else unexpected is a real drift.
+            if contype != "n" and contype not in expected_counts and actual_n:
+                issues.append(f"constraint-unexpected:{table}.{contype}")
+    return issues
+
+
+def _index_issues(conn: Any, schema: str) -> list[str]:
+    issues: list[str] = []
+    tables = tuple(_COLUMN_SHAPE)
+    rows = conn.execute(
+        """SELECT index_class.relname AS index_name, table_class.relname AS table_name,
+                  array_agg(attribute_record.attname ORDER BY key_record.position) AS columns
+           FROM pg_index index_record
+           JOIN pg_class index_class ON index_class.oid=index_record.indexrelid
+           JOIN pg_class table_class ON table_class.oid=index_record.indrelid
+           JOIN pg_namespace namespace_record ON namespace_record.oid=table_class.relnamespace
+           JOIN unnest(index_record.indkey) WITH ORDINALITY AS key_record(attnum, position) ON true
+           JOIN pg_attribute attribute_record
+             ON attribute_record.attrelid=table_class.oid AND attribute_record.attnum=key_record.attnum
+           WHERE namespace_record.nspname=%s AND table_class.relname = ANY(%s) AND NOT index_record.indisprimary
+           GROUP BY index_class.relname, table_class.relname""",
+        (schema, list(tables)),
+    ).fetchall()
+    observed: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for row in rows:
+        name = str(_row(row, "index_name"))
+        table = str(_row(row, "table_name", 1))
+        columns = tuple(_row(row, "columns", 2) or ())
+        observed[name] = (table, columns)
+    for name, expected in _REQUIRED_INDEXES.items():
+        actual = observed.get(name)
+        if actual is None:
+            issues.append(f"index-missing:{name}")
+        elif actual != expected:
+            issues.append(f"index-shape:{name}")
+    issues.extend(
+        f"index-unexpected:{name}" for name in sorted(set(observed) - set(_REQUIRED_INDEXES))
+    )
+    return issues
+
+
 def _shape_issues(conn: Any, schema: str) -> tuple[str, ...]:
     issues: list[str] = []
     for table in REQUIRED_TABLES:
         row = conn.execute("SELECT to_regclass(%s) AS relation", (db.qname(schema, table),)).fetchone()
         if not row or not _row(row, "relation"):
             issues.append(f"table-missing:{table}")
+    if issues:
+        # Column/constraint/index checks assume every required table exists;
+        # a missing table already fails compatibility on its own.
+        return tuple(sorted(issues))
+    issues.extend(_column_issues(conn, schema))
+    issues.extend(_constraint_issues(conn, schema))
+    issues.extend(_index_issues(conn, schema))
     rows = conn.execute(
         """SELECT source.relname AS source_table, target_namespace.nspname AS target_schema
            FROM pg_constraint constraint_record

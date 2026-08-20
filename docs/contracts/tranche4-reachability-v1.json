@@ -1017,7 +1017,7 @@
     {
       "id": "federation-v1-schema-authority",
       "path": "actionq/federation_schema.py",
-      "symbols": ["FederationSchemaError", "Compatibility", "Compatibility.as_dict", "configured_schema", "load_migrations", "_statements", "_row", "_ledger_exists", "_shape_issues", "check_compatibility", "require_compatible", "migrate", "configure_role_boundaries"],
+      "symbols": ["FederationSchemaError", "Compatibility", "Compatibility.as_dict", "configured_schema", "load_migrations", "_statements", "_row", "_ledger_exists", "_canonical_default", "_column_issues", "_constraint_issues", "_index_issues", "_shape_issues", "check_compatibility", "require_compatible", "migrate", "configure_role_boundaries"],
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "Federation migrations enter the execution domain, compatibility is conflated, or database roles can cross their frozen authority boundary."

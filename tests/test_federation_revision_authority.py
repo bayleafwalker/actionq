@@ -7,6 +7,7 @@ from threading import Barrier
 from pathlib import Path
 
 import psycopg
+import pytest
 from psycopg import sql
 
 from actionq import db, federation_schema, schema
@@ -64,6 +65,107 @@ def test_federation_compatibility_rejects_shape_loss(postgres_urls) -> None:
         assert "table-missing:federation_settlements" in result.detail
 
 
+def test_federation_compatibility_rejects_column_constraint_and_index_drift(postgres_urls) -> None:
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f"ALTER TABLE {db.qname(selected, 'federation_resources')} ALTER COLUMN recovery_floor DROP DEFAULT")
+        result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "shape-mismatch"
+        assert "column-default:federation_resources.recovery_floor" in result.detail
+
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f"ALTER TABLE {db.qname(selected, 'federation_resources')} ALTER COLUMN owner_principal_id DROP NOT NULL")
+        result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "shape-mismatch"
+        assert "column-nullability:federation_resources.owner_principal_id" in result.detail
+
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f"ALTER TABLE {db.qname(selected, 'federation_resources')} DROP CONSTRAINT federation_resources_revision_check")
+        result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "shape-mismatch"
+        assert "constraint-count:federation_resources.c:2!=3" in result.detail
+
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f"DROP INDEX {db.qname(selected, 'federation_relations_target_idx')}")
+        result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "shape-mismatch"
+        assert "index-missing:federation_relations_target_idx" in result.detail
+
+
+def test_snapshot_requires_authenticated_federation_read_authority(postgres_urls) -> None:
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("creator", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+
+    with pytest.raises(db.ActionQError):
+        authority.snapshot(principal=_principal("intruder"), resource_ref=resource)
+    with pytest.raises(db.ActionQError):
+        authority.snapshot(principal=_principal("intruder", "federation.create"), resource_ref=resource)
+    assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=resource)["resource_ref"] == resource
+
+
+def test_malformed_command_with_valid_idempotency_identity_is_durable_and_replayable(postgres_urls) -> None:
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("creator", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+    ingester = _principal("ingester", "federation.evidence.ingest")
+
+    first = authority.record_evidence(
+        principal=ingester, idempotency_key="malformed-evidence", resource_ref=resource,
+        evidence_ref="artifact:sha256:" + "0" * 64, evidence_bytes="not-bytes",
+        assurance_type="verified", expected_revision=1,
+    )
+    replay = authority.record_evidence(
+        principal=ingester, idempotency_key="malformed-evidence", resource_ref=resource,
+        evidence_ref="artifact:sha256:" + "0" * 64, evidence_bytes="not-bytes",
+        assurance_type="verified", expected_revision=1,
+    )
+
+    assert first.status == "rejected" and first.code == "invalid-evidence-bytes" and first.replayed is False
+    assert replay.replayed is True and replay.response_bytes == first.response_bytes
+    assert replay.response_digest == first.response_digest
+    with db.connect(postgres_urls["admin"]) as conn:
+        assert conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_command_decisions')} WHERE idempotency_key=%s",
+            ("malformed-evidence",),
+        ).fetchone()["n"] == 1
+        assert conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_idempotency_bindings')} WHERE idempotency_key=%s",
+            ("malformed-evidence",),
+        ).fetchone()["n"] == 1
+    # A resource_ref of the wrong type is malformed input entirely outside
+    # the specific evidence-bytes guard; it must still be recorded durably.
+    # (It is JSON-serializable so the failure surfaces inside apply(), where
+    # the idempotency identity is already bound -- not before, in the request
+    # canonicalization that happens ahead of the transaction.)
+    type_malformed = authority.record_execution_ref(
+        principal=_principal("owner", "federation.relate"), idempotency_key="bad-ref-type",
+        resource_ref=12345, execution_ref="provider:1", assurance_type="observation",
+        expected_revision=0,
+    )
+    type_malformed_replay = authority.record_execution_ref(
+        principal=_principal("owner", "federation.relate"), idempotency_key="bad-ref-type",
+        resource_ref=12345, execution_ref="provider:1", assurance_type="observation",
+        expected_revision=0,
+    )
+    assert type_malformed.status == "rejected" and type_malformed.code == "malformed-command"
+    assert type_malformed_replay.replayed is True
+    assert type_malformed_replay.response_digest == type_malformed.response_digest
+
+
 def test_create_is_action_independent_and_response_loss_replays_exact_bytes(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
@@ -111,7 +213,7 @@ def test_acl_cas_state_machine_and_rejected_decisions_do_not_change_projection(p
         evidence_bytes=b"evidence", assurance_type="verified", expected_revision=1,
     )
     assert (denied.code, stale.code, mismatch.code) == ("authority-denied", "stale-revision", "evidence-digest-mismatch")
-    assert authority.snapshot(resource_ref=resource)["revision"] == 1
+    assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=resource)["revision"] == 1
 
     evidence_bytes = b"verified evidence"
     evidence_ref = "artifact:sha256:" + hashlib.sha256(evidence_bytes).hexdigest()
@@ -140,7 +242,7 @@ def test_acl_cas_state_machine_and_rejected_decisions_do_not_change_projection(p
     )
     assert [recorded.after_revision, accepted.after_revision, settled.after_revision, superseded.after_revision] == [2, 3, 4, 5]
     assert immutable.code == "resource-superseded"
-    snapshot = authority.snapshot(resource_ref=resource)
+    snapshot = authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=resource)
     assert snapshot["state"] == "superseded" and snapshot["revision"] == 5
     assert snapshot["owner_principal_id"] == "owner" and snapshot["recovery_floor"] == 0
     with db.connect(postgres_urls["admin"]) as conn:
@@ -174,8 +276,8 @@ def test_relations_are_source_owned_directed_and_do_not_mutate_target(postgres_u
     assert relation.after_revision == 2
     assert owner_mismatch.code == "owner-mismatch"
     assert cycle.code == "relation-cycle"
-    assert authority.snapshot(resource_ref=source)["revision"] == 2
-    assert authority.snapshot(resource_ref=target)["revision"] == 1
+    assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=source)["revision"] == 2
+    assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=target)["revision"] == 1
 
 
 def test_opposite_relation_attempts_serialize_cycle_check(postgres_urls) -> None:
@@ -205,7 +307,7 @@ def test_opposite_relation_attempts_serialize_cycle_check(postgres_urls) -> None
 
     assert sorted(decision.status for decision in decisions) == ["accepted", "rejected"]
     assert {decision.code for decision in decisions} == {"accepted", "relation-cycle"}
-    assert sorted((authority.snapshot(resource_ref=left)["revision"], authority.snapshot(resource_ref=right)["revision"])) == [1, 2]
+    assert sorted((authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=left)["revision"], authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=right)["revision"])) == [1, 2]
 
 
 def test_postgres_roles_separate_migration_command_and_end_actor_authority(postgres_urls) -> None:
