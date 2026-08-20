@@ -7,12 +7,15 @@ surface before a later, separately reviewed packet is allowed to move code.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import re
 import subprocess
 import tomllib
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -189,6 +192,41 @@ def _assert_classified(entries: list[dict]) -> None:
         assert entry["falsifying_test"].strip(), entry
 
 
+def _validate_r1_invariants(manifest: dict, cancellation_source: str) -> None:
+    imports = {entry["id"]: entry for entry in manifest["import_groups"]}
+    assert imports["legacy-execution-import-edges"]["disposition"] == "historicalize/delete"
+
+    q_spec = next(
+        item for item in manifest["external_consumers"]
+        if item["id"] == "q-spec-stale-normative-contracts"
+    )
+    assert set(q_spec["paths"]) == set(q_spec["file_sha256"])
+    assert q_spec["file_sha256"]["actionq-spec.md"] == (
+        "61181fb5f3916fe008cfc055004b4b00f75355340dd46a1b98e1e0dace64a4ff"
+    )
+
+    vuoro = next(
+        item for item in manifest["external_consumers"]
+        if item["id"] == "vuoro-composition"
+    )
+    pins = vuoro["pins"]
+    assert pins["legacy_catalog_default_operation_count"] == 26
+    assert pins["legacy_catalog_policy_enabled_operation_count"] == 27
+    assert pins["sole_conditional_operation"] == "execution.managed-dispatch.enqueue"
+    assert pins["managed_dispatch_operation_is_policy_conditional"] is True
+    assert "def test_bounded_depth_three_cancellation_histories(" in cancellation_source
+
+
+def _assert_atomic_entries(entries: list[dict], value_field: str) -> None:
+    observed: dict[tuple[str, str], str] = {}
+    for entry in entries:
+        assert entry["disposition"] in DISPOSITIONS
+        for value in entry[value_field]:
+            key = (entry["path"], value)
+            assert key not in observed, f"conflicting atomic classification: {key}"
+            observed[key] = entry["disposition"]
+
+
 def test_manifest_identity_and_every_entry_is_owned_and_falsifiable():
     manifest = _manifest()
     assert manifest["contract_id"] == "actionq/tranche4-reachability-v1"
@@ -197,6 +235,14 @@ def test_manifest_identity_and_every_entry_is_owned_and_falsifiable():
         "docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md"
     )
     assert set(manifest["dispositions"]) == DISPOSITIONS
+    assert manifest["basis"]["w0_ratification"] == {
+        "third_oracle_accept": "f6750e47edeb9f3a60c23059cd638604ac0d40a4",
+        "final_editorial": "2d0e4abdcf673a8831a9e754b32264bde8a6f438",
+        "merge": "89ec87607d71af1156771db2e0c927d74017f5a0",
+        "ci_run": "32347566284",
+        "ci_job": "96359442888",
+        "status": "R0-accepted-and-merged-before-W1",
+    }
     for section in (
         "python_surfaces",
         "import_groups",
@@ -219,6 +265,55 @@ def test_every_current_root_symbol_is_pinned_to_one_module_disposition():
         entry["path"]: entry["symbols"] for entry in manifest["python_surfaces"]
     }
     assert expected == _python_symbols()
+
+
+def test_mixed_symbols_constants_and_semantic_assets_are_atomically_pinned():
+    manifest = _manifest()
+    _assert_atomic_entries(manifest["atomic_symbol_dispositions"], "symbols")
+    _assert_atomic_entries(manifest["bound_constant_dispositions"], "names")
+    _assert_atomic_entries(manifest["atomic_import_dispositions"], "names")
+    _assert_atomic_entries(
+        [dict(entry, path="semantic-assets") for entry in manifest["semantic_assets"]],
+        "paths",
+    )
+    for entry in manifest["semantic_assets"]:
+        for relative in entry["paths"]:
+            assert (ROOT / relative).is_file(), relative
+    source = (ROOT / "tests/test_cancellation_model.py").read_text(encoding="utf-8")
+    _validate_r1_invariants(manifest, source)
+
+
+def test_r1_reviewer_corruption_probes_are_rejected():
+    manifest = _manifest()
+    source = (ROOT / "tests/test_cancellation_model.py").read_text(encoding="utf-8")
+
+    changed = copy.deepcopy(manifest)
+    next(x for x in changed["import_groups"] if x["id"] == "legacy-execution-import-edges")[
+        "disposition"
+    ] = "replace-by-federation"
+    with pytest.raises(AssertionError):
+        _validate_r1_invariants(changed, source)
+
+    changed = copy.deepcopy(manifest)
+    next(x for x in changed["external_consumers"] if x["id"] == "q-spec-stale-normative-contracts")[
+        "file_sha256"
+    ]["actionq-spec.md"] = "0" * 64
+    with pytest.raises(AssertionError):
+        _validate_r1_invariants(changed, source)
+
+    changed = copy.deepcopy(manifest)
+    pins = next(x for x in changed["external_consumers"] if x["id"] == "vuoro-composition")["pins"]
+    pins["managed_dispatch_operation_is_policy_conditional"] = False
+    pins["legacy_catalog_policy_enabled_operation_count"] = 26
+    with pytest.raises(AssertionError):
+        _validate_r1_invariants(changed, source)
+
+    renamed = source.replace(
+        "test_bounded_depth_three_cancellation_histories",
+        "bounded_depth_three_cancellation_histories",
+    )
+    with pytest.raises(AssertionError):
+        _validate_r1_invariants(manifest, renamed)
 
 
 def test_critical_claim_runner_publication_cas_and_rebuild_symbols_are_bound():
@@ -254,6 +349,18 @@ def test_every_console_script_cli_command_and_catalog_operation_is_pinned():
     operations, handlers = _catalog_operations_and_handlers()
     assert _flatten(manifest["catalog_operation_groups"], "operations") == operations
     assert manifest["catalog_handler_bindings"] == handlers
+
+    from actionq.application import ActionQApplication
+    from actionq.vuoro import build_operations
+
+    default = {item.definition["name"] for item in build_operations(ActionQApplication())}
+    enabled = {
+        item.definition["name"]
+        for item in build_operations(ActionQApplication(managed_dispatch_policy=object()))
+    }
+    assert len(default) == 26
+    assert len(enabled) == 27
+    assert enabled - default == {"execution.managed-dispatch.enqueue"}
 
 
 def test_execution_migrations_001_through_012_are_exact_and_no_013_exists():
@@ -314,6 +421,7 @@ def test_external_consumers_have_immutable_refs_and_operator_gates():
         "vuoro-composition",
         "actionq-dispatcher-tombstone",
         "q-spec-stale-normative-contracts",
+        "sprintctl-actionq-lifecycle",
         "agentops-generated-guidance",
         "gitops-nixos-daemon-retirement",
         "appservice-ordered-retirement",
@@ -325,6 +433,11 @@ def test_external_consumers_have_immutable_refs_and_operator_gates():
     q_spec = consumers["q-spec-stale-normative-contracts"]
     assert q_spec["revision_kind"] == "unversioned-file-digests"
     assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in q_spec["file_sha256"].values())
+    q_spec_root = Path("/projects/dev/q-spec")
+    if q_spec_root.is_dir():
+        assert set(q_spec["paths"]) == set(q_spec["file_sha256"])
+        for relative, expected in q_spec["file_sha256"].items():
+            assert hashlib.sha256((q_spec_root / relative).read_bytes()).hexdigest() == expected
     runner = consumers["actionq-dispatcher-tombstone"]
     assert runner["release"] == "actionq-dispatcher-v0.2.0"
     gitops = consumers["gitops-nixos-daemon-retirement"]

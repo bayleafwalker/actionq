@@ -4,7 +4,8 @@
   "basis": {
     "actionq_commit": "89ec87607d71af1156771db2e0c927d74017f5a0",
     "w0_contract": "docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md",
-    "scope": "Static reachability and consumer classification only. This record does not authorize W2, code movement, schema, migration, catalog, deployment, runtime, or appservice mutation."
+    "scope": "Static reachability and consumer classification only. This record does not authorize W2, code movement, schema, migration, catalog, deployment, runtime, or appservice mutation.",
+    "w0_ratification": {"third_oracle_accept":"f6750e47edeb9f3a60c23059cd638604ac0d40a4","final_editorial":"2d0e4abdcf673a8831a9e754b32264bde8a6f438","merge":"89ec87607d71af1156771db2e0c927d74017f5a0","ci_run":"32347566284","ci_job":"96359442888","status":"R0-accepted-and-merged-before-W1"}
   },
   "dispositions": [
     "retain-as-frozen-archive",
@@ -586,10 +587,17 @@
         "actionq_contracts_source_revision": "0e8b21325a7fd3d59a989110e61ce80476c51dea",
         "actionq_contracts_version": "0.1.1",
         "actionq_contracts_wheel_sha256": "23236d0f662a1dc58eacbc7c5d9a3dcd27f11fb34be2b725945518452119d3df",
+        "adapter_kit_sha256": "0037898a4c9f01720a42302365b0172ecd203732070326ea2abdf549a44bf0c2",
+        "schema_runtime_sha256": "b66c9357c99aa9e1a7353991ce54105a8621958ecfac47f8c121d80b90b77912",
+        "catalog_metadata_sha256": "8d434e8b347e804c90e48a6598304be84b12f2a61ebc2dbed00a26053239a778",
+        "composition_global_revision": "23cfc276ed1fb4a51b94864a963cfd4b0e70a02a73dc3522e13a96e0c9b33c9a",
         "execution_schema": "actionq-schema/v12",
         "legacy_catalog_default_operation_count": 26,
+        "legacy_catalog_policy_enabled_operation_count": 27,
+        "sole_conditional_operation": "execution.managed-dispatch.enqueue",
         "managed_dispatch_operation_is_policy_conditional": true
       },
+      "outcomes":{"frozen-execution-wheel-schema-catalog-and-operation-pins":"retain-as-frozen-archive","federation-v1-fifth-domain":"replace-by-federation"},
       "operations": ["released-wheel fetch/digest", "execution/v1 registration", "four-domain composition", "pre-migration compatibility", "catalog global revision"],
       "disposition": "replace-by-federation",
       "owner": "vuoro",
@@ -614,13 +622,24 @@
       "revision_kind": "unversioned-file-digests",
       "file_sha256": {
         "actionq-spec.md": "61181fb5f3916fe008cfc055004b4b00f75355340dd46a1b98e1e0dace64a4ff",
-        "dispatcher-spec.md": "5ece7f9c6af0eaf96867e1a8ab98d8f4e17774549c283d1f785510d363e14c16"
+        "dispatcher-spec.md": "5ece7f9c6af0eaf96867e1a8ab98d8f4e17774549c283d1f785510d363e14c16",
+        "sprintctl-spec.md": "25f74910b9af050fc3fabf0579bcc8f4e4b600c8c662722b0fc81b84648c0fe3"
       },
       "paths": ["actionq-spec.md", "dispatcher-spec.md", "sprintctl-spec.md"],
       "operations": ["queue/claim/daemon normative contract", "dispatcher claim loop", "queued-dispatch ownership statement"],
       "disposition": "historicalize/delete",
       "owner": "q-spec",
       "falsifying_test": "A stale q-spec is used as tranche-4 implementation authority or supersession omits the dispatcher tombstone and native-runtime/federation boundary."
+    },
+    {
+      "id":"sprintctl-actionq-lifecycle",
+      "repository":"https://github.com/bayleafwalker/sprintctl.git",
+      "commit_refs":{"inspected_worktree":"75fd4a7bc01472f941c923444cabe6451bb1afd0"},
+      "paths":["sprintctl/cli.py","tests/test_takeup.py","docs/advanced/takeup.md"],
+      "operations":["_load_active_actionq_session_ids","takeup sweep archive-session liveness"],
+      "disposition":"unresolved-owner-decision",
+      "owner":"sprintctl",
+      "falsifying_test":"Archive-session reads are removed before takeup sweep has a native lifecycle source and migration tests."
     },
     {
       "id": "agentops-generated-guidance",
@@ -636,6 +655,7 @@
         "docs/plans/agentops/substrate-resilience-plan.md"
       ],
       "operations": ["generated workspace guidance", "hybrid dispatch manifests", "historical daemon plans with supersession markers"],
+      "outcomes":{"cockpit-actionq-write-api":"historicalize/delete","cockpit-archive-session-and-dispatch-reads":"retain-as-frozen-archive","reconciliation-successor":"replace-by-federation"},
       "disposition": "replace-by-federation",
       "owner": "agentops",
       "falsifying_test": "Generated current guidance instructs starting the retired daemon/dispatcher or a historical plan lacks an explicit native-runtime/federation supersession boundary."
@@ -658,6 +678,8 @@
         "docs/runbooks/actionq-devbox-dispatch.md"
       ],
       "operations": ["nix-managed daemon/unit retirement", "client-only actionctl refresh", "runner install removal", "retirement gate"],
+      "outcomes":{"daemon-unit-scripts-runbook":"historicalize/delete","actionctl-client-tools":"retain-as-frozen-archive"},
+      "ci_status":"failing-payment-or-spending-limit-no-steps-executed-at-W1-inspection",
       "merge_gate": "operator-after-appservice-phase2",
       "disposition": "historicalize/delete",
       "owner": "gitops-nixos+operator",
@@ -678,6 +700,7 @@
         "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml"
       ],
       "operations": ["namespace ownership transfer", "runner identity registry transfer", "server removal", "cockpit URL removal", "execution v12 migration job", "database runtime roles"],
+      "outcomes":{"actionq-server":"historicalize/delete","database-and-frozen-archive":"retain-as-frozen-archive","federation-successor":"replace-by-federation","actionq-runner":"unresolved-owner-decision","managed-policy-credentials-vuoro-deployments-roles-jobs":"unresolved-owner-decision"},
       "operator_only": true,
       "required_order": [
         "merge-and-reconcile-phase1",
@@ -691,6 +714,42 @@
       "owner": "operator+appservice",
       "falsifying_test": "Phase 2 precedes phase 1 health proof, namespace pruning deletes vscode/CNPG/cockpit, or any non-operator session mutates/reconciles the cluster."
     }
+  ],
+  "atomic_symbol_dispositions": [
+    {"path":"actionq/application_completion.py","disposition":"historicalize/delete","symbols":["CompletionService._terminal","CompletionService.complete","CompletionService.fail","CompletionService.reject","CompletionService.settle","CompletionService.cancel","CompletionService.sweep","CompletionService.acknowledge_cancellation"]},
+    {"path":"actionq/application_completion.py","disposition":"replace-by-federation","symbols":["CompletionService","CompletionService.register_publication"]},
+    {"path":"actionq/application_enqueue.py","disposition":"historicalize/delete","symbols":["EnqueueService.enqueue"]},
+    {"path":"actionq/application_enqueue.py","disposition":"replace-by-federation","symbols":["EnqueueService","EnqueueService.create_immutable_action"]},
+    {"path":"actionq/application_groups.py","disposition":"historicalize/delete","symbols":["GroupService.realize_execution_group","GroupService.stop_execution_group"]},
+    {"path":"actionq/application_groups.py","disposition":"retain-as-frozen-archive","symbols":["GroupService","GroupService.list_actions","GroupService.show_action","GroupService.show_execution_group","GroupService.list_execution_groups"]},
+    {"path":"actionq/application_outbox.py","disposition":"historicalize/delete","symbols":["OutboxService.emit_event","OutboxService.record_session"]},
+    {"path":"actionq/application_outbox.py","disposition":"retain-as-frozen-archive","symbols":["OutboxService","OutboxService.list_events","OutboxService.list_sessions"]},
+    {"path":"actionq/action_resource.py","disposition":"retain-as-frozen-archive","symbols":["ActionResourceOwner.enqueue","ActionResourceOwner._lookup","ActionResourceOwner.snapshot","ActionResourceOwner.changes","ActionResourceOwner.project_state","ActionResourceOwner.prune"]},
+    {"path":"actionq/completion_outbox.py","disposition":"historicalize/delete","symbols":["completion_fields","_duration_ms"]},
+    {"path":"actionq/completion_outbox.py","disposition":"replace-by-federation","symbols":["CompletionOutbox.record","CompletionOutbox.pending","CompletionOutbox.retry","CompletionOutbox.acknowledge","CompletionOutbox.contains_capsule","CompletionOutbox._verify_rows","recover_capsules","inspect_outbox"]},
+    {"path":"actionq/db.py","disposition":"historicalize/delete","symbols":["NoActionAvailable","ClaimRejected","ClaimRejected.__init__","receipt_digest","consume_runner_request","_rate_limited_source","enqueue","realize_execution_group","stop_execution_group","_validate_immutable_claim","claim","_claim_schema3","_renewal_rejection_reason","renew","_transition_terminal","complete","fail","reject","settle_dispatch_result","cancel","acknowledge_cancellation","reap_cancellations","sweep"]},
+    {"path":"actionq/db.py","disposition":"retain-as-frozen-archive","symbols":["get_action","redact_action","prune_dispatch_observation_events","list_actions","summarize_dispatches","list_dispatches","get_execution_group","list_execution_groups","action_events","summarize_sessions","list_events","follow_events","list_sessions"]},
+    {"path":"actionq/db.py","disposition":"replace-by-federation","symbols":["immutable_input_set_digest","_immutable_snapshot","immutable_spec_input_refs","create_immutable_action","register_publication","migrate","check_compatibility","require_compatible","insert_event","event_payload_with_provenance","validate_dispatch_result","_verify_dispatch_result_referent"]}
+  ],
+  "bound_constant_dispositions": [
+    {"path":"actionq/schema.py","names":["DOMAIN","API_VERSION","MIN_SCHEMA_VERSION","MAX_SCHEMA_VERSION"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/db.py","names":["SESSION_EVENT_TYPES","_IMMUTABLE_ROLE_CONTRACTS"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/completion_log.py","names":["SCHEMA_VERSION","_TERMINAL_REASONS"],"disposition":"replace-by-federation"},
+    {"path":"actionq/completion_outbox.py","names":["SCHEMA_VERSION","DEFAULT_ACK_RETENTION_SECONDS","MAX_ACK_RETENTION_SECONDS"],"disposition":"replace-by-federation"},
+    {"path":"actionq/vuoro.py","names":["SCHEMA_FEATURES","API_VERSION","_ACTION_SCHEMA","_EVENT_SCHEMA","_DISPATCH_V2_INPUT_SCHEMA","_MANAGED_DISPATCH_INPUT_SCHEMA"],"disposition":"historicalize/delete"}
+  ],
+  "atomic_import_dispositions": [
+    {"path":"actionq/db.py","names":["ACTION_CREATION_REQUEST_V1","DISPATCH_RESULT_V1","EXECUTION_ENVELOPE_V1","require_compatible as require_contract_compatible"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/db.py","names":["canonical_bytes as contract_canonical_bytes","sha256_digest as contract_digest"],"disposition":"replace-by-federation"},
+    {"path":"actionq/vuoro.py","names":["DISPATCH_STOP_REASONS","DISPATCH_TERMINAL_STATUSES"],"disposition":"historicalize/delete"}
+  ],
+  "semantic_assets": [
+    {"disposition":"retain-as-frozen-archive","paths":["tests/test_cancellation_model.py","tests/test_candidate_action_cancellation_model.py","tests/test_verification_contracts.py","verification/contexts/action-claim-concurrency.json","verification/contexts/dispatch-enqueue-v2-contract.json","verification/contexts/schema-migration-compatibility.json","verification/fixtures/action-resource-owner-v1/manifest.json","verification/fixtures/action-resource-owner-v1/not-found.json","verification/fixtures/action-resource-owner-v1/protocol-responses.json","verification/fixtures/action-resource-owner-v1/required-histories.json","verification/history-receipts/bounded-wait.json","verification/history-receipts/fencing.json","verification/history-receipts/non-disclosure.json","verification/history-receipts/pruning.json","verification/history-receipts/redaction.json","verification/history-receipts/response-loss.json","verification/history-receipts/snapshot-race.json","verification/results/action-resource-owner-bounded-wait.json","verification/results/action-resource-owner-fencing.json","verification/results/action-resource-owner-non-disclosure.json","verification/results/action-resource-owner-pruning.json","verification/results/action-resource-owner-redaction.json","verification/results/action-resource-owner-response-loss.json","verification/results/action-resource-owner-snapshot-race.json"]},
+    {"disposition":"historicalize/delete","paths":["verification/capture_claude_acp.py","verification/probe_claude_acp_set_model.py","verification/probe_claude_acp_settings_binding.py","verification/probe_native_harness_binding.py","docs/operations/codex-luna-catalog-workaround.md","docs/plans/acp-execution-adapter.md","docs/verification/2026-08-13-adapter-kit-depth-2-survey.md","docs/verification/2026-08-13-schema-runtime-depth-2-survey.md",".agents/overlays/actionq.hybrid-worker.md"]},
+    {"disposition":"replace-by-federation","paths":["actionq/migrations/__init__.py"]}
+  ],
+  "host_local_anchors": [
+    {"path":"/projects/dev/AGENTS.md","sha256":"afda50a10c7dcd2df0c3193016b09170585a59dd2e6b5ea01c92f864d572093c","limitation":"host-local mutable workspace guidance","disposition":"historicalize/delete"}
   ],
   "python_surfaces": [
     {
