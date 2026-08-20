@@ -257,6 +257,8 @@ def test_manifest_identity_and_every_entry_is_owned_and_falsifiable():
         "external_consumers",
     ):
         _assert_classified(manifest[section])
+    _check_mixed_symbols_constants_and_semantic_assets()
+    _check_r1_reviewer_corruption_probes()
 
 
 def test_every_current_root_symbol_is_pinned_to_one_module_disposition():
@@ -267,7 +269,7 @@ def test_every_current_root_symbol_is_pinned_to_one_module_disposition():
     assert expected == _python_symbols()
 
 
-def test_mixed_symbols_constants_and_semantic_assets_are_atomically_pinned():
+def _check_mixed_symbols_constants_and_semantic_assets():
     manifest = _manifest()
     _assert_atomic_entries(manifest["atomic_symbol_dispositions"], "symbols")
     _assert_atomic_entries(manifest["bound_constant_dispositions"], "names")
@@ -283,7 +285,7 @@ def test_mixed_symbols_constants_and_semantic_assets_are_atomically_pinned():
     _validate_r1_invariants(manifest, source)
 
 
-def test_r1_reviewer_corruption_probes_are_rejected():
+def _check_r1_reviewer_corruption_probes():
     manifest = _manifest()
     source = (ROOT / "tests/test_cancellation_model.py").read_text(encoding="utf-8")
 
