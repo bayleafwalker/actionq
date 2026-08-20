@@ -38,6 +38,10 @@
         "actionq.completion_log|from|actionq|schema",
         "actionq.db|from|actionq|schema",
         "actionq.db|from|actionq.cas|_DaemonCAS",
+        "actionq.federation|from|actionq|db",
+        "actionq.federation|from|actionq|federation_schema",
+        "actionq.federation|from|actionq_contracts|canonical_bytes",
+        "actionq.federation_schema|from|actionq|db",
         "actionq.schema|from|actionq|db",
         "actionq.vuoro|from|actionq|db",
         "actionq.vuoro|from|actionq.application|ActionQApplication,InvocationProvenance",
@@ -999,6 +1003,22 @@
       "disposition": "historicalize/delete",
       "owner": "actionq",
       "falsifying_test": "Runner proof becomes permission to create or mutate a federation resource."
+    },
+    {
+      "id": "federation-v1-command-authority",
+      "path": "actionq/federation.py",
+      "symbols": ["FederationPrincipal", "FederationPrincipal.__post_init__", "FederationPrincipal.authenticated", "CommandDecision", "CommandDecision.response", "_Rejected", "_Rejected.__init__", "_new_resource_ref", "_digest", "_decision_from_row", "FederationAuthority", "FederationAuthority.__init__", "FederationAuthority._q", "FederationAuthority._response", "FederationAuthority._record_decision", "FederationAuthority._resource", "FederationAuthority._require_resource_ref", "FederationAuthority._require_revision", "FederationAuthority._require_authority", "FederationAuthority._locked_existing", "FederationAuthority._advance", "FederationAuthority._execute", "FederationAuthority.create", "FederationAuthority.add_relation", "FederationAuthority.record_execution_ref", "FederationAuthority.record_evidence", "FederationAuthority.decide_acceptance", "FederationAuthority.record_settlement", "FederationAuthority.supersede", "FederationAuthority.snapshot"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "The federation root imports execution policy, omits ACL/CAS/idempotency authority, or gains runtime/catalog side effects."
+    },
+    {
+      "id": "federation-v1-schema-authority",
+      "path": "actionq/federation_schema.py",
+      "symbols": ["FederationSchemaError", "Compatibility", "Compatibility.as_dict", "configured_schema", "load_migrations", "_statements", "_row", "_ledger_exists", "_shape_issues", "check_compatibility", "require_compatible", "migrate", "configure_role_boundaries"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Federation migrations enter the execution domain, compatibility is conflated, or database roles can cross their frozen authority boundary."
     },
     {
       "id": "execution-schema-and-migration-mechanics",
