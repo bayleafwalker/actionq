@@ -1,9 +1,15 @@
 # Handoff — actionq
 
-**As of:** 2026-08-19 · **Branch:** `feat/acp-backend-registry` ([PR #26](https://github.com/bayleafwalker/actionq/pull/26)) · **Suite:** 718 passed, 19 skipped, 0 failed
+**As of:** 2026-08-19 (end of session) · **`main`:** `0fb33f6` (PR #28 merged) · **Suite:** 718 passed, 19 skipped, 0 failed
 
-Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, then
-`docs/evidence/2026-08-19-acp-v1-conformance.md` (findings A1–A19). This file is the map.
+**Unmerged branch you own:** `evidence/native-harness-qualification` — 2 commits, pushed, **no PR
+opened**. Open or merge it first; everything in §2 step 2 builds on it.
+
+Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, then the two
+evidence records: `docs/evidence/2026-08-19-acp-v1-conformance.md` (A1–A19, the ACP bridge) and
+`docs/evidence/2026-08-19-native-harness-qualification.md` (N1–N5, the Claude native harness).
+`docs/evidence/2026-08-19-devbox-fence-baseline.md` (F1–F10) is the closed fence experiment —
+read it only if you are tempted to cite the fence for anything. This file is the map.
 
 ---
 
@@ -68,11 +74,13 @@ argument.
 Not a rewrite, and not a plan to execute top-down. Each step must produce evidence that
 justifies the next one. Ordered:
 
-1. **Read the fence experiment.** The daemon has been paused since 2026-08-19. What actually
-   stopped working? *Done when:* there is a written list of what broke and what did not.
-   A quiet week is itself the strongest possible argument for deletion — record that outcome
-   as carefully as a noisy one.
-2. **Qualify the native harnesses, the way ACP was qualified.** `actionq/harnesses/`
+1. ~~**Read the fence experiment.**~~ **CLOSED** — F1–F10. It did not conclude as designed: the
+   fence was fed, proven to hold against real claimable work, then ended by decision after a
+   21-minute soak. **Never cite the soak.** The conclusion is **F9**: seventeen actions across
+   the queue's entire history, all hand-created, and no dispatch planner exists on any host.
+   *There is no standing demand for a claim loop.*
+2. **Qualify the native harnesses, the way ACP was qualified.** ← **YOU ARE HERE.** Claude is
+   done (N1–N5); `codex.py`, `opencode.py`, `copilot.py` remain. `actionq/harnesses/`
    (`claude.py`, `codex.py`, `opencode.py`, `copilot.py`) invoke vendor CLIs directly. Under
    this architecture *those are the integration points*, and their binding assurance is
    **completely unmeasured** — everything in A12–A19 characterises the ACP bridge, which
@@ -99,6 +107,11 @@ daemon, no queue, no leases, no fan-out engine.**
 | Binding needs **two** checks, not one | substring matching downgrades `sonnet-5`→`sonnet`; an unadvertised id is *adopted verbatim* and round-trips cleanly | A17, `verify_bound_model` |
 | ACP is **one integration, not the funnel** | native harnesses preserve subscription, session, context and first-party improvements | A19 |
 | The durable output of the ACP work is the **qualification record**, not an implementation | workflow-specific, outlives the adapter, regenerates in minutes | A19 |
+| Claude's native harness emits **no drifted flags** — every flag `build_command` produces exists on the installed CLI | probed against `claude --help` on this host | N1 |
+| The native harness has a **real model read-back**: `modelUsage` keys name the resolved dated id | `--output-format json` returns it; `provider: "firstParty"` confirms the subscription path | N2 |
+| That read-back is **post-hoc, not pre-flight** — unlike A17's `currentModelId` | it arrives only after the turn has already consumed usage | N2, A17 |
+| An unknown model **fails closed**, consuming nothing | probe: rejected before any turn ran | N3 |
+| `is_error` and `modelUsage` are **independent signals** — a rejected turn can still consume usage on a model the caller never asked for | `gpt-4o` was rejected with the same error class, yet 897 input tokens were consumed against `claude-haiku-4-5` | N4 |
 | `session/list` stays below the runner boundary | machine-global: 50 sessions across 12 unrelated projects, incl. the observing session | A15 |
 | Providers are **not fungible** for subscription work | OpenCode cannot use Claude Pro/Max; Agentic Workflows use provider credentials | plan doc |
 | Work state stays ours | adopting GitHub Issues means adopting its meaning of open/closed in place of `ready\|claimed\|blocked\|accepted\|rejected\|superseded\|integrated` | plan doc |
@@ -127,6 +140,17 @@ perform.
 - **`tests/test_managed_dispatch.py` needs the agentops sibling checkout** to be on a branch
   carrying `templates/dispatch/scripts/render_managed_capsule.py`. It now skips with a clear
   message instead of aborting collection of all 700+ tests.
+- **A harness rejection is not proof that nothing ran.** N4: `--model gpt-4o` returned an
+  error envelope *and* billed 897 input tokens against `claude-haiku-4-5`. Any qualification
+  probe must read `is_error` and `modelUsage` separately; treating the error as "no execution"
+  under-reports usage against a model the caller never requested.
+- **Dollar figures in Claude CLI envelopes are notional.** `total_cost_usd` / `costUSD` are
+  equivalent-usage accounting, not spend: this estate holds subscriptions only, with API
+  billing enabled nowhere (`provider: "firstParty"` is the envelope's own confirmation).
+  Never write them up as cost.
+- **The `actionq-dispatcher` checkout's GitHub remote is `bayleafwalker/actionq-dispatch`** —
+  no `-er`. A `gh` command that infers the repo from the directory name fails; that is what
+  made the branch sweep skip it, not an access problem.
 - **Never `pgrep -f` a pattern your own command line contains.** A cleanup loop matched its
   own ssh invocation and killed its own session mid-run. Use `[b]in/postgres` style.
 - **Disposable test clusters leak on abnormal exit.** `pytest_unconfigure` does not run under
@@ -147,10 +171,16 @@ perform.
   queue; it is *not* an argument that dispatched execution was worthless (action 14 succeeded),
   only that demand is episodic and human-initiated — a shape a federation layer serves without
   a daemon.
-- **Native harness qualification is unstarted** and is now the highest-value next measurement
-  outright, since step 1 is closed and step 3 is deletion work.
-- `actionq-dispatcher`'s remote branches were never audited: its `gh pr list` failed during
-  the branch sweep and it was skipped rather than assumed empty. Redo that one repo.
+- **Native harness qualification is half done.** Claude is qualified (N1–N5,
+  `docs/evidence/2026-08-19-native-harness-qualification.md`). `codex.py`, `opencode.py` and
+  `copilot.py` are **unmeasured** — that is the next work. N5 states what a qualified adapter
+  needs; reproduce it per harness in the shape of the A19 table.
+- **The evidence branch has no PR.** `evidence/native-harness-qualification` carries the N1–N5
+  record in 2 pushed commits with nothing opened against it. Open or merge it before building
+  on top; otherwise the second harness's record lands on an unreviewed base.
+- ~~Audit `actionq-dispatcher`'s remote branches~~ **done, clean** — one remote branch, PR #1
+  MERGED, 0 commits not in `main`. The earlier `gh pr list` failure was the repo-name mismatch
+  in §4, not an unaudited backlog.
 - ~~Untangle the devbox schema-error / different-binary contradiction~~ **resolved** — F1, F2.
   The `too-new` error was `actionctl`'s, surfaced through the daemon's `claim` subprocess while
   the daemon adapter itself reported schema 12 compatible; the 2026-08-16 restart cleared it.
@@ -160,3 +190,6 @@ perform.
   reconciled them.
 - 20 previously machine-only branches were pushed to origin across the estate; they still
   need merge-or-drop decisions.
+- Minor, noted only: two detached-HEAD worktrees under `/projects/dev/_projects/` reference
+  actionq-dispatcher (`2f299ce`, `9acf071`) and were never reconciled; the merged remote branch
+  `chore/remove-stale-environment-pointer-20260811` can be deleted.
