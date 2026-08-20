@@ -1,5 +1,14 @@
 # Handoff — actionq
 
+> **Post-merge architecture update (2026-08-20):** PR #30 is merged on `main` at
+> `9dccf4e`. Tranches 1–3 are therefore repository history, not an open branch. Tranche 4 is
+> frozen for review in
+> `docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md`: claim/lease is a
+> transitional read-only compatibility archive, revision-CAS federation resources replace it
+> as authority, and no broad extraction starts before that oracle is ratified. The live-state
+> and rollout notes below are retained as historical/operator evidence; this documentation
+> update does not authorize deployment or runtime mutation.
+
 **As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged)
 **Suite:** 480 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
 deletes the tests along with the code they covered)*
