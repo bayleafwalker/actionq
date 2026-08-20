@@ -285,20 +285,31 @@ class FederationAuthority:
         request = {"source_ref": source_ref, "relation_type": relation_type, "target_ref": target_ref, "expected_revision": expected_revision}
         def apply(conn: Any) -> tuple[str, int, int]:
             self._require_authority(principal, "federation.relate")
+            self._require_resource_ref(source_ref)
+            self._require_resource_ref(target_ref)
+            if relation_type not in RELATION_TYPES:
+                raise _Rejected("invalid-relation-type", "relation type is not supported")
             # Opposite-direction relation attempts must not each inspect a
             # graph that predates the other edge.  Lock both endpoints in a
             # stable order before checking ownership, existence and cycles.
-            self._require_resource_ref(source_ref)
-            self._require_resource_ref(target_ref)
             for locked_ref in sorted((source_ref, target_ref)):
                 conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (f"federation-resource/v1:{locked_ref}",),
                 )
+            if relation_type in CYCLIC_RELATION_TYPES:
+                # Endpoint locks alone only serialize writes that share an
+                # endpoint. Two concurrent adds with pairwise-disjoint
+                # endpoints (e.g. existing A->B, C->D; concurrent B->C and
+                # D->A) would each pass a cycle probe against committed-only
+                # state and jointly create a cycle. A lock scoped to the
+                # relation type serializes every cycle-checked write of that
+                # type, closing the gap.
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"federation-cycle/v1:{relation_type}",),
+                )
             source = self._locked_existing(conn, principal=principal, resource_ref=source_ref, expected_revision=expected_revision, owner_required=True)
-            if relation_type not in RELATION_TYPES:
-                raise _Rejected("invalid-relation-type", "relation type is not supported", resource_ref=source_ref, before_revision=int(source["revision"]))
-            self._require_resource_ref(target_ref)
             if source_ref == target_ref:
                 raise _Rejected("self-relation", "self relations are forbidden", resource_ref=source_ref, before_revision=int(source["revision"]))
             if self._resource(conn, target_ref, lock=False) is None:
@@ -335,8 +346,10 @@ class FederationAuthority:
         def apply(conn: Any) -> tuple[str, int, int]:
             self._require_authority(principal, "federation.relate")
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision, owner_required=True)
-            if not execution_ref or not assurance_type:
-                raise _Rejected("invalid-execution-reference", "execution_ref and assurance_type are required", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            if not execution_ref:
+                raise _Rejected("invalid-execution-reference", "execution_ref is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            if not assurance_type:
+                raise _Rejected("invalid-assurance-type", "assurance_type is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
             exists = conn.execute(f"SELECT 1 FROM {self._q('federation_execution_refs')} WHERE resource_ref=%s AND execution_ref=%s", (resource_ref, execution_ref)).fetchone()
             if exists:
                 raise _Rejected("execution-reference-exists", "execution reference already exists", resource_ref=resource_ref, before_revision=int(row["revision"]))
@@ -364,8 +377,10 @@ class FederationAuthority:
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision)
             if str(row["state"]) not in {"registered", "evidence-recorded"}:
                 raise _Rejected("invalid-state-transition", "evidence may only be recorded before acceptance", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            if not assurance_type:
+                raise _Rejected("invalid-assurance-type", "assurance_type is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
             expected_ref = "artifact:" + actual_digest
-            if evidence_ref != expected_ref or not assurance_type:
+            if evidence_ref != expected_ref:
                 raise _Rejected("evidence-digest-mismatch", "evidence bytes do not match the content-addressed reference", resource_ref=resource_ref, before_revision=int(row["revision"]))
             exists = conn.execute(f"SELECT 1 FROM {self._q('federation_evidence')} WHERE resource_ref=%s AND evidence_ref=%s", (resource_ref, evidence_ref)).fetchone()
             if exists:
@@ -426,7 +441,8 @@ class FederationAuthority:
         return self._execute(principal=principal, operation="supersede", idempotency_key=idempotency_key, request=request, apply=apply)
 
     def snapshot(self, *, principal: FederationPrincipal, resource_ref: str) -> dict[str, Any]:
-        self._require_resource_ref(resource_ref)
+        if not RESOURCE_RE.fullmatch(resource_ref):
+            raise db.ActionQError("resource_ref is not a federation v1 reference")
         if "federation.read" not in principal.authorities:
             raise db.ActionQError("federation.read authority is required")
         with self.connection() as conn, conn.transaction():

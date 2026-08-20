@@ -111,6 +111,11 @@ def test_snapshot_requires_authenticated_federation_read_authority(postgres_urls
         authority.snapshot(principal=_principal("intruder"), resource_ref=resource)
     with pytest.raises(db.ActionQError):
         authority.snapshot(principal=_principal("intruder", "federation.create"), resource_ref=resource)
+    # An invalid resource_ref must raise the same public db.ActionQError as
+    # every other snapshot() failure, not the module-private _Rejected that
+    # every command path routes through _execute() to translate.
+    with pytest.raises(db.ActionQError):
+        authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref="not-a-federation-ref")
     assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=resource)["resource_ref"] == resource
 
 
@@ -187,6 +192,40 @@ def test_create_is_action_independent_and_response_loss_replays_exact_bytes(post
         assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_resources')}").fetchone()["n"] == 1
         assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_resource_changes')}").fetchone()["n"] == 1
         assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_command_decisions')}").fetchone()["n"] == 2
+
+
+def test_missing_assurance_type_is_distinguished_from_evidence_or_reference_mismatch(postgres_urls) -> None:
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("owner", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+
+    evidence_bytes = b"verified evidence"
+    evidence_ref = "artifact:sha256:" + hashlib.sha256(evidence_bytes).hexdigest()
+    missing_assurance = authority.record_evidence(
+        principal=_principal("ingester", "federation.evidence.ingest"), idempotency_key="missing-assurance",
+        resource_ref=resource, evidence_ref=evidence_ref, evidence_bytes=evidence_bytes,
+        assurance_type="", expected_revision=1,
+    )
+    true_mismatch = authority.record_evidence(
+        principal=_principal("ingester", "federation.evidence.ingest"), idempotency_key="true-mismatch",
+        resource_ref=resource, evidence_ref="artifact:sha256:" + "0" * 64,
+        evidence_bytes=evidence_bytes, assurance_type="verified", expected_revision=1,
+    )
+    missing_execution_ref = authority.record_execution_ref(
+        principal=_principal("owner", "federation.relate"), idempotency_key="missing-execution-ref",
+        resource_ref=resource, execution_ref="", assurance_type="observation", expected_revision=1,
+    )
+    missing_execution_assurance = authority.record_execution_ref(
+        principal=_principal("owner", "federation.relate"), idempotency_key="missing-execution-assurance",
+        resource_ref=resource, execution_ref="provider:1", assurance_type="", expected_revision=1,
+    )
+    assert missing_assurance.code == "invalid-assurance-type"
+    assert true_mismatch.code == "evidence-digest-mismatch"
+    assert missing_execution_ref.code == "invalid-execution-reference"
+    assert missing_execution_assurance.code == "invalid-assurance-type"
 
 
 def test_acl_cas_state_machine_and_rejected_decisions_do_not_change_projection(postgres_urls) -> None:
@@ -308,6 +347,56 @@ def test_opposite_relation_attempts_serialize_cycle_check(postgres_urls) -> None
     assert sorted(decision.status for decision in decisions) == ["accepted", "rejected"]
     assert {decision.code for decision in decisions} == {"accepted", "relation-cycle"}
     assert sorted((authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=left)["revision"], authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=right)["revision"])) == [1, 2]
+
+
+def test_disjoint_endpoint_relation_attempts_cannot_jointly_create_a_cycle(postgres_urls) -> None:
+    # Endpoint locks alone only serialize writes sharing an endpoint. A -> B
+    # and C -> D exist already; concurrent B -> C and D -> A share no
+    # endpoint, so each could pass a cycle probe against committed-only
+    # state and jointly close a cycle A -> B -> C -> D -> A unless writes of
+    # a cyclic relation type are also serialized against each other.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    owners = {name: _principal(name, "federation.create", "federation.relate") for name in "abcd"}
+    nodes = {
+        name: authority.create(principal=owners[name], idempotency_key=name, expected_revision=0).resource_ref
+        for name in "abcd"
+    }
+    assert all(nodes.values())
+    seed_ab = authority.add_relation(
+        principal=owners["a"], idempotency_key="seed-ab", source_ref=nodes["a"],
+        relation_type="parent-of", target_ref=nodes["b"], expected_revision=1,
+    )
+    seed_cd = authority.add_relation(
+        principal=owners["c"], idempotency_key="seed-cd", source_ref=nodes["c"],
+        relation_type="parent-of", target_ref=nodes["d"], expected_revision=1,
+    )
+    assert seed_ab.status == "accepted" and seed_cd.status == "accepted"
+    barrier = Barrier(2)
+
+    def relate(principal, key, source, target, expected_revision):
+        barrier.wait()
+        return authority.add_relation(
+            principal=principal, idempotency_key=key, source_ref=source,
+            relation_type="parent-of", target_ref=target, expected_revision=expected_revision,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [
+            executor.submit(relate, owners["b"], "b-to-c", nodes["b"], nodes["c"], 1),
+            executor.submit(relate, owners["d"], "d-to-a", nodes["d"], nodes["a"], 1),
+        ]
+        decisions = [future.result() for future in results]
+
+    assert sorted(decision.status for decision in decisions) == ["accepted", "rejected"]
+    assert {decision.code for decision in decisions} == {"accepted", "relation-cycle"}
+    reader = _principal("reader", "federation.read")
+    # a and c are each at revision 2 from seeding (they were each a source
+    # once); exactly one of b or d advances from 1 to 2 for the accepted
+    # edge, the other stays at 1 because its attempt was rejected.
+    total_revision = sum(authority.snapshot(principal=reader, resource_ref=nodes[name])["revision"] for name in "abcd")
+    assert total_revision == 7
 
 
 def test_postgres_roles_separate_migration_command_and_end_actor_authority(postgres_urls) -> None:
