@@ -1,13 +1,22 @@
 # Handoff — actionq
 
-**As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged) · **Suite:** 718 passed, 19 skipped, 0 failed
+**As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged)
+**Suite:** 698 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
+deletes 20 tests with the code they covered)*
 
-**Open PR you own:** `delete/session-wrapper-execution-plane` — step 3 tranche 1 (the session
-wrapper, 970 LOC) plus the deletion order. Read
-`docs/plans/2026-08-20-execution-plane-deletion-order.md` **before deleting anything else**;
-it lists four modules that look deletable and are not.
+### Start here
 
-**Step 3 is blocked on two decisions, not on evidence** — see §5.
+1. **Open PR #30**, branch `delete/session-wrapper-execution-plane` — step 3 tranche 1 (session
+   wrapper, 970 LOC) plus the deletion order. Merge or review it first; it is the base for
+   everything below.
+2. **Read `docs/plans/2026-08-20-execution-plane-deletion-order.md` before deleting anything.**
+   It lists four modules that look deletable and are not — a pure import-graph reading removes
+   all four and breaks the estate.
+3. **Steps 1 and 2 are closed.** Step 3 is in progress and **blocked on two decisions that are
+   the operator's, not on further measurement** (§5). If you have those answers, execute
+   tranche 2 or 3. If you do not, *ask* — do not go measure something else to fill the time.
+
+Nothing here is waiting on evidence. That is the main thing to know.
 
 Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, then the two
 evidence records: `docs/evidence/2026-08-19-acp-v1-conformance.md` (A1–A19, the ACP bridge) and
@@ -21,9 +30,16 @@ read it only if you are tempted to cite the fence for anything. This file is the
 
 ## 0. LIVE STATE — the daemon is running; the fence experiment is over
 
-The devbox ActionQ daemon is **unfenced and claiming normally** as of 2026-08-19T20:18Z. The
-queue holds no claimable work (11 `failed`, 3 `completed`, 3 `cancelled`), so a quiet daemon is
-expected and is not a fault.
+The devbox ActionQ daemon is **unfenced and claiming normally** — resumed 2026-08-19T20:18Z,
+re-verified active 2026-08-20. The queue holds no claimable work (11 `failed`, 3 `completed`,
+3 `cancelled`), so a quiet daemon is expected and is not a fault.
+
+**The deployed daemon does not run `main`.** Devbox has its own checkout of
+`/projects/dev/actionq`, pinned at `ab0dfb7` — a revision on `agent/p2.2-schema-runtime-actionq`
+that is *not* an ancestor of `main`. The daily refresh unit fails closed unless HEAD matches
+`ACTIONQ_REQUIRED_REVISION` (`gitops-nixos/modules/system/actionq-dispatch.nix:338`) **and** the
+checkout is clean. So deleting on `main` cannot break the running daemon, and adopting anything
+takes two explicit reviewed acts: move that checkout, and bump the pin.
 
 ```bash
 ssh devbox-agent 'systemctl is-active actionq-dispatch.service'
@@ -58,17 +74,23 @@ Two things a fresh session should not misread:
 > gap is not an invitation to build one. Keep the coordination layer thin enough to throw
 > away.
 
-Measured in this repo (2026-08-19):
+Measured 2026-08-20, by reachability rather than by name. **Two trees, which earlier versions of
+this table silently mixed:** `actionq/` (13,169 LOC) is the queue and daemon;
+`packages/actionq-runner/` (4,837) holds the part worth owning.
 
-| Surface | LOC | |
-|---|---:|---|
-| `daemon_runner`, `session_wrapper`, `daemon_*`, `server`, `application_dispatch`, `routing`, `usage_limit`, `scope_iterate` | ~5,030 | execution plane — delete |
-| lease/claim/heartbeat, entangled through `db.py` (2,051) + `schema.py` (1,588) | large | same, harder to extract |
-| `execution_contract`, `execution_boundary`, `context_policy`, `acp/backends` | ~1,005 | **own** |
-| `acp/v1.py` | 760 | integrate — thin adapter, replaceable by construction |
+| Surface | Tree | LOC | |
+|---|---|---:|---|
+| daemon-only: `daemon*` (9), `harnesses/*` + `harness_profiles`, `routing`, `scope_iterate`, `usage_limit`, `git_evidence` | `actionq/` | **4,480** | execution plane — delete (tranche 3) |
+| `completion_outbox` | `actionq/` | 659 | daemon + own console script |
+| `server` | `actionq/` | 416 | tranche 2, gated on the cluster |
+| `db` (2,051) + `schema` (1,588) + `cas` (130) | `actionq/` | 3,769 | reached by *every* root — extract, don't delete (tranche 4) |
+| `vuoro` | `actionq/` | 948 | **the federation surface — keep** |
+| `execution_contract`, `execution_boundary`, `context_policy`, `acp/backends` | `actionq-runner` | 1,005 | **own** |
+| `acp/v1.py` | `actionq-runner` | 760 | integrate — thin adapter, replaceable by construction |
 
-**The homemade execution plane is ~5x the size of the part worth owning.** That ratio is the
-argument.
+**The daemon-only execution plane is ~4.5x the size of the part worth owning** (4,480 vs 1,005).
+That ratio is the argument, and deleting the session wrapper did not change it — the wrapper was
+never counted in the daemon-only figure.
 
 ---
 
@@ -89,11 +111,9 @@ justifies the next one. Ordered:
    and N6–N13 (Codex, OpenCode, Copilot), re-runnable via
    `verification/probe_native_harness_binding.py`. Binding assurance is **per-vendor and
    unequal**: Copilot verifies pre-flight, Claude attributes post-hoc, Codex cannot do either,
-   OpenCode has never completed a turn here. `actionq/harnesses/`
-   (`claude.py`, `codex.py`, `opencode.py`, `copilot.py`) invoke vendor CLIs directly. Under
-   this architecture *those are the integration points*, and their binding assurance is
-   **completely unmeasured** — everything in A12–A19 characterises the ACP bridge, which
-   should not be in Claude's path at all. *Done.*
+   OpenCode has never completed a turn here. The four adapters in `actionq/harnesses/` invoke
+   vendor CLIs directly and *are* the integration points under this architecture — A12–A19
+   characterise the ACP bridge, which should not be in Claude's path at all.
 3. **Delete, in an order that keeps devbox working.** ← **YOU ARE HERE.** Order and gates:
    `docs/plans/2026-08-20-execution-plane-deletion-order.md`. Tranche 1 (session wrapper,
    970 LOC) is done. Tranche 2 (`server.py`) is gated on removing a declared cluster
@@ -237,3 +257,41 @@ perform.
 - Minor, noted only: two detached-HEAD worktrees under `/projects/dev/_projects/` reference
   actionq-dispatcher (`2f299ce`, `9acf071`) and were never reconciled; the merged remote branch
   `chore/remove-stale-environment-pointer-20260811` can be deleted.
+
+---
+
+## 6. Verify the world in 60 seconds
+
+Run these before trusting anything above. Each line's expected answer is on the right.
+
+```bash
+# repo
+git -C /projects/dev/actionq log --oneline -1        # ec07e0a on main, or PR #30's branch
+gh pr list                                           # #30 open, nothing else
+nix shell nixpkgs#postgresql -c .venv/bin/python -m pytest -q   # 698 pass / 19 skip on the branch
+
+# devbox — the constraint the whole goal is written around
+ssh devbox-agent 'systemctl is-active actionq-dispatch.service'          # active
+ssh devbox-agent 'ls /home/agent/.local/state/actionq-dispatcher/PAUSED' # absent = unfenced
+ssh devbox-agent 'git -C /projects/dev/actionq rev-parse HEAD'           # ab0dfb7… (NOT main)
+
+# harness qualification, re-runnable (skip opencode: it hangs ~3 min per case)
+python3 verification/probe_native_harness_binding.py codex copilot
+```
+
+If the devbox revision is no longer `ab0dfb7`, **stop and re-read §0** — the safety property that
+makes deletion on `main` safe has changed, and the deletion order needs revisiting before you
+delete anything.
+
+---
+
+## 7. What changed on 2026-08-20
+
+- Step 2 closed: N6–N13 recorded for Codex, OpenCode and Copilot; probe added at
+  `verification/probe_native_harness_binding.py`. Merged as PR #29.
+- Step 3 opened: session wrapper deleted (970 LOC, PR #30), deletion order written, and the
+  devbox revision pin discovered — which is what turned step 3 from risky into gated.
+- Three things were deliberately **not** recorded as findings: a transient Copilot 400, the
+  OpenCode hang (cause not isolated, sandbox artifact not excluded), and an apparent broken JSON
+  contract that was an artifact of my own `2>&1`. If you find yourself about to cite any of
+  them, don't.
