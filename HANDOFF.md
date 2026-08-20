@@ -1,10 +1,24 @@
 # Handoff — actionq
 
-**As of:** 2026-08-20 · **`main`:** `0fb33f6` (PR #28 merged) · **Suite:** 718 passed, 19 skipped, 0 failed
+**As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged)
+**Suite:** 480 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
+deletes the tests along with the code they covered)*
+**`actionq/`: 13,169 → 8,273 LOC.** The execution plane is gone.
 
-**Open PR you own:** [#29](https://github.com/bayleafwalker/actionq/pull/29) on
-`evidence/native-harness-qualification` — both harness qualification records (N1–N13) and the
-re-runnable probe. **Merge it first;** step 3 starts from it.
+### Start here
+
+**All three steps are closed in code. What is left is applying it to running systems, in a
+specific order, and two of those acts need a human.** See §8 — read it before touching the
+cluster or devbox.
+
+1. **Open PR #30**, branch `delete/session-wrapper-execution-plane` — all of step 3. Deletes the
+   session wrapper, the nine daemon modules, all seven harness adapters, `routing`,
+   `scope_iterate`, `usage_limit`, `git_evidence`, `harness_profiles` and `server.py`.
+2. **Read `docs/plans/2026-08-20-execution-plane-deletion-order.md` first.** It records four
+   boundaries a pure import graph misses. The server boundary was later retired by operator
+   decision; the CLI, migration package data, and Vuoro adapter remain live.
+3. **Two cluster branches in `/projects/dev/appservice` must merge in order** — phase 1 fully
+   reconciled *before* phase 2. Merging phase 2 alone deletes namespace `vscode`. §8.
 
 Read this, then `docs/plans/2026-08-19-execution-plane-deletion-constraint.md`, then the two
 evidence records: `docs/evidence/2026-08-19-acp-v1-conformance.md` (A1–A19, the ACP bridge) and
@@ -18,9 +32,16 @@ read it only if you are tempted to cite the fence for anything. This file is the
 
 ## 0. LIVE STATE — the daemon is running; the fence experiment is over
 
-The devbox ActionQ daemon is **unfenced and claiming normally** as of 2026-08-19T20:18Z. The
-queue holds no claimable work (11 `failed`, 3 `completed`, 3 `cancelled`), so a quiet daemon is
-expected and is not a fault.
+The devbox ActionQ daemon is **unfenced and claiming normally** — resumed 2026-08-19T20:18Z,
+re-verified active 2026-08-20. The queue holds no claimable work (11 `failed`, 3 `completed`,
+3 `cancelled`), so a quiet daemon is expected and is not a fault.
+
+**The deployed daemon does not run `main`.** Devbox has its own checkout of
+`/projects/dev/actionq`, pinned at `ab0dfb7` — a revision on `agent/p2.2-schema-runtime-actionq`
+that is *not* an ancestor of `main`. The daily refresh unit fails closed unless HEAD matches
+`ACTIONQ_REQUIRED_REVISION` (`gitops-nixos/modules/system/actionq-dispatch.nix:338`) **and** the
+checkout is clean. So deleting on `main` cannot break the running daemon, and adopting anything
+takes two explicit reviewed acts: move that checkout, and bump the pin.
 
 ```bash
 ssh devbox-agent 'systemctl is-active actionq-dispatch.service'
@@ -55,17 +76,23 @@ Two things a fresh session should not misread:
 > gap is not an invitation to build one. Keep the coordination layer thin enough to throw
 > away.
 
-Measured in this repo (2026-08-19):
+Measured 2026-08-20, by reachability rather than by name. **Two trees, which earlier versions of
+this table silently mixed:** `actionq/` (13,169 LOC) is the queue and daemon;
+`packages/actionq-runner/` (4,837) holds the part worth owning.
 
-| Surface | LOC | |
-|---|---:|---|
-| `daemon_runner`, `session_wrapper`, `daemon_*`, `server`, `application_dispatch`, `routing`, `usage_limit`, `scope_iterate` | ~5,030 | execution plane — delete |
-| lease/claim/heartbeat, entangled through `db.py` (2,051) + `schema.py` (1,588) | large | same, harder to extract |
-| `execution_contract`, `execution_boundary`, `context_policy`, `acp/backends` | ~1,005 | **own** |
-| `acp/v1.py` | 760 | integrate — thin adapter, replaceable by construction |
+| Surface | Tree | LOC | |
+|---|---|---:|---|
+| daemon-only: `daemon*` (9), `harnesses/*` + `harness_profiles`, `routing`, `scope_iterate`, `usage_limit`, `git_evidence` | `actionq/` | **4,480** | execution plane — delete (tranche 3) |
+| `completion_outbox` | `actionq/` | 659 | daemon + own console script |
+| `server` | `actionq/` | 416 | tranche 2, gated on the cluster |
+| `db` (2,051) + `schema` (1,588) + `cas` (130) | `actionq/` | 3,769 | reached by *every* root — extract, don't delete (tranche 4) |
+| `vuoro` | `actionq/` | 948 | **the federation surface — keep** |
+| `execution_contract`, `execution_boundary`, `context_policy`, `acp/backends` | `actionq-runner` | 1,005 | **own** |
+| `acp/v1.py` | `actionq-runner` | 760 | integrate — thin adapter, replaceable by construction |
 
-**The homemade execution plane is ~5x the size of the part worth owning.** That ratio is the
-argument.
+**The daemon-only execution plane is ~4.5x the size of the part worth owning** (4,480 vs 1,005).
+That ratio is the argument, and deleting the session wrapper did not change it — the wrapper was
+never counted in the daemon-only figure.
 
 ---
 
@@ -86,14 +113,17 @@ justifies the next one. Ordered:
    and N6–N13 (Codex, OpenCode, Copilot), re-runnable via
    `verification/probe_native_harness_binding.py`. Binding assurance is **per-vendor and
    unequal**: Copilot verifies pre-flight, Claude attributes post-hoc, Codex cannot do either,
-   OpenCode has never completed a turn here. `actionq/harnesses/`
-   (`claude.py`, `codex.py`, `opencode.py`, `copilot.py`) invoke vendor CLIs directly. Under
-   this architecture *those are the integration points*, and their binding assurance is
-   **completely unmeasured** — everything in A12–A19 characterises the ACP bridge, which
-   should not be in Claude's path at all. *Done.*
-3. **Delete, in an order that keeps devbox working.** ← **YOU ARE HERE.** Start with what the fence proved is
-   unused. The lease/claim surface inside `db.py`/`schema.py` comes last because it is
-   entangled with schema versions that the deployed daemon still reads.
+   OpenCode has never completed a turn here. The four adapters in `actionq/harnesses/` invoke
+   vendor CLIs directly and *are* the integration points under this architecture — A12–A19
+   characterise the ACP bridge, which should not be in Claude's path at all.
+3. ~~**Delete, in an order that keeps devbox working.**~~ **DONE in code** (PR #30). The
+   operator approved both gates on 2026-08-20: retire `actionq-dispatch.service`, and remove
+   the `actionq-server` deployment — accepting that cockpit's dispatch routes degrade, since
+   dispatch does not function without a fired execution plan. Tranches 1–3 are deleted:
+   **4,896 LOC out of `actionq/`**, no daemon, no queue worker, no harness adapters, no HTTP
+   server. Tranche 4 (lease/claim inside `db.py`/`schema.py`) is **extraction, not deletion**,
+   is reached by every remaining root including `vuoro`, and is the next real work.
+   **Rollout is not finished — see §8.**
 
 *Done when the whole thing is done:* what remains is work identity, relations and revisions;
 authority; evidence requirements and acceptance; references to external executions;
@@ -123,6 +153,9 @@ daemon, no queue, no leases, no fan-out engine.**
 | Ambient user config is **part of the execution identity** for Codex | `~/.codex/config.toml` supplied `gpt-5.6-luna` on a dispatch that requested nothing | N7 |
 | Copilot **has** a proven noninteractive path and the best binding of the four | `copilot -p … --allow-all-tools --output-format json`; `model.call_start` precedes the call | N12, N13 |
 | `base.py`'s "never inspect output for meaning" contract is the obstacle to binding assurance | every read-back above requires inspecting output; reconciliation belongs *just above* the adapter | N5, N6–N13 |
+| Deleting on `main` **cannot** break the running devbox daemon | devbox has its own checkout, pinned fail-closed to `ab0dfb7` — a revision that is not an ancestor of `main`; adoption needs two explicit acts | deletion-order doc |
+| `cli.py` is a **daemon dependency via subprocess**, with zero import edges | `daemon_clients` shells `actionctl_bin`; the tmux unit runs `actionctl check-compatibility` before start | deletion-order doc |
+| Import closure alone is **not** a deletion criterion here | it misses `cli.py` (subprocess), `migrations/` (package data), `vuoro.py` (imported out of process) and `server.py` (cluster deployment) | deletion-order doc |
 | Providers are **not fungible** for subscription work | OpenCode cannot use Claude Pro/Max; Agentic Workflows use provider credentials | plan doc |
 | Work state stays ours | adopting GitHub Issues means adopting its meaning of open/closed in place of `ready\|claimed\|blocked\|accepted\|rejected\|superseded\|integrated` | plan doc |
 
@@ -141,7 +174,7 @@ perform.
 
   ```bash
   nix shell nixpkgs#postgresql -c bash -c 'for h in pruning snapshot-race non-disclosure \
-    redaction response-loss bounded-wait legacy-quarantine fencing; do \
+    redaction response-loss bounded-wait fencing; do \
     .venv/bin/python verification/run_action_resource_history.py "$h" || echo "FAILED $h"; done'
   ```
 - **The suite needs PostgreSQL binaries on PATH.** `nix shell nixpkgs#postgresql -c ...`.
@@ -173,6 +206,9 @@ perform.
 - **Redirecting `2>&1` while probing a `--output-format json` CLI manufactures false findings.**
   Copilot writes its `--model` rejection to stderr and keeps stdout valid JSONL; merging the
   streams made it look like a broken JSON contract. Keep the streams separate.
+- **`actionq/migrations/` reads as unreachable and is live.** Its `__init__.py` is one line and
+  nothing imports the package; it holds the twelve `.sql` assets `schema.py` applies as package
+  data. Never delete a package on import-graph evidence alone.
 - **Never `pgrep -f` a pattern your own command line contains.** A cleanup loop matched its
   own ssh invocation and killed its own session mid-run. Use `[b]in/postgres` style.
 - **Disposable test clusters leak on abnormal exit.** `pytest_unconfigure` does not run under
@@ -202,8 +238,11 @@ perform.
   - `opencode.py` stays unverified until one turn completes somewhere; fix the missing `--`
     prompt separator and pass `--format json` when it does.
   - Model reconciliation belongs **above** the adapter, per `base.py`'s contract (N5, point 3).
-- **PR #29 is open** on `evidence/native-harness-qualification`, now carrying both
-  qualification records and the probe. Merge it before starting step 3.
+- **Step 3's code is done; its rollout is not.** Both gates were approved 2026-08-20. What
+  remains is §8 — two cluster merges in order, and stopping the devbox unit. Until then the
+  running estate still has a daemon and a server that `main` no longer contains.
+- **Tranche 4 is the next real work:** extract the lease/claim surface out of `db.py` (2,051) and
+  `schema.py` (1,588). Not deletion — every remaining root reaches them, `vuoro` included.
 - ~~Audit `actionq-dispatcher`'s remote branches~~ **done, clean** — one remote branch, PR #1
   MERGED, 0 commits not in `main`. The earlier `gh pr list` failure was the repo-name mismatch
   in §4, not an unaudited backlog.
@@ -219,3 +258,103 @@ perform.
 - Minor, noted only: two detached-HEAD worktrees under `/projects/dev/_projects/` reference
   actionq-dispatcher (`2f299ce`, `9acf071`) and were never reconciled; the merged remote branch
   `chore/remove-stale-environment-pointer-20260811` can be deleted.
+
+---
+
+## 6. Verify the world in 60 seconds
+
+Run these before trusting anything above. Each line's expected answer is on the right.
+
+```bash
+# repo
+git -C /projects/dev/actionq log --oneline -1        # ec07e0a on main, or PR #30's branch
+gh pr list                                           # #30 open, nothing else
+nix shell nixpkgs#postgresql -c .venv/bin/python -m pytest -q   # see PR #30 CI for the current count
+
+# devbox — the constraint the whole goal is written around
+ssh devbox-agent 'systemctl is-active actionq-dispatch.service'          # active
+ssh devbox-agent 'ls /home/agent/.local/state/actionq-dispatcher/PAUSED' # absent = unfenced
+ssh devbox-agent 'git -C /projects/dev/actionq rev-parse HEAD'           # ab0dfb7… (NOT main)
+
+# harness qualification, re-runnable (skip opencode: it hangs ~3 min per case)
+python3 verification/probe_native_harness_binding.py codex copilot
+```
+
+If the devbox revision is no longer `ab0dfb7`, **stop and re-read §0** — the safety property that
+makes deletion on `main` safe has changed, and the deletion order needs revisiting before you
+delete anything.
+
+---
+
+## 7. What changed on 2026-08-20
+
+- Step 2 closed: N6–N13 recorded for Codex, OpenCode and Copilot; probe added at
+  `verification/probe_native_harness_binding.py`. Merged as PR #29.
+- Step 3 opened: session wrapper deleted (970 LOC, PR #30), deletion order written, and the
+  devbox revision pin discovered — which is what turned step 3 from risky into gated.
+- Three things were deliberately **not** recorded as findings: a transient Copilot 400, the
+  OpenCode hang (cause not isolated, sandbox artifact not excluded), and an apparent broken JSON
+  contract that was an artifact of my own `2>&1`. If you find yourself about to cite any of
+  them, don't.
+
+---
+
+## 8. Rollout — what is applied where, and the order that matters
+
+Code and running systems have **deliberately diverged**. `main`'s successor (PR #30) has no
+daemon and no server; devbox and the cluster still run both. Nothing here is broken — it is
+staged. Apply in this order.
+
+### 8.1 Cluster — two branches in `/projects/dev/appservice`, strictly ordered
+
+```
+retire/actionq-server-phase1   move ns/vscode + runner identity registry to actionq-db
+retire/actionq-server-phase2   remove the actionq-server app, drop cockpit's env var
+```
+
+**Merging phase 2 without phase 1 reconciled deletes namespace `vscode`, and with it
+agent-cockpit and the actionq CNPG cluster.** The `vscode` Namespace was declared *only* by the
+actionq-server app, whose Kustomization has `prune: true`. Phase 1 moves that declaration to
+`actionq-db`, which stays and which actionq-server already `dependsOn`.
+
+Neither branch is merged, and **neither was pushed to `main`** — Flux reconciles `main`, so a push
+is an apply. Merge phase 1, confirm `ns/vscode` is owned by the actionq-db Kustomization and
+`kubectl get ns vscode` is healthy, *then* merge phase 2.
+
+```bash
+export KUBECONFIG=/projects/dev/appservice/clusters/.kube/config   # per its .envrc
+kubectl get ns vscode; kubectl get deploy -n vscode
+```
+
+Expected end state: `actionq-server` gone; `agent-cockpit` and `actionq-cnpg-*` still running.
+Cockpit's actionq/dispatch routes stop working — **expected, per the operator.**
+
+### 8.2 devbox — `actionq-dispatch.service` is still running
+
+**Not stopped.** It needs interactive sudo, which this session could not supply. Run:
+
+```bash
+ssh devbox-agent 'sudo systemctl disable --now actionq-dispatch.service'
+```
+
+`disable` matters as much as `stop`: without it the unit returns on the next boot. Note the unit
+is **nix-managed**, so the durable retirement is removing it from
+`gitops-nixos/modules/system/actionq-dispatch.nix` — a `systemctl` stop is undone by the next
+`nixos-rebuild`. That module change has **not** been made; it is the last piece of step 3.
+
+### 8.3 Why the running daemon is not at risk from any of this
+
+Devbox has its own checkout pinned to `ab0dfb7` (§0), and the refresh unit fails closed unless
+HEAD matches *and* the tree is clean. Deleting code on `main` cannot reach it. After PR #30
+merges, that pin can never be satisfied by `main` again — which is the intended end state, not a
+fault. Do not "fix" it by bumping `ACTIONQ_REQUIRED_REVISION` to a post-deletion revision: that
+would install a package with no `actionq-daemon` entry point under a unit that expects one.
+Retire the unit (8.2) instead.
+
+### 8.4 `actionq-dispatcher` is now an unusable historical shim
+
+The sibling package still implements `dispatcher-once` by spawning
+`actionq-daemon --once`. This ActionQ revision deliberately no longer provides
+that executable. Do not reinstall or invoke the shim after PR #30. Retiring or
+re-contracting its repository is a separate cross-repository change; PR #30
+records the dependency but does not modify that checkout.

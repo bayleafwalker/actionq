@@ -51,8 +51,9 @@ uv sync --extra dev
 
 ## Vuoro execution adapter
 
-`ActionQApplication` is the adapter-safe application core shared by
-`actionctl`, the legacy Actionq HTTP façade, and the Vuoro execution adapter.
+`ActionQApplication` is the adapter-safe application core shared by `actionctl`
+and the Vuoro execution adapter's federation handlers. The retired HTTP façade
+historically consumed this core but is not a current ActionQ surface.
 The owner-provided `actionq.vuoro` module publishes domain-qualified operation
 metadata, JSON Schemas, handlers, and the execution compatibility record for
 Vuoro composition. It does not add migrations or database access to the
@@ -98,8 +99,8 @@ export ACTIONQ_URL='postgresql://actionq_runtime:password@localhost:5432/app'
 actionctl check-compatibility
 ```
 
-Normal commands and `actionq-server` fail closed when this check is not
-compatible. They never apply migrations as a startup side effect.
+Normal commands and the Vuoro execution adapter fail closed when this check is
+not compatible. They never apply migrations as a startup side effect.
 
 Verified `settle` also requires `ACTIONQ_ARTIFACT_ROOT` (or an explicitly
 configured application root). The root is server-owned durable storage; the
@@ -166,33 +167,20 @@ Priority is ascending, so smaller numbers are claimed first.
 | `actionctl events` | Read the event log, optionally filtered or tailed. |
 | `actionctl emit` | Emit coordinator events without direct SQL writes. |
 
-## Daemon minimum
+## Execution boundary
 
-`actionq-daemon` is the actionq-owned, long-running coordinator. It uses only
-the public `actionctl` commands to claim work, emit `session.*` events, and
-settle actions. The current minimum is deliberately single-session and supports
-the fake runner for disposable verification; it does not import
-`actionq-dispatch` at runtime.
+ActionQ no longer packages an agent daemon, harness adapters, worktree runner,
+session wrapper, or standalone HTTP server. Product-native runtimes execute
+work directly. ActionQ retains the current action lifecycle and its Vuoro
+execution-domain adapter while the follow-on federation extraction is designed
+and verified. The historical qualification records under `docs/evidence/`
+describe the deleted adapters; they are evidence about those versions, not
+instructions for starting a current worker.
 
-Start from [examples/actionq-daemon.toml](examples/actionq-daemon.toml), then:
-
-```bash
-mkdir -p ~/.config/actionq
-cp examples/actionq-daemon.toml ~/.config/actionq/config.toml
-actionq-daemon --config ~/.config/actionq/config.toml
-```
-
-For user-systemd operation, install
-`ops/systemd/actionq-daemon.service`, reload the user manager, and start the
-unit. `SIGTERM` and `SIGINT` stop after a bounded child grace period; `SIGHUP`
-reloads configuration between child sessions. The daemon checks the legacy
-`~/.config/actionq-dispatcher/config.toml` only when no explicit `--config` is
-provided, so existing operators retain a visible migration path.
-
-Codex harnesses can opt into the temporary
-[Luna V2 catalog workaround](docs/operations/codex-luna-catalog-workaround.md).
-It is fail-closed, creates a fresh per-launch catalog, and automatically
-bypasses its override once Codex reports Luna as natively V2.
+`actionq-dispatcher` remains a historical compatibility package whose launcher
+expects the retired `actionq-daemon` executable. Do not install or invoke that
+launcher with this ActionQ revision. Retiring its package and the nix-managed
+devbox unit is a separate cross-repository rollout action.
 
 All state-changing commands return JSON records that are designed to be machine-consumable.
 
@@ -252,20 +240,14 @@ uses an ambient queue DSN.
 
 ## Operational Notes
 
-`actionq-session-wrap` is the supported direct entry point for OpenCode and
-other non-daemon sessions. It records the capsule and durable completion fact
-after the child exits. Harness adapters only construct child invocations; they
-never publish completion events and receive no completion-ingest credential.
-
 - The queue schema is created only by the deployment-owned `actionctl migrate`
   entrypoint. It uses a transaction-scoped advisory lock, a version ledger,
   packaged migration checksums, and idempotent retry behavior.
 - Runtime identities must not own schema objects, assume an owner role, or
   receive schema `CREATE` or migration-ledger write authority;
   see [the migration and compatibility runbook](docs/operations/schema-migrations.md).
-- `actionq-server` checks compatibility before binding its socket. Its
-  read-only `GET /compatibility` endpoint publishes the same record for the
-  Vuoro execution adapter.
+- The Vuoro execution adapter checks compatibility through the same read-only
+  owner contract before opening a runtime-role request connection.
 - Claims use `FOR UPDATE SKIP LOCKED`, so multiple workers can contend safely.
 - Automated producers are rate limited when `created_by` starts with `agent:` or `script:`.
 - Child actions cannot exceed the configured chain depth.

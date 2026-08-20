@@ -120,26 +120,21 @@ closed rather than pass through.
 
 `wait` is a changes request with an integer `wait_seconds` from 0 through 30.
 Missing means 0; negative, fractional, non-numeric, or greater than 30 is a
-400 contract error. The server returns immediately when a later revision is
+400 contract error. The served application boundary returns immediately when a later revision is
 available or the action is terminal. Otherwise it returns an empty change set
 no later than the requested bound plus a documented 1-second scheduling grace.
 Disconnect cancels only the wait, not the action. Wakeups are hints: the
 transactional revision query remains authoritative. There is no unbounded wait,
 SSE, lifecycle command, cancellation, or recovery mutation in v1.
 
-## Permanent legacy quarantine
+## Retired standalone HTTP quarantine
 
-Before body read, authentication, application construction, or database access,
-the server splits the raw request-target at the first `?` and classifies the
-raw path octets. It performs no percent decoding, dot-segment removal, slash
-collapse, Unicode transformation, or other normalization first. Every listed
-method targeting raw path exactly `/v2/dispatch` or beginning
-`/v2/dispatch/` returns the golden fixed 404 response. The query is ignored.
-The exact method/path cross-product and raw/decoded/normalized outcomes are
-closed in `legacy-quarantine.json`; adding a method or path case is a contract
-revision. HEAD intentionally returns the same body bytes to eliminate a
-distinct oracle. Auth headers, malformed/oversized bodies, and database
-availability cannot change the response.
+The raw-target `/v2/dispatch` quarantine belonged to the deleted standalone
+ActionQ HTTP server. It is not a behavior of `ActionQApplication`, `actionctl`,
+or the Vuoro adapter and is no longer part of this contract. Its fixture and
+result packet were removed with that server so current evidence cannot claim
+to exercise an absent wire boundary. Historical evidence remains available in
+the Git revision that shipped the HTTP facade.
 
 ## Required disposable-PostgreSQL falsifying histories
 
@@ -154,8 +149,6 @@ server version, isolation level, seed, bounds, faults, and minimized failures:
 - recursive redaction canaries in every forbidden class and unknown fields;
 - commit-before-enqueue-response loss plus exact retry reference and revision;
 - wait at 0 and 30 seconds, early wake, spurious wake, disconnect, and restart;
-- the complete legacy quarantine matrix with spies proving zero auth,
-  application, body-read, and database calls; and
 - stale session/claim settlement attempts proving existing ActionQ fencing is
   neither exposed nor weakened by observation.
 

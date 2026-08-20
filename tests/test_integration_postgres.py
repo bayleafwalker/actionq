@@ -12,7 +12,7 @@ import pytest
 from psycopg import errors as pg_errors, sql
 
 from actionq.cli import cli
-from actionq import db, schema as schema_contract, server
+from actionq import db, schema as schema_contract
 from actionq.action_resource import ActionResourceOwner, CursorExpired, IdempotencyConflict
 import actionq.action_resource as action_resource_module
 from actionq.application import ActionQApplication, AuthenticatedActionResourcePrincipal, InvocationProvenance
@@ -277,44 +277,6 @@ def _run_action_resource_owner_history(owner_history):
         assert disconnected_result == {"error": "observer disconnected"}
         restarted_application = ActionQApplication(schema=resource_schema, connection_factory=connect_runtime, resource_cursor_secret=secret, authorizer=lambda *_: True)
         assert restarted_application.action_resource_snapshot(resource_ref=boundary_first["resource_ref"], principal=boundary_principal)["revision"] == 2
-    if owner_history == "legacy-quarantine":
-        fixture = json.loads((Path(__file__).parents[1] / "verification/fixtures/action-resource-owner-v1/legacy-quarantine.json").read_text())
-        counters = {"body_read": 0, "auth": 0, "application": 0, "db": 0}
-        original_auth, original_app, original_connect = server._served_authenticator, server.ActionQApplication, server._db.connect
-        server._served_authenticator = lambda _headers: counters.__setitem__("auth", counters["auth"] + 1)
-        server.ActionQApplication = lambda **_kwargs: counters.__setitem__("application", counters["application"] + 1)
-        server._db.connect = lambda *_a, **_k: counters.__setitem__("db", counters["db"] + 1)
-        class BodyReadSpy:
-            def __init__(self, wrapped): self.wrapped = wrapped
-            def read(self, *args, **kwargs): counters["body_read"] += 1; return self.wrapped.read(*args, **kwargs)
-            def __getattr__(self, name): return getattr(self.wrapped, name)
-        class HistoryHandler(server._Handler):
-            def setup(self):
-                super().setup(); self.rfile = BodyReadSpy(self.rfile)
-            def log_message(self, *_args): pass
-        httpd = HTTPServer(("127.0.0.1", 0), HistoryHandler)
-        worker = threading.Thread(target=httpd.serve_forever, daemon=True)
-        worker.start()
-        exercised = 0
-        try:
-            for method in fixture["methods"]:
-                for case in fixture["path_cases"]:
-                    payload = b"{invalid-json"
-                    raw = f"{method} {case['raw_target']} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload
-                    with socket.create_connection(httpd.server_address, timeout=2) as connection:
-                        connection.sendall(raw)
-                        response = b""
-                        while chunk := connection.recv(65536):
-                            response += chunk
-                    if case["quarantined"]:
-                        assert b" 404 Not Found\r\n" in response and response.endswith(server.V2_DISPATCH_QUARANTINE_BYTES)
-                    exercised += 1
-        finally:
-            httpd.shutdown(); worker.join(2); httpd.server_close()
-            server._served_authenticator, server.ActionQApplication, server._db.connect = original_auth, original_app, original_connect
-        assert exercised == fixture["cross_product_count"] == 64
-        assert counters == {"body_read": 0, "auth": 0, "application": 0, "db": 0}
-        assert server.V2_DISPATCH_QUARANTINE_BYTES.decode() == fixture["response"]["body_utf8"]
 
     cleanup = connect()
     cleanup.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(resource_schema)))
@@ -347,10 +309,6 @@ def test_action_resource_history_commit_response_loss_original_retry():
 
 def test_action_resource_history_wait_zero_thirty_early_spurious_disconnect_restart():
     assert _run_action_resource_owner_history("bounded-wait") == {"action-resource-owner.bounded-wait.v1"}
-
-
-def test_action_resource_history_legacy_raw_64_case_preaccess_quarantine():
-    assert _run_action_resource_owner_history("legacy-quarantine") == {"action-resource-owner.legacy-quarantine.v1"}
 
 
 def test_action_resource_history_two_incarnation_stale_session_fencing():
@@ -807,14 +765,14 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_pr
         ["add", "--type", "scope-iterate", "--project", "sprintctl", "--target", "42", "--created-by", "human:test"],
     )
     claimed = _invoke_json(runner, ["claim", "--proof-stdin"], input=json.dumps(
-        signed_runner_proof("actionq-daemon:test", "execution.action.claim", "queue:next")
+        signed_runner_proof("native-runner:test", "execution.action.claim", "queue:next")
     ))
     assert claimed["id"] == action["id"]
 
     paused = _invoke_json(
         runner,
         [
-            "emit", "--type", "session.paused", "--action", str(action["id"]), "--actor", "actionq-daemon:test",
+            "emit", "--type", "session.paused", "--action", str(action["id"]), "--actor", "native-runner:test",
             "--payload", json.dumps({
                 "session_id": "aqs:old", "reason": "usage-limit", "mechanism": "checkpoint-and-fail",
                 "handoff_ref": "/home/agent/.local/state/actionq/handoff/aqs_old.md", "resumable": True,
@@ -827,7 +785,7 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_pr
         runner,
         ["fail", str(action["id"]), "--reason", "usage-limit-paused: confirmed usage-limit signal matched", "--proof-stdin"],
         input=json.dumps({"claim_receipt": claimed["claim_receipt"], "runner_proof": signed_runner_proof(
-            "actionq-daemon:test", "execution.action.fail", f"action:{action['id']}"
+            "native-runner:test", "execution.action.fail", f"action:{action['id']}"
         )}),
     )
     assert failed["status"] == "failed"
@@ -840,7 +798,7 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_pr
     resumed = _invoke_json(
         runner,
         [
-            "emit", "--type", "session.resumed", "--action", str(redispatch["id"]), "--actor", "actionq-daemon:test",
+            "emit", "--type", "session.resumed", "--action", str(redispatch["id"]), "--actor", "native-runner:test",
             "--payload", json.dumps({
                 "session_id": "aqs:new", "resumed_from_session_id": "aqs:old",
                 "handoff_ref": "/home/agent/.local/state/actionq/handoff/aqs_old.md", "mechanism": "redispatch",
@@ -1172,24 +1130,6 @@ def test_runtime_contract_rejects_future_schema_without_running_ddl(runner_env):
     assert "too-new" in result.output
 
 
-def test_valid_ledger_with_damaged_queue_shape_fails_runtime_and_restart(runner_env):
-    runner, schema = runner_env
-    assert runner.invoke(cli, ["migrate"]).exit_code == 0
-    conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
-    conn.execute(f'DROP INDEX "{schema}".idx_actions_project')
-    conn.commit()
-    conn.close()
-
-    check = runner.invoke(cli, ["check-compatibility"])
-
-    assert check.exit_code == 3
-    compatibility = json.loads(check.output)
-    assert compatibility["state"] == "shape-mismatch"
-    assert "index-missing-or-invalid:actions.project" in compatibility["detail"]
-    with pytest.raises(schema_contract.SchemaCompatibilityError, match="shape-mismatch"):
-        server._require_runtime_compatibility()
-
-
 @pytest.mark.parametrize(
     ("statements", "expected_issue"),
     [
@@ -1314,334 +1254,3 @@ def test_runtime_rejects_semantically_permissive_schema_shape(
     compatibility = json.loads(result.output)
     assert compatibility["state"] == "shape-mismatch"
     assert expected_issue in compatibility["detail"]
-
-
-def test_service_restart_repeats_compatibility_without_migration(runner_env):
-    runner, schema = runner_env
-    assert runner.invoke(cli, ["migrate"]).exit_code == 0
-
-    first_start = server._require_runtime_compatibility()
-    second_start = server._require_runtime_compatibility()
-
-    assert first_start["state"] == "compatible"
-    assert second_start == first_start
-
-
-def test_migration_role_cannot_serve_and_runtime_role_cannot_run_ddl(monkeypatch):
-    schema = "aqroles_" + uuid.uuid4().hex
-    migration_conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
-    runtime_conn = db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"])
-    runtime_role = runtime_conn.execute("SELECT current_user AS role").fetchone()["role"]
-    migration_role = migration_conn.execute("SELECT current_user AS role").fetchone()["role"]
-    assert migration_role == MIGRATION_ROLE
-    assert runtime_role == RUNTIME_ROLE
-    assert migration_role != runtime_role
-    try:
-        migration_conn.rollback()
-        runtime_conn.rollback()
-        report = schema_contract.migrate(
-            migration_conn,
-            schema,
-            runtime_role=runtime_role,
-        )
-        assert report["runtime_role"] == runtime_role
-
-        migration_compatibility = schema_contract.check_compatibility(
-            migration_conn, schema
-        )
-        assert migration_compatibility.state == "role-mismatch"
-        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
-            schema_contract.require_compatible(migration_conn, schema)
-        migration_conn.rollback()
-
-        monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
-        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_MIGRATION_URL"])
-        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
-            server._require_runtime_compatibility()
-        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
-            server._dispatch(
-                {
-                    "contract_version": "v1",
-                    "repo_id": "actionq",
-                    "kind": "implement",
-                    "title": "must not dispatch as migrator",
-                }
-            )
-
-        assert schema_contract.require_compatible(runtime_conn, schema).compatible
-        runtime_conn.rollback()
-        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
-        assert server._require_runtime_compatibility()["state"] == "compatible"
-        action = server._dispatch(
-            {
-                "contract_version": "v1",
-                "repo_id": "actionq",
-                "kind": "implement",
-                "title": "runtime dispatch",
-            }
-        )
-        assert action["status"] == "pending"
-        with pytest.raises(Exception) as excinfo:
-            runtime_conn.execute(
-                sql.SQL("CREATE TABLE {}.forbidden_runtime_ddl (id INTEGER)").format(
-                    sql.Identifier(schema)
-                )
-            )
-        assert getattr(excinfo.value, "sqlstate", None) == "42501"
-        runtime_conn.rollback()
-        with pytest.raises(Exception) as excinfo:
-            runtime_conn.execute(
-                sql.SQL("UPDATE {}.{} SET checksum = 'forbidden'").format(
-                    sql.Identifier(schema), sql.Identifier("schema_migrations")
-                )
-            )
-        assert getattr(excinfo.value, "sqlstate", None) == "42501"
-        runtime_conn.rollback()
-    finally:
-        runtime_conn.close()
-        migration_conn.close()
-
-
-def test_relation_owner_and_assumable_owner_cannot_serve_when_schema_create_revoked(
-    monkeypatch,
-):
-    """Reproduce the split owner topology from the independent PG18 gate."""
-
-    schema = "aqsplitroles_" + uuid.uuid4().hex
-    admin_conn = db.connect(os.environ["ACTIONQ_TEST_URL"])
-    migration_conn = db.connect(os.environ["ACTIONQ_TEST_MIGRATION_URL"])
-    runtime_conn = db.connect(os.environ["ACTIONQ_TEST_RUNTIME_URL"])
-    schema_identifier = sql.Identifier(schema)
-    migration_identifier = sql.Identifier(MIGRATION_ROLE)
-    runtime_identifier = sql.Identifier(RUNTIME_ROLE)
-    membership_granted = False
-    try:
-        admin_conn.execute(
-            sql.SQL("CREATE SCHEMA {} AUTHORIZATION CURRENT_USER").format(
-                schema_identifier
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT USAGE, CREATE ON SCHEMA {} TO {}").format(
-                schema_identifier, migration_identifier
-            )
-        )
-        admin_conn.commit()
-
-        monkeypatch.delenv("ACTIONQ_RUNTIME_ROLE")
-        report = schema_contract.migrate(migration_conn, schema)
-        assert report["runtime_role"] is None
-
-        admin_conn.execute(
-            sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC, {}, {}").format(
-                schema_identifier, migration_identifier, runtime_identifier
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
-                schema_identifier, runtime_identifier
-            )
-        )
-        admin_conn.execute(
-            sql.SQL(
-                "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {}.{}, {}.{} TO {}"
-            ).format(
-                schema_identifier,
-                sql.Identifier("actions"),
-                schema_identifier,
-                sql.Identifier("events"),
-                runtime_identifier,
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
-                schema_identifier,
-                sql.Identifier("dispatch_requests"),
-                runtime_identifier,
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
-                schema_identifier,
-                sql.Identifier("dispatch_observation_watermarks"),
-                runtime_identifier,
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
-                schema_identifier,
-                sql.Identifier("managed_dispatch_envelopes"),
-                runtime_identifier,
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(
-                schema_identifier,
-                sql.Identifier("execution_groups"),
-                runtime_identifier,
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
-                schema_identifier,
-                sql.Identifier("execution_group_members"),
-                runtime_identifier,
-            )
-        )
-        for table in (
-            "immutable_action_specs",
-            "immutable_action_requests",
-            "immutable_action_runtime_grants",
-        ):
-            admin_conn.execute(
-                sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(
-                    schema_identifier, sql.Identifier(table), runtime_identifier
-                )
-            )
-        for table in (
-            "action_resources",
-            "action_resource_changes",
-            "action_resource_sessions",
-        ):
-            admin_conn.execute(
-                sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {}.{} TO {}").format(
-                    schema_identifier, sql.Identifier(table), runtime_identifier
-                )
-            )
-        admin_conn.execute(
-            sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(
-                schema_identifier,
-                sql.Identifier("schema_migrations"),
-                runtime_identifier,
-            )
-        )
-        admin_conn.execute(
-            sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
-                schema_identifier, runtime_identifier
-            )
-        )
-        admin_conn.commit()
-
-        topology = admin_conn.execute(
-            """
-            SELECT owner_role.rolname AS schema_owner,
-                   array_agg(DISTINCT relation_owner.rolname) AS relation_owners
-            FROM pg_namespace AS namespace_record
-            JOIN pg_roles AS owner_role ON owner_role.oid = namespace_record.nspowner
-            JOIN pg_class AS relation_record
-              ON relation_record.relnamespace = namespace_record.oid
-             AND relation_record.relname = ANY(%s)
-            JOIN pg_roles AS relation_owner
-              ON relation_owner.oid = relation_record.relowner
-            WHERE namespace_record.nspname = %s
-            GROUP BY owner_role.rolname
-            """,
-            (["actions", "events", "dispatch_requests", "dispatch_observation_watermarks", "managed_dispatch_envelopes", "schema_migrations"], schema),
-        ).fetchone()
-        admin_conn.rollback()
-        assert topology["schema_owner"] != MIGRATION_ROLE
-        assert topology["relation_owners"] == [MIGRATION_ROLE]
-        assert migration_conn.execute(
-            "SELECT has_schema_privilege(current_user, %s, 'CREATE') AS allowed",
-            (schema,),
-        ).fetchone()["allowed"] is False
-        migration_conn.rollback()
-
-        owner_compatibility = schema_contract.check_compatibility(
-            migration_conn, schema
-        )
-        assert owner_compatibility.state == "role-mismatch"
-        assert "owns a domain relation" in owner_compatibility.detail
-        migration_conn.rollback()
-
-        # Revoking schema CREATE does not remove ALTER authority from the
-        # principal that owns the tables. Prove the verifier topology without
-        # retaining the probe mutation.
-        migration_conn.execute(
-            sql.SQL("ALTER TABLE {}.{} ADD COLUMN verifier_probe INTEGER").format(
-                schema_identifier, sql.Identifier("actions")
-            )
-        )
-        migration_conn.rollback()
-
-        monkeypatch.setenv("ACTIONQ_SCHEMA", schema)
-        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_MIGRATION_URL"])
-        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
-            server._require_runtime_compatibility()
-        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
-            server._dispatch(
-                {
-                    "contract_version": "v1",
-                    "repo_id": "actionq",
-                    "kind": "implement",
-                    "title": "relation owner must not dispatch",
-                }
-            )
-
-        assert schema_contract.require_compatible(runtime_conn, schema).compatible
-        runtime_conn.rollback()
-        monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
-        assert server._require_runtime_compatibility()["state"] == "compatible"
-        assert server._dispatch(
-            {
-                "contract_version": "v1",
-                "repo_id": "actionq",
-                "kind": "implement",
-                "title": "bounded runtime dispatch",
-            }
-        )["status"] == "pending"
-
-        with pytest.raises(Exception) as excinfo:
-            runtime_conn.execute(
-                sql.SQL("ALTER TABLE {}.{} ADD COLUMN forbidden INTEGER").format(
-                    schema_identifier, sql.Identifier("actions")
-                )
-            )
-        assert getattr(excinfo.value, "sqlstate", None) == "42501"
-        runtime_conn.rollback()
-        with pytest.raises(Exception) as excinfo:
-            runtime_conn.execute(
-                sql.SQL("UPDATE {}.{} SET checksum = 'forbidden'").format(
-                    schema_identifier, sql.Identifier("schema_migrations")
-                )
-            )
-        assert getattr(excinfo.value, "sqlstate", None) == "42501"
-        runtime_conn.rollback()
-
-        admin_conn.execute(
-            sql.SQL("GRANT {} TO {}").format(
-                migration_identifier, runtime_identifier
-            )
-        )
-        admin_conn.commit()
-        membership_granted = True
-
-        assumable_compatibility = schema_contract.check_compatibility(
-            runtime_conn, schema
-        )
-        assert assumable_compatibility.state == "role-mismatch"
-        assert "can assume a domain relation owner" in assumable_compatibility.detail
-        runtime_conn.rollback()
-        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
-            server._require_runtime_compatibility()
-        with pytest.raises(schema_contract.SchemaCompatibilityError, match="role-mismatch"):
-            server._dispatch(
-                {
-                    "contract_version": "v1",
-                    "repo_id": "actionq",
-                    "kind": "implement",
-                    "title": "owner member must not dispatch",
-                }
-            )
-    finally:
-        if membership_granted:
-            admin_conn.rollback()
-            admin_conn.execute(
-                sql.SQL("REVOKE {} FROM {}").format(
-                    migration_identifier, runtime_identifier
-                )
-            )
-            admin_conn.commit()
-        runtime_conn.close()
-        migration_conn.close()
-        admin_conn.close()

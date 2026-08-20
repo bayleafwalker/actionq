@@ -10,7 +10,6 @@ import pytest
 
 from actionq import db
 from actionq.application import ActionQApplication, InvocationProvenance
-from actionq import server
 from actionq import application_dispatch
 from actionq.managed_dispatch import ManagedDispatchPolicy, ManagedEnqueueAdmission
 from actionq.vuoro import build_operations, catalog_metadata
@@ -183,18 +182,6 @@ def test_managed_enqueue_persists_an_immutable_envelope_with_its_v2_root(monkeyp
     assert envelope_insert == (8, "a" * 64, b'{"managed":true}\n', "b" * 64, "c" * 64)
 
 
-def test_http_identity_is_fail_closed_and_never_uses_spoofed_actor_headers(monkeypatch):
-    headers = {"x-actionq-actor": "attacker", "x-actionq-environment": "prod", "idempotency-key": "key"}
-    monkeypatch.setattr(server, "_served_authenticator", server._no_authenticator)
-    with pytest.raises(db.ActionQError, match="not configured"):
-        server._request_provenance(headers)
-    server.set_served_authenticator_for_testing(lambda _headers: server.AuthenticatedDispatchIdentity("compiler:trusted", "dev", ("actionq",)))
-    provenance = server._request_provenance(headers)
-    assert provenance.actor == "compiler:trusted"
-    assert provenance.environment == "dev"
-    assert provenance.authorized_repositories == ("actionq",)
-
-
 def test_vuoro_context_carries_only_trusted_repository_authorization():
     context = SimpleNamespace(identity=SimpleNamespace(actor="compiler:trusted", environment="dev", authorized_repositories=("actionq",)), request_id="r", catalog_revision="c", basis_revision=None, idempotency_key="k")
     operation = next(item for item in build_operations() if item.definition["name"] == "execution.dispatch.enqueue")
@@ -327,81 +314,3 @@ def test_observation_prune_preserves_terminal_history_and_never_uses_minimum_eve
         db.prune_dispatch_observation_events(TerminalConnection(), "aq", action_id=7, through_event_id=44)
 
 
-@pytest.mark.parametrize("path", [
-    "/v2/dispatch",
-    "/v2/dispatch/actions/1",
-    "/v2/dispatch/actions/1/changes?cursor=actionq:event:1",
-    "/v2/dispatch/requests/req:" + "a" * 32,
-    "/v2/dispatch/actions/nope",
-    "/v2/dispatch/requests/req:" + "a" * 32 + "/suffix",
-])
-def test_quarantined_v2_routes_are_byte_identical_and_skip_authentication_application_and_database(path, monkeypatch):
-    handler = object.__new__(server._Handler)
-    handler.path = path
-    seen = io.BytesIO()
-    handler.requestline = "GET " + path + " HTTP/1.1"
-    handler.request_version = "HTTP/1.1"
-    handler.command = "GET"
-    handler.wfile = seen
-    handler.send_response = lambda status: setattr(handler, "status", status)
-    handler.send_header = lambda *_args: None
-    handler.end_headers = lambda: None
-    monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("quarantined route must not authenticate"))
-    monkeypatch.setattr(server, "ActionQApplication", lambda **_kwargs: pytest.fail("quarantined route must not instantiate application"))
-    handler.do_GET()
-    assert handler.status == 404
-    assert seen.getvalue() == server.V2_DISPATCH_QUARANTINE_BYTES
-
-
-@pytest.mark.parametrize("path", ["/v2/dispatch", "/v2/dispatch/actions/1"])
-def test_quarantined_v2_post_routes_return_frozen_generic_response_before_body_auth_or_app(path, monkeypatch):
-    handler = object.__new__(server._Handler)
-    handler.path = path
-    handler.wfile = io.BytesIO()
-    handler.send_response = lambda status: setattr(handler, "status", status)
-    handler.send_header = lambda *_args: None
-    handler.end_headers = lambda: None
-    handler.headers = {"Content-Length": "not-an-integer"}
-    handler.rfile = io.BytesIO(b"{bad-json")
-    monkeypatch.setattr(server, "_request_provenance", lambda _headers: pytest.fail("quarantined route must not authenticate"))
-    monkeypatch.setattr(server, "_dispatch_v2", lambda *_args: pytest.fail("quarantined route must not call application"))
-    handler.do_POST()
-    assert handler.status == 404
-    assert handler.wfile.getvalue() == server.V2_DISPATCH_QUARANTINE_BYTES
-
-
-def test_quarantined_v2_wire_response_is_identical_for_every_http_method(monkeypatch):
-    monkeypatch.setattr(server._Handler, "log_message", lambda *_args: None)
-    httpd = HTTPServer(("127.0.0.1", 0), server._Handler)
-    worker = threading.Thread(target=httpd.serve_forever, daemon=True)
-    worker.start()
-
-    def request(method: str) -> tuple[bytes, bytes]:
-        payload = b"{invalid-json"
-        raw = (
-            f"{method} /v2/dispatch/actions/1 HTTP/1.1\r\n"
-            "Host: 127.0.0.1\r\n"
-            f"Content-Length: {len(payload)}\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode() + payload
-        with socket.create_connection(httpd.server_address, timeout=2) as connection:
-            connection.sendall(raw)
-            response = bytearray()
-            while chunk := connection.recv(65536):
-                response.extend(chunk)
-        return tuple(bytes(part) for part in bytes(response).split(b"\r\n\r\n", 1))
-
-    try:
-        responses = [request(method) for method in ("GET", "POST", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")]
-    finally:
-        httpd.shutdown()
-        worker.join(timeout=2)
-        httpd.server_close()
-
-    expected = server.V2_DISPATCH_QUARANTINE_BYTES
-    headers, bodies = zip(*responses, strict=True)
-    assert all(b" 404 Not Found\r\n" in header for header in headers)
-    assert all(b"content-type: application/json\r\n" in header.lower() for header in headers)
-    assert all(f"content-length: {len(expected)}".encode() in header.lower() for header in headers)
-    assert all(b"cache-control: no-store" in header.lower() for header in headers)
-    assert bodies == (expected,) * len(bodies)

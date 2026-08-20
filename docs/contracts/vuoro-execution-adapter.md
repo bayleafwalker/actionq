@@ -8,14 +8,14 @@ functions or reproduce Actionq lifecycle rules.
 The immutable `vuoro-adapter-kit` 0.1.0 wheel owns only pure Draft 2020-12
 object-schema building and the shared schema dialect/feature constants.
 ActionQ retains every operation schema, `AdapterOperation`, `_definition`,
-handler and served wrapper, registration order, authorization decision,
+handler and served adapter wrapper, registration order, authorization decision,
 invocation provenance rule, compatibility check, and lifecycle transition.
 
 The composition entry points are `actionq.vuoro.register_operations` and
 `actionq.vuoro.compatibility_record`. Importing either module does not connect
 to PostgreSQL, run a migration, or start a service. Every handler opens a
 runtime-role connection and fails closed through the same read-only schema and
-role compatibility check used by `actionctl` and `actionq-server`.
+role compatibility check used by `actionctl` and the Vuoro execution adapter.
 
 ## Catalog
 
@@ -92,6 +92,7 @@ metadata, not claimant proof, and those transitions are not fenced. The adapter
 does not claim stale-terminal-owner rejection. Adding fencing remains a
 separately authorized lifecycle and schema decision.
 
-`actionctl` and the legacy HTTP façade delegate to `ActionQApplication` without
-invocation provenance, so their existing output and lifecycle event shapes stay
-compatible while sharing the same application core.
+`actionctl` delegates to `ActionQApplication` without invocation provenance, so
+its existing output and lifecycle event shapes stay compatible with the served
+adapter while sharing the same application core. The standalone HTTP façade was
+retired with the execution plane and is not a compatibility surface.

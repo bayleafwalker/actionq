@@ -1,8 +1,7 @@
 name: Release ActionQ wheel
 
-# An ActionQ vX.Y.Z tag intentionally triggers this wheel release and the
-# existing publish-server-image workflow. The two artifacts share one source
-# tag while retaining independent build, validation, and attestation jobs.
+# An ActionQ vX.Y.Z tag publishes only the owner/federation wheel. The retired
+# standalone HTTP server has no image-release workflow in this revision.
 on:
   push:
     tags:

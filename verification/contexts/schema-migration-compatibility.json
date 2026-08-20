@@ -69,7 +69,7 @@
   "implementation_anchors": [
     "actionq/schema.py:migrate",
     "actionq/schema.py:check_compatibility",
-    "actionq/server.py:_runtime_connection",
+    "actionq/application_core.py:ActionQCore.connection",
     "tests/test_integration_postgres.py:test_deployment_migrations_serialize_across_connections"
   ],
   "expansions": ["semantic-doc", "concurrent-history", "fault-scenario"]

@@ -1,10 +1,18 @@
 ---
 doc_id: actionq-server-daemon-workstream-c
-status: active
+status: superseded
 last_verified: 2026-07-21
+superseded_on: 2026-08-20
+superseded_by: docs/plans/2026-08-20-execution-plane-deletion-order.md
 ---
 
 # actionq server and devbox daemon plan
+
+> **Historical plan — superseded 2026-08-20.** This body records the retired
+> server/daemon execution-plane workstream and is not current implementation
+> guidance. See `docs/plans/2026-08-20-execution-plane-deletion-order.md` for
+> the deletion decision and `HANDOFF.md` for the owner/federation successor and
+> its tranche-4 extraction boundary.
 
 Workstream C of `/projects/dev/agentops/docs/plans/agentops/agent-ops-substrate-plan.md`. `/projects/dev/actionq` is the Postgres-backed queue and HTTP server. `/projects/dev/actionq-dispatch` is the separate compatibility repository that provides a working `dispatcher-once` implementation for one claimed action.
 

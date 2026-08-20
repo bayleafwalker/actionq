@@ -10,9 +10,11 @@ public write contract; consumers must not write queue tables directly, use
 direct SQL, or import internal database functions to enqueue, claim, complete,
 reject, cancel, sweep, or emit action events.
 
-The behavioral contract is `../q-spec/actionq-spec.md`. The dispatcher owns
-worker execution policy; sprintctl owns sprint and work-item state; appservice
-owns deployment and cluster mutation.
+The behavioral contract is `../q-spec/actionq-spec.md`. Product-native runtimes
+own worker execution. The sibling `actionq-dispatcher` package is a historical
+compatibility launcher for the retired daemon and must not be used with this
+revision. Sprintctl owns sprint and work-item state; appservice owns deployment
+and cluster mutation.
 
 ## Development workflow
 
@@ -31,8 +33,8 @@ owns deployment and cluster mutation.
 - Claims must remain atomic and auditable. Changes to claims, deadlines,
   scheduling, parent-child depth, rate limits, or events require focused tests
   and careful migration review.
-- Keep action types opaque in this repository. Their worker behavior and gates
-  belong in actionq-dispatcher configuration, not queue schema logic.
+- Keep action types opaque in this repository. Their external-runtime behavior
+  and gates do not belong in queue schema logic.
 
 ## Stateful protocol work
 

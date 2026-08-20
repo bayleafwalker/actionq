@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import tomllib
 
 import pytest
 
@@ -19,7 +20,6 @@ from verification.validate_release_contract import (
 )
 
 WORKFLOW = ROOT / ".github" / "workflows" / "release-actionq-wheel.yaml"
-IMAGE_WORKFLOW = ROOT / ".github" / "workflows" / "publish-server-image.yaml"
 
 
 def test_adapter_dependency_is_an_immutable_github_wheel_pin() -> None:
@@ -56,12 +56,20 @@ def test_release_workflow_is_tag_only_and_github_only() -> None:
     assert "uses: actions/attest@v4" in workflow
 
 
-def test_release_tag_intentionally_also_publishes_the_server_image() -> None:
-    wheel_workflow = WORKFLOW.read_text(encoding="utf-8")
-    image_workflow = IMAGE_WORKFLOW.read_text(encoding="utf-8")
-    assert 'tags:\n      - "v*"' in wheel_workflow
-    assert 'tags:\n      - "v*"' in image_workflow
-    assert "ghcr.io/${{ github.repository_owner }}/actionq-server" in image_workflow
+def test_retired_server_and_daemon_are_not_release_surfaces() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert set(project["project"]["scripts"]) == {
+        "actionctl",
+        "actionq-completion-outbox",
+    }
+    for retired in (
+        ROOT / "Dockerfile",
+        ROOT / ".github/workflows/publish-server-image.yaml",
+        ROOT / "ops/systemd/actionq-daemon.service",
+        ROOT / "examples/actionq-daemon.toml",
+    ):
+        assert not retired.exists(), f"retired execution surface returned: {retired}"
 
 
 def test_release_workflow_runs_full_tests_before_one_gated_build() -> None:

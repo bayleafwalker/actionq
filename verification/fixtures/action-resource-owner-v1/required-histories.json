@@ -9,7 +9,6 @@
     "recursive-redaction-canaries",
     "enqueue-commit-response-loss-original-reference-revision",
     "bounded-wait-zero-thirty-early-spurious-disconnect-restart",
-    "legacy-quarantine-pre-auth-app-body-db",
     "stale-claim-session-fencing"
   ],
   "required_assertions": [
@@ -19,7 +18,6 @@
     "no-forbidden-field-at-any-depth",
     "retry-returns-transaction-original-reference-and-enqueue-revision",
     "wait-never-exceeds-bound-plus-one-second-grace",
-    "legacy-404-before-auth-application-body-or-database",
     "observation-does-not-weaken-fencing"
   ]
 }
