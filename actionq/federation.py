@@ -21,8 +21,6 @@ from . import federation_schema
 
 
 RESOURCE_RE = re.compile(r"^aqf1_[A-Za-z0-9_-]{43}$")
-DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-STATES = frozenset({"registered", "evidence-recorded", "accepted", "rejected", "superseded"})
 RELATION_TYPES = frozenset({"parent-of", "depends-on", "derived-from", "supersedes"})
 CYCLIC_RELATION_TYPES = frozenset({"parent-of", "depends-on"})
 
@@ -374,9 +372,9 @@ class FederationAuthority:
         def apply(conn: Any) -> tuple[str, int, int]:
             self._require_authority(principal, "federation.relate")
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision, owner_required=True)
-            if not execution_ref:
+            if not isinstance(execution_ref, str) or not execution_ref:
                 raise _Rejected("invalid-execution-reference", "execution_ref is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
-            if not assurance_type:
+            if not isinstance(assurance_type, str) or not assurance_type:
                 raise _Rejected("invalid-assurance-type", "assurance_type is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
             exists = conn.execute(f"SELECT 1 FROM {self._q('federation_execution_refs')} WHERE resource_ref=%s AND execution_ref=%s", (resource_ref, execution_ref)).fetchone()
             if exists:
@@ -416,7 +414,7 @@ class FederationAuthority:
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision)
             if str(row["state"]) not in {"registered", "evidence-recorded"}:
                 raise _Rejected("invalid-state-transition", "evidence may only be recorded before acceptance", resource_ref=resource_ref, before_revision=int(row["revision"]))
-            if not assurance_type:
+            if not isinstance(assurance_type, str) or not assurance_type:
                 raise _Rejected("invalid-assurance-type", "assurance_type is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
             expected_ref = "artifact:" + actual_digest
             if evidence_ref != expected_ref:
@@ -438,13 +436,13 @@ class FederationAuthority:
             self._require_authority(principal, "federation.acceptance.decide")
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision)
             state = str(row["state"])
-            if outcome not in {"accepted", "rejected"} or not policy_ref:
+            if outcome not in {"accepted", "rejected"} or not isinstance(policy_ref, str) or not policy_ref:
                 raise _Rejected("invalid-acceptance", "outcome and named policy are required", resource_ref=resource_ref, before_revision=int(row["revision"]))
             allowed = state == "evidence-recorded" if outcome == "accepted" else state in {"registered", "evidence-recorded"}
             if not allowed:
                 raise _Rejected("invalid-state-transition", "acceptance decision is invalid for current state", resource_ref=resource_ref, before_revision=int(row["revision"]))
             if outcome == "accepted":
-                if not evidence_ref:
+                if not isinstance(evidence_ref, str) or not evidence_ref:
                     raise _Rejected("evidence-required", "acceptance requires cited verified evidence", resource_ref=resource_ref, before_revision=int(row["revision"]))
                 found = conn.execute(f"SELECT 1 FROM {self._q('federation_evidence')} WHERE resource_ref=%s AND evidence_ref=%s", (resource_ref, evidence_ref)).fetchone()
                 if found is None:
@@ -461,7 +459,7 @@ class FederationAuthority:
         def apply(conn: Any) -> tuple[str, int, int]:
             self._require_authority(principal, "federation.settlement.record")
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision)
-            if str(row["state"]) not in {"accepted", "rejected"} or not fact_ref:
+            if str(row["state"]) not in {"accepted", "rejected"} or not isinstance(fact_ref, str) or not fact_ref:
                 raise _Rejected("invalid-state-transition", "settlement requires accepted/rejected state and a cited fact", resource_ref=resource_ref, before_revision=int(row["revision"]))
             def insert(after: int) -> None:
                 conn.execute(f"INSERT INTO {self._q('federation_settlements')} (resource_ref, source_revision, fact_ref, reconciled_by) VALUES (%s,%s,%s,%s)", (resource_ref, after, fact_ref, principal.principal_id))

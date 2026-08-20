@@ -301,6 +301,38 @@ def test_create_is_action_independent_and_response_loss_replays_exact_bytes(post
         assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_command_decisions')}").fetchone()["n"] == 2
 
 
+def test_non_string_free_form_fields_are_rejected_not_silently_stored_or_crashed(postgres_urls) -> None:
+    # execution_ref, assurance_type, policy_ref, evidence_ref, and fact_ref
+    # were only truthiness-checked, not type-checked. A non-str value that is
+    # still JSON-serializable (so canonical_bytes doesn't catch it) escaped
+    # to a SQL comparison or assignment: WHERE execution_ref=%s with an int
+    # raised a bare psycopg.errors.UndefinedFunction that the module's
+    # (TypeError, ValueError, AttributeError) durability handler misses
+    # entirely, while assurance_type/policy_ref/fact_ref would get silently
+    # assignment-cast and durably stored as the wrong type.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("owner", "federation.create", "federation.relate")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+
+    bad_execution_ref = authority.record_execution_ref(
+        principal=creator, idempotency_key="bad-execution-ref", resource_ref=resource,
+        execution_ref=12345, assurance_type="observation", expected_revision=1,
+    )
+    bad_assurance_type = authority.record_execution_ref(
+        principal=creator, idempotency_key="bad-assurance-type", resource_ref=resource,
+        execution_ref="provider:1", assurance_type=7, expected_revision=1,
+    )
+    assert bad_execution_ref.code == "invalid-execution-reference"
+    assert bad_assurance_type.code == "invalid-assurance-type"
+    with db.connect(postgres_urls["admin"]) as conn:
+        assert conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_execution_refs')}"
+        ).fetchone()["n"] == 0
+
+
 def test_missing_assurance_type_is_distinguished_from_evidence_or_reference_mismatch(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
