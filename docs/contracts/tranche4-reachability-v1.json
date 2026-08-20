@@ -5,7 +5,7 @@
     "actionq_commit": "89ec87607d71af1156771db2e0c927d74017f5a0",
     "w0_contract": "docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md",
     "scope": "Static reachability and consumer classification only. This record does not authorize W2, code movement, schema, migration, catalog, deployment, runtime, or appservice mutation.",
-    "w0_ratification": {"third_oracle_accept":"f6750e47edeb9f3a60c23059cd638604ac0d40a4","final_editorial":"2d0e4abdcf673a8831a9e754b32264bde8a6f438","merge":"89ec87607d71af1156771db2e0c927d74017f5a0","ci_run":"32347566284","ci_job":"96359442888","status":"R0-accepted-and-merged-before-W1"}
+    "w0_ratification": {"decision_url":"https://github.com/bayleafwalker/actionq/pull/31#issuecomment-5353774023","decision_comment_id":5353774023,"independent_review_accepted_head":"f6750e47edeb9f3a60c23059cd638604ac0d40a4","nonblocking_final_editorial":"2d0e4abdcf673a8831a9e754b32264bde8a6f438","merge":"89ec87607d71af1156771db2e0c927d74017f5a0","ci_run":"32347566284","ci_job":"96359442888","status":"R0-owner-ratified-and-merged-before-W1"}
   },
   "dispositions": [
     "retain-as-frozen-archive",
@@ -523,7 +523,7 @@
       "paths": ["actionq/action_resource.py", "actionq/application_core.py", "actionq/migrations/009_action_resource_owner.sql"],
       "symbols": ["actionq/action_resource.py#ActionResourceOwner.enqueue", "actionq/action_resource.py#ActionResourceOwner.snapshot", "actionq/action_resource.py#ActionResourceOwner.changes", "actionq/action_resource.py#ActionResourceOwner.project_state", "actionq/action_resource.py#ActionResourceOwner.prune", "actionq/application_core.py#AuthenticatedActionResourcePrincipal.derive", "actionq/application_core.py#ActionQCore.enqueue_action_resource", "actionq/application_core.py#ActionQCore.project_action_resource"],
       "operations": ["revision/change cursor", "recovery floor", "principal-scoped idempotency", "current action-row/claim projection coupling"],
-      "disposition": "replace-by-federation",
+      "disposition": "retain-as-frozen-archive",
       "owner": "actionq",
       "falsifying_test": "The successor requires an action row/claim receipt, treats CAS as authorization, prunes v1 changes, or loses deterministic projection."
     },
@@ -548,7 +548,7 @@
     {
       "id": "completion-replay-and-rebuild",
       "paths": ["actionq/completion_log.py", "actionq/completion_outbox.py", "actionq/action_resource.py", "actionq/migrations/011_session_completion_log.sql", "verification/run_action_resource_history.py", "verification/validate_action_resource_owner_v1.py", "verification/contexts/action-resource-owner-v1.json", "verification/fixtures/action-resource-owner-v1/manifest.json"],
-      "symbols": ["actionq/completion_log.py#CompletionLog.ingest", "actionq/completion_log.py#CompletionLog.list", "actionq/completion_log.py#CompletionLog.compact", "actionq/completion_outbox.py#CompletionOutbox.record", "actionq/completion_outbox.py#CompletionOutbox.retry", "actionq/completion_outbox.py#recover_capsules", "actionq/action_resource.py#ActionResourceOwner.project_state", "actionq/action_resource.py#ActionResourceOwner.changes"],
+      "symbols": ["actionq/completion_log.py#CompletionLog.ingest", "actionq/completion_log.py#CompletionLog.list", "actionq/completion_log.py#CompletionLog.compact", "actionq/completion_outbox.py#CompletionOutbox.record", "actionq/completion_outbox.py#CompletionOutbox.retry", "actionq/completion_outbox.py#recover_capsules"],
       "operations": ["completion event identity/digest", "cursor/recovery floor", "response-loss retry", "capsule recovery", "resource projection/rebuild"],
       "disposition": "replace-by-federation",
       "owner": "actionq",
@@ -587,7 +587,11 @@
         "actionq_contracts_source_revision": "0e8b21325a7fd3d59a989110e61ce80476c51dea",
         "actionq_contracts_version": "0.1.1",
         "actionq_contracts_wheel_sha256": "23236d0f662a1dc58eacbc7c5d9a3dcd27f11fb34be2b725945518452119d3df",
+        "adapter_kit_source_revision":"a002e5031b4235779462314c125903300636c5f1",
+        "adapter_kit_version":"0.1.0",
         "adapter_kit_sha256": "0037898a4c9f01720a42302365b0172ecd203732070326ea2abdf549a44bf0c2",
+        "schema_runtime_source_revision":"a002e5031b4235779462314c125903300636c5f1",
+        "schema_runtime_version":"0.1.0",
         "schema_runtime_sha256": "b66c9357c99aa9e1a7353991ce54105a8621958ecfac47f8c121d80b90b77912",
         "catalog_metadata_sha256": "8d434e8b347e804c90e48a6598304be84b12f2a61ebc2dbed00a26053239a778",
         "composition_global_revision": "23cfc276ed1fb4a51b94864a963cfd4b0e70a02a73dc3522e13a96e0c9b33c9a",
@@ -597,6 +601,7 @@
         "sole_conditional_operation": "execution.managed-dispatch.enqueue",
         "managed_dispatch_operation_is_policy_conditional": true
       },
+      "released_operation_sha256":{"execution.action.enqueue":"93e95dbd9371537ab76a2bd89dda0fd0bcbbe9db7169bfd0c3dc2226eba4f21a","execution.dispatch.enqueue":"6f203830b9932b3a6fb63b35aae2a5d80fb89a1834e1ba09d54953f98f6b826d","execution.action.create-immutable-candidate":"f8b6b56d86d4876db3c8dafcfbf09208709b7f2d7f9a052f8e81f9f7d786f7ef","execution.action.list":"e6b03f3b38cd806264803a40fb0b8f490052f849db9f72e030c5923f4b09d002","execution.action.show":"9ff4d4d856cc82c9141f749b98dfe95d0d287b49997f24d33a10e3a394d808bf","execution.group.realize":"cae0d3c53d7864d0bd102f858d841b75b5cfd8c2f8c73a3d95edb4e15300182f","execution.group.stop-new-claims":"e6a7dee48f2f3dbea96ca0522e6d4dfd723e3c2689b86d095ab30bf08c98726b","execution.group.show":"9425426ef4ac455425a4aebee69006e5f88939b85d30e4e0b699a30c74bfda38","execution.group.list":"abf1ce35800a1a6df1e111c8a5664b2e792f85533ec338965a95fd2d9aa2c819","execution.action.claim":"4430ebe7242cc8a218a38f26fa7008b5215c6c2ad30a656d60d663a7c2f41bd7","execution.action.renew":"2f65f3ace025a1878c216ec2762fa1ced2700f73809858e4bc35fe79f9c43f59","execution.action.settle":"4cc8fe17422de69ca6e53999dd39db99f5d07ec18458eca32625ed250b61fab3","execution.action.complete":"025fc42e54a540a25d6b3e05c2b8ea000abeb3afe19629a43e3e1c97a6bc03a9","execution.action.fail":"13790b9273509614e353ad980b47495ddaf6255dfbd0acf366fad4a9187295a2","execution.action.reject":"aff131e3134df96ad8cdf0d804475b220c48aa164335bbbb5e05c9bcf12cbde5","execution.action.cancel":"715efc1f5bf36f35050a6afd61d91804165684a07f70b0934fe7956116c31992","execution.action.sweep":"9d5ec1b34b507158a4c211a2dfe306d704dbb1aa12d3936806c8255881264057","execution.event.list":"5e07346bee06617eda570f78a71f1427cb98c800c6c3c9f3e51db8d39abd5064","execution.session.list":"9fdb3d138d04c32b00a8d20bc273f224b92aef0c49ddbc0b3def7fb6375c89e6","execution.session.record":"a4accddacbdbc661c4d3ef932362e0b9c2e73fa7dfb49e23ced24bf8503006f2","execution.dispatch.enqueue.v1":"859fc0f1a63f864593ede2985186b3a7f38fed73380be842954c05120d381975","execution.dispatch.list":"c002545391fab83fcbb6b4d56cd9d3b9045ed0c2b171ac49d3b6dc1caa7e5748"},
       "outcomes":{"frozen-execution-wheel-schema-catalog-and-operation-pins":"retain-as-frozen-archive","federation-v1-fifth-domain":"replace-by-federation"},
       "operations": ["released-wheel fetch/digest", "execution/v1 registration", "four-domain composition", "pre-migration compatibility", "catalog global revision"],
       "disposition": "replace-by-federation",
@@ -634,8 +639,8 @@
     {
       "id":"sprintctl-actionq-lifecycle",
       "repository":"https://github.com/bayleafwalker/sprintctl.git",
-      "commit_refs":{"inspected_worktree":"75fd4a7bc01472f941c923444cabe6451bb1afd0"},
-      "paths":["sprintctl/cli.py","tests/test_takeup.py","docs/advanced/takeup.md"],
+      "commit_refs":{"released_baseline":"15afc8762ce99beb3ec0239a5ce4a8713dd6f934","current_origin_main":"db52e2fdc219eeb6b15a7667e079779e22128d4e"},
+      "paths":["sprintctl/commands/lifecycle.py","tests/test_takeup.py","tests/test_takeup_pg_contract.py","docs/advanced/takeup.md"],
       "operations":["_load_active_actionq_session_ids","takeup sweep archive-session liveness"],
       "disposition":"unresolved-owner-decision",
       "owner":"sprintctl",
@@ -648,11 +653,16 @@
         "realignment_source": "6b41e6f7b14d7cb9b6e44acced4f05f457b810eb"
       },
       "paths": [
-        "templates/workspace/AGENTS.agentops.md",
-        "README.md",
-        "docs/plans/agentops/native-runtime-federation-realignment-2026-08-20.md",
-        "docs/plans/agentops/generalized-dispatch-practices-plan.md",
-        "docs/plans/agentops/substrate-resilience-plan.md"
+        "apps/web/lib/cockpit/actionq.js",
+        "apps/web/lib/cockpit/dispatch.js",
+        "apps/web/lib/cockpit/env.js",
+        "apps/web/app/cockpit/api/claims/route.js",
+        "apps/web/app/cockpit/api/dispatch/route.js",
+        "apps/web/app/cockpit/api/dispatches/route.js",
+        "apps/web/app/cockpit/api/mcp/route.js",
+        "apps/web/tests/actionq-contract.test.js",
+        "apps/web/tests/route-shapes.test.js",
+        "apps/web/tests/write-surface.test.js"
       ],
       "operations": ["generated workspace guidance", "hybrid dispatch manifests", "historical daemon plans with supersession markers"],
       "outcomes":{"cockpit-actionq-write-api":"historicalize/delete","cockpit-archive-session-and-dispatch-reads":"retain-as-frozen-archive","reconciliation-successor":"replace-by-federation"},
@@ -694,10 +704,22 @@
         "phase2_server_removal": "565c5343895ce6c19860a981c343a876723a840b"
       },
       "paths": [
-        "clusters/main/kubernetes/apps/actionq-server",
-        "clusters/main/kubernetes/apps/actionq-db",
+        "clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml",
+        "clusters/main/kubernetes/apps/actionq-db/app/actionq-runtime.secret.yaml",
         "clusters/main/kubernetes/apps/agent-cockpit/app/deployment.yaml",
-        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml"
+        "clusters/main/kubernetes/apps/vuoro-shared/app/deployment.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev/app/deployment.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared/app/managed-dispatch-policy.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migration.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-read-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-migration.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-read-runtime.secret.yaml",
+        "clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-migrate-v1.yaml"
       ],
       "operations": ["namespace ownership transfer", "runner identity registry transfer", "server removal", "cockpit URL removal", "execution v12 migration job", "database runtime roles"],
       "outcomes":{"actionq-server":"historicalize/delete","database-and-frozen-archive":"retain-as-frozen-archive","federation-successor":"replace-by-federation","actionq-runner":"unresolved-owner-decision","managed-policy-credentials-vuoro-deployments-roles-jobs":"unresolved-owner-decision"},
@@ -715,6 +737,25 @@
       "falsifying_test": "Phase 2 precedes phase 1 health proof, namespace pruning deletes vscode/CNPG/cockpit, or any non-operator session mutates/reconciles the cluster."
     }
   ],
+  "external_atomic_path_dispositions": [
+    {"consumer_id":"vuoro-composition","disposition":"retain-as-frozen-archive","paths":["packages/vuoro-service/composition/adapter-pins.json","scripts/validate_released_execution_adapter.py","scripts/validate_released_catalog_composition.py","scripts/verify_pre_migration_startup.py"]},
+    {"consumer_id":"vuoro-composition","disposition":"replace-by-federation","paths":["packages/vuoro-service/src/vuoro_service/composition.py","packages/vuoro-service/src/vuoro_service/execution_provenance.py","scripts/fetch_pinned_adapters.py"]},
+    {"consumer_id":"agentops-generated-guidance","disposition":"historicalize/delete","paths":["apps/web/lib/cockpit/actionq.js","apps/web/lib/cockpit/dispatch.js","apps/web/app/cockpit/api/claims/route.js","apps/web/app/cockpit/api/dispatch/route.js"]},
+    {"consumer_id":"agentops-generated-guidance","disposition":"retain-as-frozen-archive","paths":["apps/web/app/cockpit/api/dispatches/route.js","apps/web/tests/actionq-contract.test.js"]},
+    {"consumer_id":"agentops-generated-guidance","disposition":"replace-by-federation","paths":["apps/web/lib/cockpit/env.js","apps/web/app/cockpit/api/mcp/route.js","apps/web/tests/route-shapes.test.js","apps/web/tests/write-surface.test.js"]},
+    {"consumer_id":"sprintctl-actionq-lifecycle","disposition":"unresolved-owner-decision","paths":["sprintctl/commands/lifecycle.py","tests/test_takeup.py","tests/test_takeup_pg_contract.py","docs/advanced/takeup.md"]},
+    {"consumer_id":"gitops-nixos-daemon-retirement","disposition":"historicalize/delete","paths":["modules/system/actionq-dispatch.nix","scripts/actionq-daemon-tmux.sh","scripts/actionq-handoff.sh","scripts/check-actionq-retirement.sh","docs/runbooks/actionq-devbox-dispatch.md"]},
+    {"consumer_id":"gitops-nixos-daemon-retirement","disposition":"retain-as-frozen-archive","paths":["scripts/update-agentops-tools.sh","modules/system/agentops-client-tools.nix"]},
+    {"consumer_id":"appservice-ordered-retirement","disposition":"historicalize/delete","paths":["clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml"]},
+    {"consumer_id":"appservice-ordered-retirement","disposition":"retain-as-frozen-archive","paths":["clusters/main/kubernetes/apps/actionq-db/app/actionq-runtime.secret.yaml"]},
+    {"consumer_id":"appservice-ordered-retirement","disposition":"unresolved-owner-decision","paths":["clusters/main/kubernetes/apps/agent-cockpit/app/deployment.yaml","clusters/main/kubernetes/apps/vuoro-shared/app/deployment.yaml","clusters/main/kubernetes/apps/vuoro-dev/app/deployment.yaml","clusters/main/kubernetes/apps/vuoro-shared/app/managed-dispatch-policy.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migration.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-read-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-migration.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-read-runtime.secret.yaml","clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-migrate-v1.yaml"]}
+  ],
+  "external_baseline_bytes": [
+    {"consumer_id":"vuoro-composition","commit":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/composition/adapter-pins.json","sha256":"6d2f9739c1ffa1a5fa3a9cfdf8dd22b81ed71d5a93eff211fa1db134ae8902f1"},
+    {"consumer_id":"agentops-generated-guidance","commit":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/actionq.js","sha256":"ba9050d863420c8c364b42edc44e265933c1be51af7372aba6ce8cd59dd7b456"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","commit":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"sprintctl/commands/lifecycle.py","sha256":"18b3b2a42af6195a264fb6b8d3d7a02bc3ba7703fac83a1dec7879f3f29fb9c5"},
+    {"consumer_id":"appservice-ordered-retirement","commit":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml","sha256":"dbe82ae71c60941f77398a07e48059beb2b43b63f78d6e6a6ab3a6184f6a66e8"}
+  ],
   "atomic_symbol_dispositions": [
     {"path":"actionq/application_completion.py","disposition":"historicalize/delete","symbols":["CompletionService._terminal","CompletionService.complete","CompletionService.fail","CompletionService.reject","CompletionService.settle","CompletionService.cancel","CompletionService.sweep","CompletionService.acknowledge_cancellation"]},
     {"path":"actionq/application_completion.py","disposition":"replace-by-federation","symbols":["CompletionService","CompletionService.register_publication"]},
@@ -725,6 +766,7 @@
     {"path":"actionq/application_outbox.py","disposition":"historicalize/delete","symbols":["OutboxService.emit_event","OutboxService.record_session"]},
     {"path":"actionq/application_outbox.py","disposition":"retain-as-frozen-archive","symbols":["OutboxService","OutboxService.list_events","OutboxService.list_sessions"]},
     {"path":"actionq/action_resource.py","disposition":"retain-as-frozen-archive","symbols":["ActionResourceOwner.enqueue","ActionResourceOwner._lookup","ActionResourceOwner.snapshot","ActionResourceOwner.changes","ActionResourceOwner.project_state","ActionResourceOwner.prune"]},
+    {"path":"actionq/application_core.py","disposition":"retain-as-frozen-archive","symbols":["AuthenticatedActionResourcePrincipal.derive","ActionQCore.enqueue_action_resource","ActionQCore.project_action_resource"]},
     {"path":"actionq/completion_outbox.py","disposition":"historicalize/delete","symbols":["completion_fields","_duration_ms"]},
     {"path":"actionq/completion_outbox.py","disposition":"replace-by-federation","symbols":["CompletionOutbox.record","CompletionOutbox.pending","CompletionOutbox.retry","CompletionOutbox.acknowledge","CompletionOutbox.contains_capsule","CompletionOutbox._verify_rows","recover_capsules","inspect_outbox"]},
     {"path":"actionq/db.py","disposition":"historicalize/delete","symbols":["NoActionAvailable","ClaimRejected","ClaimRejected.__init__","receipt_digest","consume_runner_request","_rate_limited_source","enqueue","realize_execution_group","stop_execution_group","_validate_immutable_claim","claim","_claim_schema3","_renewal_rejection_reason","renew","_transition_terminal","complete","fail","reject","settle_dispatch_result","cancel","acknowledge_cancellation","reap_cancellations","sweep"]},
@@ -732,11 +774,12 @@
     {"path":"actionq/db.py","disposition":"replace-by-federation","symbols":["immutable_input_set_digest","_immutable_snapshot","immutable_spec_input_refs","create_immutable_action","register_publication","migrate","check_compatibility","require_compatible","insert_event","event_payload_with_provenance","validate_dispatch_result","_verify_dispatch_result_referent"]}
   ],
   "bound_constant_dispositions": [
-    {"path":"actionq/schema.py","names":["DOMAIN","API_VERSION","MIN_SCHEMA_VERSION","MAX_SCHEMA_VERSION"],"disposition":"retain-as-frozen-archive"},
-    {"path":"actionq/db.py","names":["SESSION_EVENT_TYPES","_IMMUTABLE_ROLE_CONTRACTS"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/action_resource.py","names":["RESOURCE_RE","TERMINAL","OUTCOMES","PROJECTION_KEYS","SESSION_KEYS","EVENT_KEYS","ROOT_STORAGE_KEYS","SESSION_STORAGE_KEYS","EVENT_STORAGE_KEYS"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/schema.py","names":["DOMAIN","API_VERSION","MIN_SCHEMA_VERSION","MAX_SCHEMA_VERSION","PRE_MIGRATION_BRIDGE_VERSION","MIGRATION_TABLE","_MIGRATION_RE","_COLUMN_SHAPE","_REQUIRED_COLUMNS","_REQUIRED_CONSTRAINT_COUNTS","_REQUIRED_INDEXES","Migration"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/db.py","names":["MAX_CHAIN_DEPTH","DEFAULT_RATE_LIMIT_PER_HOUR","SCHEMA_RE","SESSION_EVENT_TYPES","_ARTIFACT_REF_RE","_GIT_OBJECT_RE","_ATTEMPT_ID_RE","_IMMUTABLE_REF_RE","_IMMUTABLE_DIGEST_RE","_IMMUTABLE_ROLE_CONTRACTS","_GROUP_CONTRACT_ID","_PLAN_REF_RE"],"disposition":"retain-as-frozen-archive"},
     {"path":"actionq/completion_log.py","names":["SCHEMA_VERSION","_TERMINAL_REASONS"],"disposition":"replace-by-federation"},
-    {"path":"actionq/completion_outbox.py","names":["SCHEMA_VERSION","DEFAULT_ACK_RETENTION_SECONDS","MAX_ACK_RETENTION_SECONDS"],"disposition":"replace-by-federation"},
-    {"path":"actionq/vuoro.py","names":["SCHEMA_FEATURES","API_VERSION","_ACTION_SCHEMA","_EVENT_SCHEMA","_DISPATCH_V2_INPUT_SCHEMA","_MANAGED_DISPATCH_INPUT_SCHEMA"],"disposition":"historicalize/delete"}
+    {"path":"actionq/completion_outbox.py","names":["SCHEMA_VERSION","DEFAULT_OUTBOX_PATH","MAX_RETRY_SECONDS","DEFAULT_ACK_RETENTION_SECONDS","MAX_ACK_RETENTION_SECONDS","SQLITE_BUSY_TIMEOUT_SECONDS","SQLITE_LOCK_RETRY_SECONDS","_SAFE_ERROR_CLASSES"],"disposition":"replace-by-federation"},
+    {"path":"actionq/vuoro.py","names":["SCHEMA_FEATURES","API_VERSION","_object","_NULLABLE_STRING","_NULLABLE_INTEGER","_ACTION_SCHEMA","_EVENT_SCHEMA","_DECISION_SCHEMA","_DECISION_RESULT_SCHEMA","_DISPATCH_V2_RESULT_SCHEMA","_DISPATCH_V2_INPUT_SCHEMA","_MANAGED_DISPATCH_INPUT_SCHEMA","_DISPATCH_RESULT_SCHEMA","_EXECUTION_ENVELOPE_SCHEMA","_EXECUTION_GROUP_SCHEMA","_IMMUTABLE_CANDIDATE_ACTION_INPUT_SCHEMA","_COMPLETION_EVENT_SCHEMA","_COMPLETION_PAGE_SCHEMA","__all__"],"disposition":"historicalize/delete"}
   ],
   "atomic_import_dispositions": [
     {"path":"actionq/db.py","names":["ACTION_CREATION_REQUEST_V1","DISPATCH_RESULT_V1","EXECUTION_ENVELOPE_V1","require_compatible as require_contract_compatible"],"disposition":"retain-as-frozen-archive"},
@@ -746,8 +789,10 @@
   "semantic_assets": [
     {"disposition":"retain-as-frozen-archive","paths":["tests/test_cancellation_model.py","tests/test_candidate_action_cancellation_model.py","tests/test_verification_contracts.py","verification/contexts/action-claim-concurrency.json","verification/contexts/dispatch-enqueue-v2-contract.json","verification/contexts/schema-migration-compatibility.json","verification/fixtures/action-resource-owner-v1/manifest.json","verification/fixtures/action-resource-owner-v1/not-found.json","verification/fixtures/action-resource-owner-v1/protocol-responses.json","verification/fixtures/action-resource-owner-v1/required-histories.json","verification/history-receipts/bounded-wait.json","verification/history-receipts/fencing.json","verification/history-receipts/non-disclosure.json","verification/history-receipts/pruning.json","verification/history-receipts/redaction.json","verification/history-receipts/response-loss.json","verification/history-receipts/snapshot-race.json","verification/results/action-resource-owner-bounded-wait.json","verification/results/action-resource-owner-fencing.json","verification/results/action-resource-owner-non-disclosure.json","verification/results/action-resource-owner-pruning.json","verification/results/action-resource-owner-redaction.json","verification/results/action-resource-owner-response-loss.json","verification/results/action-resource-owner-snapshot-race.json"]},
     {"disposition":"historicalize/delete","paths":["verification/capture_claude_acp.py","verification/probe_claude_acp_set_model.py","verification/probe_claude_acp_settings_binding.py","verification/probe_native_harness_binding.py","docs/operations/codex-luna-catalog-workaround.md","docs/plans/acp-execution-adapter.md","docs/verification/2026-08-13-adapter-kit-depth-2-survey.md","docs/verification/2026-08-13-schema-runtime-depth-2-survey.md",".agents/overlays/actionq.hybrid-worker.md"]},
-    {"disposition":"replace-by-federation","paths":["actionq/migrations/__init__.py"]}
+    {"disposition":"replace-by-federation","paths":["actionq/migrations/__init__.py","AGENTS.md"]}
   ],
+  "semantic_asset_inheritance":{"owner":"actionq","falsifying_test":"A selected semantic root is added, removed, or changes category without an explicit W1 disposition."},
+  "effective_disposition_rule":"atomic symbol/import/constant entries override their python-surface or import-group inventory default; critical_reachability is an index only and must reconcile every symbol to that single effective disposition; successor semantics must use distinct names and may not override frozen legacy symbols.",
   "host_local_anchors": [
     {"path":"/projects/dev/AGENTS.md","sha256":"afda50a10c7dcd2df0c3193016b09170585a59dd2e6b5ea01c92f864d572093c","limitation":"host-local mutable workspace guidance","disposition":"historicalize/delete"}
   ],

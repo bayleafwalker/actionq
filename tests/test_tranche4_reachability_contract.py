@@ -32,6 +32,13 @@ PYTHON_ROOTS = (
     (ROOT / "packages/actionq-runner/actionq_runner", "actionq_runner"),
     (ROOT / "packages/actionq-contracts/actionq_contracts", "actionq_contracts"),
 )
+CONSTANT_UNIVERSE = {
+    "actionq/action_resource.py",
+    "actionq/completion_outbox.py",
+    "actionq/db.py",
+    "actionq/schema.py",
+    "actionq/vuoro.py",
+}
 
 
 def _manifest() -> dict:
@@ -64,6 +71,42 @@ def _python_symbols() -> dict[str, list[str]]:
                     )
         observed[path.relative_to(ROOT).as_posix()] = names
     return observed
+
+
+def _top_level_assignments(relative: str) -> set[str]:
+    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in tree.body:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        names.update(target.id for target in targets if isinstance(target, ast.Name))
+    return names
+
+
+def _contract_import_names(relative: str) -> set[str]:
+    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+    return {
+        alias.name + (f" as {alias.asname}" if alias.asname else "")
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "actionq_contracts"
+        for alias in node.names
+    }
+
+
+def _effective_symbol_dispositions(manifest: dict) -> dict[tuple[str, str], str]:
+    effective = {
+        (entry["path"], symbol): entry["disposition"]
+        for entry in manifest["python_surfaces"]
+        for symbol in entry["symbols"]
+    }
+    seen: set[tuple[str, str]] = set()
+    for entry in manifest["atomic_symbol_dispositions"]:
+        for symbol in entry["symbols"]:
+            key = (entry["path"], symbol)
+            assert key not in seen
+            assert key in effective
+            seen.add(key)
+            effective[key] = entry["disposition"]
+    return effective
 
 
 def _local_import_edges() -> set[str]:
@@ -236,12 +279,14 @@ def test_manifest_identity_and_every_entry_is_owned_and_falsifiable():
     )
     assert set(manifest["dispositions"]) == DISPOSITIONS
     assert manifest["basis"]["w0_ratification"] == {
-        "third_oracle_accept": "f6750e47edeb9f3a60c23059cd638604ac0d40a4",
-        "final_editorial": "2d0e4abdcf673a8831a9e754b32264bde8a6f438",
+        "decision_url": "https://github.com/bayleafwalker/actionq/pull/31#issuecomment-5353774023",
+        "decision_comment_id": 5353774023,
+        "independent_review_accepted_head": "f6750e47edeb9f3a60c23059cd638604ac0d40a4",
+        "nonblocking_final_editorial": "2d0e4abdcf673a8831a9e754b32264bde8a6f438",
         "merge": "89ec87607d71af1156771db2e0c927d74017f5a0",
         "ci_run": "32347566284",
         "ci_job": "96359442888",
-        "status": "R0-accepted-and-merged-before-W1",
+        "status": "R0-owner-ratified-and-merged-before-W1",
     }
     for section in (
         "python_surfaces",
@@ -274,6 +319,22 @@ def _check_mixed_symbols_constants_and_semantic_assets():
     _assert_atomic_entries(manifest["atomic_symbol_dispositions"], "symbols")
     _assert_atomic_entries(manifest["bound_constant_dispositions"], "names")
     _assert_atomic_entries(manifest["atomic_import_dispositions"], "names")
+    constants = {
+        entry["path"]: set()
+        for entry in manifest["bound_constant_dispositions"]
+        if entry["path"] in CONSTANT_UNIVERSE
+    }
+    for entry in manifest["bound_constant_dispositions"]:
+        if entry["path"] in CONSTANT_UNIVERSE:
+            constants[entry["path"]].update(entry["names"])
+    assert constants == {path: _top_level_assignments(path) for path in CONSTANT_UNIVERSE}
+    imports = {}
+    for entry in manifest["atomic_import_dispositions"]:
+        imports.setdefault(entry["path"], set()).update(entry["names"])
+    assert imports == {
+        "actionq/db.py": _contract_import_names("actionq/db.py"),
+        "actionq/vuoro.py": _contract_import_names("actionq/vuoro.py"),
+    }
     _assert_atomic_entries(
         [dict(entry, path="semantic-assets") for entry in manifest["semantic_assets"]],
         "paths",
@@ -283,6 +344,59 @@ def _check_mixed_symbols_constants_and_semantic_assets():
             assert (ROOT / relative).is_file(), relative
     source = (ROOT / "tests/test_cancellation_model.py").read_text(encoding="utf-8")
     _validate_r1_invariants(manifest, source)
+    effective = _effective_symbol_dispositions(manifest)
+    for entry in manifest["critical_reachability"]:
+        for reference in entry["symbols"]:
+            path, symbol = reference.split("#", 1)
+            assert effective[path, symbol] == entry["disposition"], reference
+
+    selected = set()
+    for pattern in (
+        "tests/test_cancellation_model.py", "tests/test_candidate_action_cancellation_model.py",
+        "tests/test_verification_contracts.py", "verification/contexts/action-claim-concurrency.json",
+        "verification/contexts/dispatch-enqueue-v2-contract.json", "verification/contexts/schema-migration-compatibility.json",
+        "verification/fixtures/action-resource-owner-v1/*", "verification/history-receipts/*.json",
+        "verification/results/action-resource-owner-*.json", "verification/*probe*.py",
+        "verification/capture_claude_acp.py", "docs/operations/codex-luna-catalog-workaround.md",
+            "docs/plans/acp-execution-adapter.md", "docs/verification/*depth-2-survey.md",
+            ".agents/overlays/actionq.hybrid-worker.md", "actionq/migrations/__init__.py", "AGENTS.md",
+    ):
+        selected.update(path.relative_to(ROOT).as_posix() for path in ROOT.glob(pattern) if path.is_file())
+    assert _flatten(manifest["semantic_assets"], "paths") == selected
+    inheritance = manifest["semantic_asset_inheritance"]
+    assert inheritance["owner"] and inheritance["falsifying_test"]
+
+    atomic_external = manifest["external_atomic_path_dispositions"]
+    _assert_atomic_entries(
+        [dict(entry, path=entry["consumer_id"]) for entry in atomic_external], "paths"
+    )
+    consumers = {entry["id"]: entry for entry in manifest["external_consumers"]}
+    for consumer_id in {entry["consumer_id"] for entry in atomic_external}:
+        classified = {
+            path for entry in atomic_external if entry["consumer_id"] == consumer_id for path in entry["paths"]
+        }
+        assert classified == set(consumers[consumer_id]["paths"])
+    repo_roots = {
+        "vuoro-composition": Path("/projects/dev/vuoro"),
+        "agentops-generated-guidance": Path("/projects/dev/agentops"),
+        "sprintctl-actionq-lifecycle": Path("/projects/dev/sprintctl"),
+        "appservice-ordered-retirement": Path("/projects/dev/appservice"),
+    }
+    for record in manifest["external_baseline_bytes"]:
+        assert re.fullmatch(r"[0-9a-f]{40}", record["commit"])
+        assert re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+        repo = repo_roots[record["consumer_id"]]
+        if repo.is_dir():
+            content = subprocess.check_output(
+                ["git", "show", f'{record["commit"]}:{record["path"]}'], cwd=repo
+            )
+            assert hashlib.sha256(content).hexdigest() == record["sha256"]
+    vuoro = consumers["vuoro-composition"]
+    assert vuoro["pins"]["adapter_kit_source_revision"] == "a002e5031b4235779462314c125903300636c5f1"
+    assert vuoro["pins"]["schema_runtime_source_revision"] == "a002e5031b4235779462314c125903300636c5f1"
+    assert len(vuoro["released_operation_sha256"]) == 22
+    assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in vuoro["released_operation_sha256"].values())
+    assert "historical compatibility launcher" not in (ROOT / "AGENTS.md").read_text()
 
 
 def _check_r1_reviewer_corruption_probes():
@@ -316,6 +430,37 @@ def _check_r1_reviewer_corruption_probes():
     )
     with pytest.raises(AssertionError):
         _validate_r1_invariants(manifest, renamed)
+
+    for section, field, value in (
+        ("bound_constant_dispositions", "names", "MAX_SCHEMA_VERSION"),
+        ("atomic_symbol_dispositions", "symbols", "CompletionService.settle"),
+        ("atomic_import_dispositions", "names", "canonical_bytes as contract_canonical_bytes"),
+        ("semantic_assets", "paths", "verification/probe_native_harness_binding.py"),
+    ):
+        changed = copy.deepcopy(manifest)
+        for entry in changed[section]:
+            if value in entry[field]:
+                entry[field].remove(value)
+                break
+        with pytest.raises(AssertionError):
+            if section == "semantic_assets":
+                # Exercise the same selected-universe relation without mutating disk.
+                assert _flatten(changed[section], field) == _flatten(manifest[section], field)
+            elif section == "bound_constant_dispositions":
+                observed = {e["path"]: set() for e in changed[section] if e["path"] in CONSTANT_UNIVERSE}
+                for entry in changed[section]:
+                    if entry["path"] in observed:
+                        observed[entry["path"]].update(entry[field])
+                assert observed == {path: _top_level_assignments(path) for path in CONSTANT_UNIVERSE}
+            elif section == "atomic_import_dispositions":
+                observed = {}
+                for entry in changed[section]:
+                    observed.setdefault(entry["path"], set()).update(entry[field])
+                assert observed["actionq/db.py"] == _contract_import_names("actionq/db.py")
+            else:
+                assert _effective_symbol_dispositions(changed)[
+                    "actionq/application_completion.py", "CompletionService.settle"
+                ] == "historicalize/delete"
 
 
 def test_critical_claim_runner_publication_cas_and_rebuild_symbols_are_bound():

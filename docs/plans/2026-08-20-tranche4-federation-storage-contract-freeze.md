@@ -1,7 +1,10 @@
 # Tranche 4 federation/storage contract freeze
 
-**Status:** proposed owner oracle; coordinator-supplied acceptance checklist pending
-ratification
+**Status:** accepted and owner-ratified as R0. Durable decision:
+[PR #31 owner ratification](https://github.com/bayleafwalker/actionq/pull/31#issuecomment-5353774023).
+Independent architecture review accepted `f6750e47edeb9f3a60c23059cd638604ac0d40a4`;
+the final nonblocking editorial was `2d0e4abdcf673a8831a9e754b32264bde8a6f438`,
+and the ratified contract merged as `89ec87607d71af1156771db2e0c927d74017f5a0`.
 
 **Basis:** `main` at `9dccf4e` (PR #30 merged), `HANDOFF.md`,
 `2026-08-19-execution-plane-deletion-constraint.md`,
@@ -39,11 +42,11 @@ repositories for federation resources/changes/completion observations, and read-
 archive projections. It must not own application policy, Vuoro operations, CLI presentation,
 provider execution, claims, leases, worker proofs, execution groups, or managed dispatch.
 
-## Coordinator-supplied acceptance checklist
+## Ratified acceptance checklist
 
-No GitHub review record exists for this checklist. These ten gates were supplied by the
-coordinating session and are **pending owner ratification**; this document does not invent a
-review reference for them.
+The owner decision linked above durably records the independent review and R0 acceptance.
+It authorizes this documentation contract only; W1-W6 remain separately reviewed and W7
+remains unauthorized.
 
 1. Complete reachability for claim/lease, database, schema, application, CLI, Vuoro,
    migrations, and external consumers.
