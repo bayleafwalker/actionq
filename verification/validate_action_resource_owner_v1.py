@@ -8,7 +8,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = {
     "../../../docs/contracts/action-resource-owner-v1.md": None,
-    "legacy-quarantine.json": "actionq-legacy-quarantine-golden/v1",
     "not-found.json": "actionq-http-golden/v1",
     "protocol-responses.json": "actionq-owner-response-goldens/v1",
     "required-histories.json": "actionq-required-histories/v1",
@@ -26,7 +25,6 @@ RESULT_COMMANDS = {
     "action-resource-owner-redaction.json": "uv run --extra dev python verification/run_action_resource_history.py redaction",
     "action-resource-owner-response-loss.json": "uv run --extra dev python verification/run_action_resource_history.py response-loss",
     "action-resource-owner-bounded-wait.json": "uv run --extra dev python verification/run_action_resource_history.py bounded-wait",
-    "action-resource-owner-legacy-quarantine.json": "uv run --extra dev python verification/run_action_resource_history.py legacy-quarantine",
     "action-resource-owner-fencing.json": "uv run --extra dev python verification/run_action_resource_history.py fencing",
 }
 RESULT_ASSERTIONS = {
@@ -76,6 +74,7 @@ def validate(root: Path = ROOT) -> None:
         packet = json.loads((results_dir / name).read_text())
         require(packet.get("schema_version") == "verification-result/v1", f"result schema invalid: {name}")
         require(packet.get("context_id") == context["id"], f"result context linkage invalid: {name}")
+        require(packet.get("contract_ref") == context["contract_ref"], f"result contract linkage invalid: {name}")
         require(packet.get("implementation_sha") == candidate_ref, f"candidate tree digest mismatch: {name}")
         require(packet.get("execution", {}).get("command") == command, f"result command/node mismatch: {name}")
         require(packet.get("execution", {}).get("result") == "passed", f"result is not passed: {name}")

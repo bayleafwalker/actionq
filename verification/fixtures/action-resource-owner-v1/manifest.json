@@ -14,10 +14,9 @@
   "event_allowlist": ["revision", "kind", "state", "terminal", "outcome", "occurred_at"],
   "forbidden_classes": ["secret-like", "result-reference", "failure-detail", "claim", "provenance", "request-snapshot"],
   "registered_files": {
-    "../../../docs/contracts/action-resource-owner-v1.md": {"sha256": "022c0b0f418f9b098148f0429df2b211b444aadf073249c36cfc7a17968fd140", "schema_version": null},
-    "legacy-quarantine.json": {"sha256": "ef3ec521a2b606c86d993e5ab644ac535ccff0124ba37d1015f6bef4a403d60e", "schema_version": "actionq-legacy-quarantine-golden/v1"},
+    "../../../docs/contracts/action-resource-owner-v1.md": {"sha256": "7bf7601b07835ae8d9e6147032fe22f4c8afd5b5680408008b11eb64fd71b5bb", "schema_version": null},
     "not-found.json": {"sha256": "621fcc98eb1c4eac971f996473fce6a1abe7596882ff313310c367a15c59440d", "schema_version": "actionq-http-golden/v1"},
     "protocol-responses.json": {"sha256": "4e23f09c8296572671931004e451ce4649c8339865db3e7950b59d96b9e6eb6b", "schema_version": "actionq-owner-response-goldens/v1"},
-    "required-histories.json": {"sha256": "a704111e6a313ced46ae3e987926e70904e5776a51079a4623c127962c1ad31c", "schema_version": "actionq-required-histories/v1"}
+    "required-histories.json": {"sha256": "95a84158754ab3fc078caae130648e71146d04d0bcf2ac2ab78835282649fe1f", "schema_version": "actionq-required-histories/v1"}
   }
 }

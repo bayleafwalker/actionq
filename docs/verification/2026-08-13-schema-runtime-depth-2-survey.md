@@ -46,7 +46,9 @@ All eight protected action-resource owner histories were re-executed against
 the final candidate tree and their runtime receipts/results rebound to that
 tree. The closed-bundle validator passes. These histories cover pruning,
 snapshot races, non-disclosure, recursive redaction, response loss, bounded
-wait, legacy quarantine, and stale-session fencing.
+wait and stale-session fencing. The standalone HTTP legacy-quarantine proof was
+retired with that server in PR #30; this survey remains historical evidence for
+the earlier release and is not a current runtime claim.
 
 ## Release-candidate evidence
 

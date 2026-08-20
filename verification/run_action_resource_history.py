@@ -16,7 +16,6 @@ NODES = {
     "redaction": "test_action_resource_history_recursive_six_class_redaction_canaries",
     "response-loss": "test_action_resource_history_commit_response_loss_original_retry",
     "bounded-wait": "test_action_resource_history_wait_zero_thirty_early_spurious_disconnect_restart",
-    "legacy-quarantine": "test_action_resource_history_legacy_raw_64_case_preaccess_quarantine",
     "fencing": "test_action_resource_history_two_incarnation_stale_session_fencing",
 }
 def observed_postgres_version() -> str:
@@ -93,6 +92,10 @@ def main() -> int:
     target.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     result_path = ROOT / "verification/results" / f"action-resource-owner-{history}.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    context = json.loads(
+        (ROOT / "verification/contexts/action-resource-owner-v1.json").read_text(encoding="utf-8")
+    )
+    result["contract_ref"] = context["contract_ref"]
     result["implementation_sha"] = f"candidate-tree:{receipt['candidate_tree_digest']}"
     # Observed, not inherited -- see observed_postgres_version().
     result.setdefault("environment", {})["postgres_version"] = observed_postgres_version()

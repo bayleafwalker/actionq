@@ -1,7 +1,7 @@
 # Handoff — actionq
 
 **As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged)
-**Suite:** 487 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
+**Suite:** 479 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
 deletes the tests along with the code they covered)*
 **`actionq/`: 13,169 → 8,273 LOC.** The execution plane is gone.
 
@@ -14,9 +14,9 @@ cluster or devbox.
 1. **Open PR #30**, branch `delete/session-wrapper-execution-plane` — all of step 3. Deletes the
    session wrapper, the nine daemon modules, all seven harness adapters, `routing`,
    `scope_iterate`, `usage_limit`, `git_evidence`, `harness_profiles` and `server.py`.
-2. **Read `docs/plans/2026-08-20-execution-plane-deletion-order.md` first.** It lists four
-   modules that look deletable and are not — a pure import-graph reading removes all four and
-   breaks the estate.
+2. **Read `docs/plans/2026-08-20-execution-plane-deletion-order.md` first.** It records four
+   boundaries a pure import graph misses. The server boundary was later retired by operator
+   decision; the CLI, migration package data, and Vuoro adapter remain live.
 3. **Two cluster branches in `/projects/dev/appservice` must merge in order** — phase 1 fully
    reconciled *before* phase 2. Merging phase 2 alone deletes namespace `vscode`. §8.
 
@@ -174,7 +174,7 @@ perform.
 
   ```bash
   nix shell nixpkgs#postgresql -c bash -c 'for h in pruning snapshot-race non-disclosure \
-    redaction response-loss bounded-wait legacy-quarantine fencing; do \
+    redaction response-loss bounded-wait fencing; do \
     .venv/bin/python verification/run_action_resource_history.py "$h" || echo "FAILED $h"; done'
   ```
 - **The suite needs PostgreSQL binaries on PATH.** `nix shell nixpkgs#postgresql -c ...`.
@@ -269,7 +269,7 @@ Run these before trusting anything above. Each line's expected answer is on the 
 # repo
 git -C /projects/dev/actionq log --oneline -1        # ec07e0a on main, or PR #30's branch
 gh pr list                                           # #30 open, nothing else
-nix shell nixpkgs#postgresql -c .venv/bin/python -m pytest -q   # 698 pass / 19 skip on the branch
+nix shell nixpkgs#postgresql -c .venv/bin/python -m pytest -q   # see PR #30 CI for the current count
 
 # devbox — the constraint the whole goal is written around
 ssh devbox-agent 'systemctl is-active actionq-dispatch.service'          # active
@@ -350,3 +350,11 @@ merges, that pin can never be satisfied by `main` again — which is the intende
 fault. Do not "fix" it by bumping `ACTIONQ_REQUIRED_REVISION` to a post-deletion revision: that
 would install a package with no `actionq-daemon` entry point under a unit that expects one.
 Retire the unit (8.2) instead.
+
+### 8.4 `actionq-dispatcher` is now an unusable historical shim
+
+The sibling package still implements `dispatcher-once` by spawning
+`actionq-daemon --once`. This ActionQ revision deliberately no longer provides
+that executable. Do not reinstall or invoke the shim after PR #30. Retiring or
+re-contracting its repository is a separate cross-repository change; PR #30
+records the dependency but does not modify that checkout.

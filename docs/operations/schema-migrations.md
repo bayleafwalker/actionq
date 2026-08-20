@@ -2,8 +2,8 @@
 
 Actionq schema changes are deployment operations. `actionq.schema.migrate` and
 `actionctl migrate` are the only packaged migration entrypoints; normal CLI
-commands and `actionq-server` never invoke them. The service checks the schema
-before binding its socket and exits when the schema is absent, incomplete,
+commands and the Vuoro execution adapter never invoke them. Runtime requests check the schema
+before handling an operation and fail when the schema is absent, incomplete,
 modified, or newer than the adapter supports.
 
 The current execution contract reports:
@@ -32,11 +32,11 @@ Normal runtime commands never create or alter objects. The migrator can adopt
 the known pre-ledger v1 shape and then apply every packaged migration, but it
 refuses other schema drift.
 
-The schema-3 bridge is for the served maintenance adapter only. Keep
-`actionq-daemon` and every producer capable of starting worker sessions stopped
-until schema 8 is complete: schema 3 has no durable runner-auth digest or
-cancellation acknowledgement fence. The packaged daemon checks compatibility
-before its first claim and refuses schema 3 without mutating queue state.
+The schema-3 bridge is for the served maintenance adapter only. Keep every
+external producer capable of starting worker sessions stopped until schema 8
+is complete: schema 3 has no durable runner-auth digest or cancellation
+acknowledgement fence. Owner lifecycle operations check compatibility before
+their first mutation and refuse schema 3 without changing queue state.
 
 ## Schema 8 dispatch-root gate
 
@@ -49,9 +49,9 @@ history; those are not dispatch roots and must not be deleted to satisfy the
 gate. The migrator repeats the zero-root check transactionally and refuses the
 ledger write if any root remains.
 
-Schema 8 also permanently quarantines every `/v2/dispatch` path. The HTTP
-facade returns one generic, versioned response before reading a request body,
-authenticating, constructing the application, or connecting to the database.
+Schema 8 retains the historical dispatch-root guard. The standalone HTTP
+facade and its `/v2/dispatch` raw-target quarantine were retired with the
+execution plane; they are not behaviors of the current CLI or Vuoro adapter.
 
 `actionctl check-compatibility` performs only `SELECT` statements and exits
 with status `3` for an incompatible schema. Its JSON object is the Actionq

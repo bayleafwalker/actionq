@@ -47,7 +47,7 @@ def runner_identity(tmp_path_factory):
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     registry_path.write_text(json.dumps({"worker:test": base64.b64encode(public).decode(),
                                          "worker:one": base64.b64encode(public).decode(),
-                                         "actionq-daemon:test": base64.b64encode(public).decode(),
+                                         "native-runner:test": base64.b64encode(public).decode(),
                                          "runner:devbox": base64.b64encode(public).decode()}))
     previous = os.environ.get("ACTIONQ_RUNNER_IDENTITY_REGISTRY")
     previous_private = os.environ.get("ACTIONQ_RUNNER_PRIVATE_KEY")

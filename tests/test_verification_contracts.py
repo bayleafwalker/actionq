@@ -81,32 +81,11 @@ def test_2027_projection_and_event_allowlists_exclude_required_sensitive_classes
         assert forbidden_fragment not in serialized_allowlists
 
 
-def test_2027_legacy_quarantine_matrix_is_fixed_and_precedes_side_effects():
-    golden = _owner_fixture("legacy-quarantine.json")
-    expected_body = (
-        b'{"error":{"code":"legacy_route_not_found","message":"route not found"},'
-        b'"schema_version":"actionq-quarantine/v1"}\n'
-    )
-
-    assert golden["methods"] == ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "FROB"]
-    assert golden["classification_order"] == ["split-query-from-raw-target", "classify-raw-path-octets"]
-    assert golden["cross_product_count"] == len(golden["methods"]) * len(golden["path_cases"]) == 64
-    assert golden["response"]["body_utf8"].encode("utf-8") == expected_body
-    assert golden["response"]["headers"] == [["content-type", "application/json"], ["content-length", "113"], ["cache-control", "no-store"]]
-    cases = {case["raw_target"]: case for case in golden["path_cases"]}
-    assert cases["/v2/dispatch/%2e%2e"] == {"raw_target": "/v2/dispatch/%2e%2e", "raw_path": "/v2/dispatch/%2e%2e", "decoded_path": "/v2/dispatch/..", "normalized_path": "/v2", "quarantined": True}
-    assert cases["/v2//dispatch"]["normalized_path"] == "/v2/dispatch"
-    assert cases["/v2//dispatch"]["quarantined"] is False
-    assert golden["must_precede"] == [
-        "body-read", "authentication", "authorization", "application-construction", "database-access"
-    ]
-
-
 def test_2027_history_fixture_requires_all_falsifying_postgres_proofs():
     fixture = _owner_fixture("required-histories.json")
 
     assert fixture["backend"] == "disposable-postgresql"
-    assert len(fixture["histories"]) == 8
+    assert len(fixture["histories"]) == 7
     assert {
         "retention-none-some-all-terminal-restart",
         "snapshot-cursor-concurrent-terminal",
@@ -114,7 +93,6 @@ def test_2027_history_fixture_requires_all_falsifying_postgres_proofs():
         "recursive-redaction-canaries",
         "enqueue-commit-response-loss-original-reference-revision",
         "bounded-wait-zero-thirty-early-spurious-disconnect-restart",
-        "legacy-quarantine-pre-auth-app-body-db",
         "stale-claim-session-fencing",
     } == set(fixture["histories"])
     assert "recovery-floor-durable-non-null-in-every-pruning-state" in fixture["required_assertions"]

@@ -311,10 +311,6 @@ def test_action_resource_history_wait_zero_thirty_early_spurious_disconnect_rest
     assert _run_action_resource_owner_history("bounded-wait") == {"action-resource-owner.bounded-wait.v1"}
 
 
-def test_action_resource_history_legacy_raw_64_case_preaccess_quarantine():
-    assert _run_action_resource_owner_history("legacy-quarantine") == {"action-resource-owner.legacy-quarantine.v1"}
-
-
 def test_action_resource_history_two_incarnation_stale_session_fencing():
     assert _run_action_resource_owner_history("fencing") == {"action-resource-owner.fencing.v1"}
 
@@ -769,14 +765,14 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_pr
         ["add", "--type", "scope-iterate", "--project", "sprintctl", "--target", "42", "--created-by", "human:test"],
     )
     claimed = _invoke_json(runner, ["claim", "--proof-stdin"], input=json.dumps(
-        signed_runner_proof("actionq-daemon:test", "execution.action.claim", "queue:next")
+        signed_runner_proof("native-runner:test", "execution.action.claim", "queue:next")
     ))
     assert claimed["id"] == action["id"]
 
     paused = _invoke_json(
         runner,
         [
-            "emit", "--type", "session.paused", "--action", str(action["id"]), "--actor", "actionq-daemon:test",
+            "emit", "--type", "session.paused", "--action", str(action["id"]), "--actor", "native-runner:test",
             "--payload", json.dumps({
                 "session_id": "aqs:old", "reason": "usage-limit", "mechanism": "checkpoint-and-fail",
                 "handoff_ref": "/home/agent/.local/state/actionq/handoff/aqs_old.md", "resumable": True,
@@ -789,7 +785,7 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_pr
         runner,
         ["fail", str(action["id"]), "--reason", "usage-limit-paused: confirmed usage-limit signal matched", "--proof-stdin"],
         input=json.dumps({"claim_receipt": claimed["claim_receipt"], "runner_proof": signed_runner_proof(
-            "actionq-daemon:test", "execution.action.fail", f"action:{action['id']}"
+            "native-runner:test", "execution.action.fail", f"action:{action['id']}"
         )}),
     )
     assert failed["status"] == "failed"
@@ -802,7 +798,7 @@ def test_manual_usage_limit_pause_then_resume_drill(runner_env, signed_runner_pr
     resumed = _invoke_json(
         runner,
         [
-            "emit", "--type", "session.resumed", "--action", str(redispatch["id"]), "--actor", "actionq-daemon:test",
+            "emit", "--type", "session.resumed", "--action", str(redispatch["id"]), "--actor", "native-runner:test",
             "--payload", json.dumps({
                 "session_id": "aqs:new", "resumed_from_session_id": "aqs:old",
                 "handoff_ref": "/home/agent/.local/state/actionq/handoff/aqs_old.md", "mechanism": "redispatch",
@@ -1258,5 +1254,3 @@ def test_runtime_rejects_semantically_permissive_schema_shape(
     compatibility = json.loads(result.output)
     assert compatibility["state"] == "shape-mismatch"
     assert expected_issue in compatibility["detail"]
-
-
