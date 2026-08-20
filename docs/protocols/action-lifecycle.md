@@ -6,6 +6,16 @@ supersedes: null
 
 # Action lifecycle protocol
 
+> **Future-state supersession notice (2026-08-20):** this document specifies the retained
+> historical queue/claim protocol; it is not the tranche-4 execution authority. The dispatcher
+> is retired (`actionq-dispatcher` tombstone PR #2, commit `510822a`, release
+> `actionq-dispatcher-v0.2.0`). Native runtimes own execution, and the proposed replacement
+> authority is revision-CAS federation state described in
+> `docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md`. Preserve this protocol
+> as a writable compatibility protocol through W4, then for archive interpretation and
+> compatibility tests after W5 database privileges enforce read-only access; do not build new
+> dispatchers or execution integrations against it.
+
 ## Boundary
 
 An action is the smallest state object. The authoritative mutable projection is one row in `actions`; `events` is the append-only lifecycle history. Both are owned by actionq and written through `actionctl`/`actionq.db` transactions.

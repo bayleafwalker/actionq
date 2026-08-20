@@ -1,5 +1,19 @@
 # Handoff — actionq
 
+**Repository state as of 2026-08-20:** PR #30 is merged on `main` at `9dccf4e`; the repository
+daemon/server execution plane is deleted. `actionq-dispatcher` is retired at `510822a` with
+release `actionq-dispatcher-v0.2.0`. The queue/claim subsystem remains writable compatibility
+code until the database-enforced W5 fence. Draft PR #31 freezes tranche 4 in
+`docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md`.
+
+**Deployment state:** not re-observed or changed by PR #30 or #31. The remainder of this file
+is the preserved pre-merge deployment/rollout snapshot. Its daemon status, pins and commands
+are historical observations, not current instructions. Repository retirement does not prove
+that an independently deployed old unit is stopped; that requires its owning operational
+evidence and change.
+
+## Preserved pre-merge handoff
+
 **As of:** 2026-08-20 · **`main`:** `ec07e0a` (PR #29 merged)
 **Suite:** 480 passed, 19 skipped, 0 failed *(on the open branch; `main` is 718 — the branch
 deletes the tests along with the code they covered)*
@@ -30,9 +44,9 @@ read it only if you are tempted to cite the fence for anything. This file is the
 
 ---
 
-## 0. LIVE STATE — the daemon is running; the fence experiment is over
+## 0. HISTORICAL DEPLOYMENT SNAPSHOT — observed before repository retirement
 
-The devbox ActionQ daemon is **unfenced and claiming normally** — resumed 2026-08-19T20:18Z,
+At the time of this snapshot, the devbox ActionQ daemon was **unfenced and claiming normally** — resumed 2026-08-19T20:18Z,
 re-verified active 2026-08-20. The queue holds no claimable work (11 `failed`, 3 `completed`,
 3 `cancelled`), so a quiet daemon is expected and is not a fault.
 
@@ -351,10 +365,9 @@ fault. Do not "fix" it by bumping `ACTIONQ_REQUIRED_REVISION` to a post-deletion
 would install a package with no `actionq-daemon` entry point under a unit that expects one.
 Retire the unit (8.2) instead.
 
-### 8.4 `actionq-dispatcher` is now an unusable historical shim
+### 8.4 Historical dispatcher state; superseded by tombstone release
 
-The sibling package still implements `dispatcher-once` by spawning
-`actionq-daemon --once`. This ActionQ revision deliberately no longer provides
-that executable. Do not reinstall or invoke the shim after PR #30. Retiring or
-re-contracting its repository is a separate cross-repository change; PR #30
-records the dependency but does not modify that checkout.
+At snapshot time the sibling package implemented `dispatcher-once` by spawning
+`actionq-daemon --once`. That state is superseded: its tombstone PR #2 merged at
+`510822a` and release `actionq-dispatcher-v0.2.0` declares retirement. It is not
+a compatibility launcher and must not be reinstalled or invoked.

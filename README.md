@@ -1,17 +1,24 @@
 # actionq
 
-`actionq` is a Postgres-backed action queue for deterministic agent and operator dispatch. It gives you a small, explicit CLI contract for enqueuing work, claiming one item at a time, recording lifecycle transitions, and reading the queue event log without exposing direct SQL writes to consumers.
+> **Repository state (2026-08-20):** `main` no longer contains an ActionQ daemon/server
+> execution plane, and `actionq-dispatcher` is retired. Native runtimes own execution. This
+> repository still contains a **writable** queue/claim compatibility subsystem; it is not an
+> execution recommendation and does not become read-only until the W5 database privilege
+> fence in `docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md`. Deployment
+> state is separately owned and is not inferred from repository state.
+
+`actionq` is being reduced to federation state, evidence, acceptance and reconciliation for
+externally owned executions. Its Postgres queue/claim API remains temporarily writable for
+compatibility and historical-data migration.
 
 `actionctl` is the public contract. Consumers should not import the package directly or write to the database outside the queue interface.
 
 ## What It Does
 
-- Stores actions in a Postgres schema.
-- Supports a strict action lifecycle: `pending`, `claimed`, `completed`, `failed`, `rejected`, `cancelled`.
-- Records append-only queue events for auditability and coordination.
-- Enforces chain-depth limits for child actions.
-- Applies per-source enqueue rate limiting for automated producers.
-- Lets dispatchers emit coordinator events without broad database access.
+- Retains the writable v1–v12 action lifecycle during the compatibility window.
+- Records append-only lifecycle, resource, evidence, and completion observations.
+- Serves ActionQ-owned Vuoro operations while a clean federation catalog is frozen and built.
+- Does not launch, route, claim authority over, or control product-native executions.
 
 ## Install
 
@@ -177,10 +184,11 @@ and verified. The historical qualification records under `docs/evidence/`
 describe the deleted adapters; they are evidence about those versions, not
 instructions for starting a current worker.
 
-`actionq-dispatcher` remains a historical compatibility package whose launcher
-expects the retired `actionq-daemon` executable. Do not install or invoke that
-launcher with this ActionQ revision. Retiring its package and the nix-managed
-devbox unit is a separate cross-repository rollout action.
+`actionq-dispatcher` is retired by its tombstone release
+`actionq-dispatcher-v0.2.0` at `510822a`; it is not a compatibility launcher. Do
+not install or invoke it. Do not install or invoke that launcher with this ActionQ revision.
+Any still-deployed old unit is separate operational
+state and requires its owning rollout rather than a repository fiction.
 
 All state-changing commands return JSON records that are designed to be machine-consumable.
 
