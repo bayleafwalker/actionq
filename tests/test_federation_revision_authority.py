@@ -164,6 +164,33 @@ def test_federation_compatibility_rejects_column_constraint_and_index_drift(post
         assert "foreign-key:federation_settlements" in result.detail
 
 
+def test_federation_compatibility_too_new_and_checksum_mismatch_states(postgres_urls) -> None:
+    # Ledger-verdict classification now delegates to
+    # vuoro_schema_runtime.compatibility_report; pin the states it must
+    # still distinguish for a domain with exactly one migration.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(
+            f"INSERT INTO {db.qname(selected, federation_schema.MIGRATION_TABLE)} (domain, version, name, checksum) "
+            "VALUES ('federation', 2, 'fake.sql', %s)",
+            ("0" * 64,),
+        )
+        result = federation_schema.check_compatibility(conn, selected)
+    assert result.state == "too-new"
+    assert result.observed_schema_version == 2
+
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(
+            f"UPDATE {db.qname(selected, federation_schema.MIGRATION_TABLE)} SET checksum=%s WHERE domain='federation' AND version=1",
+            ("1" * 64,),
+        )
+        result = federation_schema.check_compatibility(conn, selected)
+    assert result.state == "checksum-mismatch"
+
+
 def test_foreign_key_check_is_immune_to_schema_name_and_search_path_rendering(postgres_urls) -> None:
     # The FK check compares catalog OIDs and resolved column names, not
     # PostgreSQL's rendered pg_get_constraintdef text -- that text quotes
@@ -517,6 +544,29 @@ def test_decide_acceptance_type_checks_evidence_ref_on_the_rejected_path_too(pos
     assert none_evidence.status == "accepted" and none_evidence.after_revision == 2
 
 
+def test_decide_acceptance_rejects_an_unverified_evidence_ref_on_the_rejected_path_too(postgres_urls) -> None:
+    # The accepted branch verifies a cited evidence_ref actually exists in
+    # federation_evidence; the rejected branch skipped that check entirely,
+    # letting a rejection durably cite evidence that was never submitted.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("owner", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+
+    fabricated = authority.decide_acceptance(
+        principal=_principal("reviewer", "federation.acceptance.decide"), idempotency_key="fabricated-evidence",
+        resource_ref=resource, outcome="rejected", policy_ref="policy:v1",
+        evidence_ref="artifact:sha256:" + "0" * 64, expected_revision=1,
+    )
+    assert fabricated.status == "rejected" and fabricated.code == "evidence-not-found"
+    with db.connect(postgres_urls["admin"]) as conn:
+        assert conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_acceptance_decisions')}"
+        ).fetchone()["n"] == 0
+
+
 def test_missing_assurance_type_is_distinguished_from_evidence_or_reference_mismatch(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
@@ -549,6 +599,45 @@ def test_missing_assurance_type_is_distinguished_from_evidence_or_reference_mism
     assert true_mismatch.code == "evidence-digest-mismatch"
     assert missing_execution_ref.code == "invalid-execution-reference"
     assert missing_execution_assurance.code == "invalid-assurance-type"
+
+
+def test_record_settlement_rejects_a_second_settlement_of_the_same_resource(postgres_urls) -> None:
+    # Every other side-effect-recording command (add_relation,
+    # record_execution_ref, record_evidence) rejects a repeat with a
+    # dedicated '*-exists' code; record_settlement had no such guard, and
+    # its PK (resource_ref, source_revision) does not block a second insert
+    # since source_revision increments on every call.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("owner", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+    evidence_bytes = b"verified evidence"
+    evidence_ref = "artifact:sha256:" + hashlib.sha256(evidence_bytes).hexdigest()
+    authority.record_evidence(
+        principal=_principal("ingester", "federation.evidence.ingest"), idempotency_key="evidence",
+        resource_ref=resource, evidence_ref=evidence_ref, evidence_bytes=evidence_bytes,
+        assurance_type="byte-verification", expected_revision=1,
+    )
+    authority.decide_acceptance(
+        principal=_principal("reviewer", "federation.acceptance.decide"), idempotency_key="accept",
+        resource_ref=resource, outcome="accepted", policy_ref="policy:v1",
+        evidence_ref=evidence_ref, expected_revision=2,
+    )
+    reconciler = _principal("reconciler", "federation.settlement.record")
+    first = authority.record_settlement(
+        principal=reconciler, idempotency_key="settle-1", resource_ref=resource, fact_ref="fact:durable", expected_revision=3,
+    )
+    second = authority.record_settlement(
+        principal=reconciler, idempotency_key="settle-2", resource_ref=resource, fact_ref="fact:durable-again", expected_revision=4,
+    )
+    assert first.status == "accepted"
+    assert second.status == "rejected" and second.code == "settlement-exists"
+    with db.connect(postgres_urls["admin"]) as conn:
+        assert conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_settlements')}"
+        ).fetchone()["n"] == 1
 
 
 def test_acl_cas_state_machine_and_rejected_decisions_do_not_change_projection(postgres_urls) -> None:
@@ -668,6 +757,33 @@ def test_relations_are_source_owned_directed_and_do_not_mutate_target(postgres_u
     assert cycle.code == "relation-cycle"
     assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=source)["revision"] == 2
     assert authority.snapshot(principal=_principal("reader", "federation.read"), resource_ref=target)["revision"] == 1
+
+
+def test_add_relation_rejects_a_superseded_target(postgres_urls) -> None:
+    # The source endpoint is guarded against superseded state via
+    # _locked_existing; the target endpoint was only checked for existence,
+    # letting a live resource gain a persisted edge into one that is
+    # supposed to be frozen.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    owner_a = _principal("a", "federation.create", "federation.relate", "federation.supersede")
+    owner_b = _principal("b", "federation.create", "federation.relate", "federation.supersede")
+    source = authority.create(principal=owner_a, idempotency_key="a", expected_revision=0).resource_ref
+    target = authority.create(principal=owner_b, idempotency_key="b", expected_revision=0).resource_ref
+    assert source and target
+    superseded = authority.supersede(principal=owner_b, idempotency_key="supersede-target", resource_ref=target, expected_revision=1)
+    assert superseded.status == "accepted"
+
+    decision = authority.add_relation(
+        principal=owner_a, idempotency_key="edge-to-superseded", source_ref=source,
+        relation_type="depends-on", target_ref=target, expected_revision=1,
+    )
+    assert decision.code == "target-superseded"
+    with db.connect(postgres_urls["admin"]) as conn:
+        assert conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_relations')}"
+        ).fetchone()["n"] == 0
 
 
 def test_opposite_relation_attempts_serialize_cycle_check(postgres_urls) -> None:

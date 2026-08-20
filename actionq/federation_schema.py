@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from importlib import resources
 from typing import Any
 
-from vuoro_schema_runtime import MigrationAsset, sha256_text
+from vuoro_schema_runtime import MigrationAsset, compatibility_report, sha256_text, validate_contiguous_migrations
 
 from . import db
 
@@ -271,9 +271,13 @@ def load_migrations() -> tuple[MigrationAsset, ...]:
             continue
         raw = path.read_text(encoding="utf-8")
         result.append(MigrationAsset(int(match.group("version")), path.name, raw, sha256_text(raw)))
-    if [asset.version for asset in result] != list(range(1, MAX_SCHEMA_VERSION + 1)):
+    try:
+        contiguous = validate_contiguous_migrations(result)
+    except ValueError as exc:
+        raise FederationSchemaError(str(exc)) from exc
+    if [asset.version for asset in contiguous] != list(range(1, MAX_SCHEMA_VERSION + 1)):
         raise FederationSchemaError("federation migration assets are not exactly contiguous v1")
-    return tuple(result)
+    return contiguous
 
 
 def _statements(asset: MigrationAsset, schema: str) -> tuple[str, ...]:
@@ -478,6 +482,24 @@ def _index_issues(conn: Any, schema: str) -> list[str]:
            WHERE namespace_record.nspname=%s AND table_class.relname = ANY(%s) AND NOT index_record.indisprimary""",
         (schema, list(tables)),
     ).fetchall()
+    index_oids = [_row(row, "index_oid", 4) for row in rows]
+    # pg_get_indexdef per key position renders both plain columns and
+    # expression keys as text, unlike joining pg_attribute directly (which
+    # silently drops expression keys, attnum=0). Fetched for every index's
+    # every key position in one LATERAL query instead of one round trip per
+    # position, which is what made this an N+1 query before.
+    key_rows = conn.execute(
+        """SELECT index_record.indexrelid AS index_oid, position_record.position AS position,
+                  pg_get_indexdef(index_record.indexrelid, position_record.position, true) AS key
+           FROM pg_index index_record
+           CROSS JOIN LATERAL generate_series(1, index_record.indnatts) AS position_record(position)
+           WHERE index_record.indexrelid = ANY(%s)
+           ORDER BY index_record.indexrelid, position_record.position""",
+        (index_oids,),
+    ).fetchall() if index_oids else []
+    keys_by_oid: dict[Any, list[str]] = {}
+    for key_row in key_rows:
+        keys_by_oid.setdefault(_row(key_row, "index_oid"), []).append(str(_row(key_row, "key", 2)))
     observed: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {}
     for row in rows:
         name = str(_row(row, "index_name"))
@@ -485,16 +507,7 @@ def _index_issues(conn: Any, schema: str) -> list[str]:
         is_unique = bool(_row(row, "is_unique", 2))
         predicate = _row(row, "predicate", 3)
         index_oid = _row(row, "index_oid", 4)
-        key_count = int(_row(row, "key_count", 6))
-        # pg_get_indexdef per key position renders both plain columns and
-        # expression keys as text, unlike joining pg_attribute directly
-        # (which silently drops expression keys, attnum=0).
-        keys = tuple(
-            str(_row(conn.execute(
-                "SELECT pg_get_indexdef(%s, %s, true) AS key", (index_oid, position),
-            ).fetchone(), "key"))
-            for position in range(1, key_count + 1)
-        )
+        keys = tuple(keys_by_oid.get(index_oid, []))
         observed[name] = (table, is_unique, keys, str(predicate) if predicate is not None else None)
     for name, expected in _REQUIRED_INDEXES.items():
         actual = observed.get(name)
@@ -540,6 +553,12 @@ def _shape_issues(conn: Any, schema: str) -> tuple[str, ...]:
 
 
 def check_compatibility(conn: Any, schema: str | None = None) -> Compatibility:
+    # Ledger-verdict classification (uninitialized/too-new/incomplete/
+    # checksum-mismatch) delegates to vuoro_schema_runtime.compatibility_report,
+    # the same pure verdict algorithm actionq.schema uses for its own ledger --
+    # dummy matching current_role/configured_role sidestep its role-mismatch
+    # check, which has no federation-domain equivalent (there is no runtime
+    # principal concept here, only schema shape).
     selected = db.schema_name(schema or configured_schema())
     if not _ledger_exists(conn, selected):
         return Compatibility(DOMAIN, API_VERSION, COMPATIBILITY_LABEL, None, "uninitialized", False, "federation migration ledger is absent")
@@ -547,23 +566,28 @@ def check_compatibility(conn: Any, schema: str | None = None) -> Compatibility:
         f"SELECT version, name, checksum FROM {db.qname(selected, MIGRATION_TABLE)} WHERE domain=%s ORDER BY version",
         (DOMAIN,),
     ).fetchall()
-    applied = [(int(_row(item, "version")), str(_row(item, "name", 1)), str(_row(item, "checksum", 2))) for item in rows]
-    expected = [(asset.version, asset.name, asset.sha256) for asset in load_migrations()]
-    observed = max((item[0] for item in applied), default=0)
-    if applied == expected:
+    applied = {int(_row(item, "version")): (str(_row(item, "name", 1)), str(_row(item, "checksum", 2))) for item in rows}
+    ledger_report = compatibility_report(
+        load_migrations(), applied,
+        schema="federation_ledger_verdict", domain_api_version=API_VERSION,
+        minimum_schema_version=MIN_SCHEMA_VERSION, maximum_schema_version=MAX_SCHEMA_VERSION,
+        current_role="federation_ledger_verifier", configured_role="federation_ledger_verifier",
+    )
+    observed = ledger_report.installed_schema_version or 0
+    if not applied:
+        state, detail = "uninitialized", "federation migration ledger has no federation rows"
+    elif "schema_too_new" in ledger_report.reasons:
+        state, detail = "too-new", f"federation schema version {observed} exceeds {MAX_SCHEMA_VERSION}"
+    elif "migration_ledger_not_contiguous" in ledger_report.reasons:
+        state, detail = "incomplete", "federation migration ledger is not contiguous"
+    elif "migration_ledger_drift" in ledger_report.reasons:
+        state, detail = "checksum-mismatch", "federation migration name or checksum differs from packaged v1"
+    else:
         issues = _shape_issues(conn, selected)
         if issues:
             state, detail = "shape-mismatch", "federation schema shape is invalid: " + ",".join(issues)
         else:
             state, detail = "compatible", "schema is compatible with federation-schema/v1"
-    elif observed > MAX_SCHEMA_VERSION:
-        state, detail = "too-new", f"federation schema version {observed} exceeds {MAX_SCHEMA_VERSION}"
-    elif applied and [item[0] for item in applied] != list(range(1, observed + 1)):
-        state, detail = "incomplete", "federation migration ledger is not contiguous"
-    elif applied:
-        state, detail = "checksum-mismatch", "federation migration name or checksum differs from packaged v1"
-    else:
-        state, detail = "uninitialized", "federation migration ledger has no federation rows"
     return Compatibility(DOMAIN, API_VERSION, COMPATIBILITY_LABEL, observed or None, state, state == "compatible", detail)
 
 

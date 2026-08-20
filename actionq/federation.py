@@ -14,7 +14,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from actionq_contracts import canonical_bytes
+from actionq_contracts import canonical_bytes, sha256_digest as contract_digest
 
 from . import db
 from . import federation_schema
@@ -74,7 +74,11 @@ def _new_resource_ref() -> str:
     return "aqf1_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
 
 
-def _digest(raw: bytes) -> str:
+def _raw_digest(raw: bytes) -> str:
+    # Plain sha256 of already-final bytes, with no canonicalization step --
+    # unlike actionq_contracts.sha256_digest (imported below as
+    # contract_digest), which JSON-canonicalizes its input before hashing
+    # and so cannot be used for raw evidence bytes or a repr() descriptor.
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
@@ -102,7 +106,7 @@ class FederationAuthority:
     def _response(self, *, status: str, code: str, message: str, operation: str,
                   resource_ref: str | None, before_revision: int | None,
                   after_revision: int | None) -> tuple[bytes, str]:
-        raw = canonical_bytes({
+        payload = {
             "schema_version": "federation-command-decision/v1",
             "status": status,
             "code": code,
@@ -111,8 +115,8 @@ class FederationAuthority:
             "resource_ref": resource_ref,
             "before_revision": before_revision,
             "after_revision": after_revision,
-        })
-        return raw, _digest(raw)
+        }
+        return canonical_bytes(payload), contract_digest(payload)
 
     def _record_decision(self, conn: Any, *, principal: FederationPrincipal, operation: str,
                          idempotency_key: str, request_digest: str, status: str,
@@ -182,12 +186,11 @@ class FederationAuthority:
             raise _Rejected("stale-revision", "resource revision changed concurrently", resource_ref=row["resource_ref"], before_revision=before)
         if side_effect is not None:
             side_effect(after)
-        raw = canonical_bytes(payload)
         conn.execute(
             f"INSERT INTO {self._q('federation_resource_changes')} "
             "(resource_ref, revision, operation, state, actor_principal_id, payload_bytes, payload_digest) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (row["resource_ref"], after, operation, state, principal.principal_id, raw, _digest(raw)),
+            (row["resource_ref"], after, operation, state, principal.principal_id, canonical_bytes(payload), contract_digest(payload)),
         )
         return before, after
 
@@ -203,7 +206,7 @@ class FederationAuthority:
             # exception, after a transaction is already open.
             raise db.ActionQError("federation commands require a non-empty string idempotency key")
         try:
-            request_bytes = canonical_bytes(request)
+            request_digest = contract_digest(request)
         except (TypeError, ValueError) as malformed:
             # This cannot become a durable "malformed-command" rejected
             # decision the way apply()'s failures do: request_digest, the
@@ -214,7 +217,6 @@ class FederationAuthority:
             # argument -- every other command-argument failure in this
             # module surfaces as db.ActionQError or a rejected decision.
             raise db.ActionQError(f"command request could not be serialized: {malformed}") from malformed
-        request_digest = _digest(request_bytes)
         with self.connection() as conn, conn.transaction():
             federation_schema.require_compatible(conn, self.schema)
             identity = (principal.environment, principal.principal_id, operation, idempotency_key)
@@ -295,12 +297,12 @@ class FederationAuthority:
                 "(resource_ref, owner_principal_id, state, revision, recovery_floor) VALUES (%s,%s,'registered',1,0)",
                 (selected, principal.principal_id),
             )
-            payload = canonical_bytes({"owner_principal_id": principal.principal_id})
+            change_payload = {"owner_principal_id": principal.principal_id}
             conn.execute(
                 f"INSERT INTO {self._q('federation_resource_changes')} "
                 "(resource_ref, revision, operation, state, actor_principal_id, payload_bytes, payload_digest) "
                 "VALUES (%s,1,'create','registered',%s,%s,%s)",
-                (selected, principal.principal_id, payload, _digest(payload)),
+                (selected, principal.principal_id, canonical_bytes(change_payload), contract_digest(change_payload)),
             )
             return selected, 0, 1
         return self._execute(principal=principal, operation="create", idempotency_key=idempotency_key, request=request, apply=apply)
@@ -338,8 +340,11 @@ class FederationAuthority:
             source = self._locked_existing(conn, principal=principal, resource_ref=source_ref, expected_revision=expected_revision, owner_required=True)
             if source_ref == target_ref:
                 raise _Rejected("self-relation", "self relations are forbidden", resource_ref=source_ref, before_revision=int(source["revision"]))
-            if self._resource(conn, target_ref, lock=False) is None:
+            target = self._resource(conn, target_ref, lock=False)
+            if target is None:
                 raise _Rejected("target-not-found", "relation target does not exist", resource_ref=source_ref, before_revision=int(source["revision"]))
+            if target["state"] == "superseded":
+                raise _Rejected("target-superseded", "relation target is superseded and immutable", resource_ref=source_ref, before_revision=int(source["revision"]))
             exists = conn.execute(
                 f"SELECT 1 FROM {self._q('federation_relations')} WHERE source_ref=%s AND relation_type=%s AND target_ref=%s",
                 (source_ref, relation_type, target_ref),
@@ -395,7 +400,7 @@ class FederationAuthority:
         # the command even reaches the idempotency machinery.
         valid_evidence_bytes = isinstance(evidence_bytes, (bytes, bytearray))
         if valid_evidence_bytes:
-            actual_digest = _digest(bytes(evidence_bytes))
+            actual_digest = _raw_digest(bytes(evidence_bytes))
         else:
             try:
                 descriptor = repr(evidence_bytes)
@@ -405,7 +410,7 @@ class FederationAuthority:
                 # below (and idempotent replay of the resulting rejection)
                 # doesn't depend on succeeding at describing the bad input.
                 descriptor = f"<unrepresentable {type(evidence_bytes).__name__}>"
-            actual_digest = _digest(descriptor.encode("utf-8", errors="replace"))
+            actual_digest = _raw_digest(descriptor.encode("utf-8", errors="replace"))
         request = {
             "resource_ref": resource_ref, "evidence_ref": evidence_ref, "evidence_digest": actual_digest,
             # A raw byte string is an arbitrary, externally-fixed content-
@@ -467,9 +472,14 @@ class FederationAuthority:
             allowed = state == "evidence-recorded" if outcome == "accepted" else state in {"registered", "evidence-recorded"}
             if not allowed:
                 raise _Rejected("invalid-state-transition", "acceptance decision is invalid for current state", resource_ref=resource_ref, before_revision=int(row["revision"]))
-            if outcome == "accepted":
-                if not isinstance(evidence_ref, str) or not evidence_ref:
-                    raise _Rejected("evidence-required", "acceptance requires cited verified evidence", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            if outcome == "accepted" and (not isinstance(evidence_ref, str) or not evidence_ref):
+                raise _Rejected("evidence-required", "acceptance requires cited verified evidence", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            if evidence_ref is not None:
+                # Checked for both outcomes, not just accepted: a rejection
+                # citing an evidence_ref that was never actually submitted via
+                # record_evidence would otherwise be durably recorded with a
+                # fabricated citation, asymmetric with the accepted path's
+                # verification below.
                 found = conn.execute(f"SELECT 1 FROM {self._q('federation_evidence')} WHERE resource_ref=%s AND evidence_ref=%s", (resource_ref, evidence_ref)).fetchone()
                 if found is None:
                     raise _Rejected("evidence-not-found", "cited evidence was not verified for this resource", resource_ref=resource_ref, before_revision=int(row["revision"]))
@@ -487,6 +497,9 @@ class FederationAuthority:
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision)
             if str(row["state"]) not in {"accepted", "rejected"} or not isinstance(fact_ref, str) or not fact_ref:
                 raise _Rejected("invalid-state-transition", "settlement requires accepted/rejected state and a cited fact", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            exists = conn.execute(f"SELECT 1 FROM {self._q('federation_settlements')} WHERE resource_ref=%s", (resource_ref,)).fetchone()
+            if exists:
+                raise _Rejected("settlement-exists", "resource has already been settled", resource_ref=resource_ref, before_revision=int(row["revision"]))
             def insert(after: int) -> None:
                 conn.execute(f"INSERT INTO {self._q('federation_settlements')} (resource_ref, source_revision, fact_ref, reconciled_by) VALUES (%s,%s,%s,%s)", (resource_ref, after, fact_ref, principal.principal_id))
             before, after = self._advance(conn, row=row, principal=principal, operation="record-settlement", state=str(row["state"]), payload=request, side_effect=insert)
