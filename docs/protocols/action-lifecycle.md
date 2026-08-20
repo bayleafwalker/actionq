@@ -12,8 +12,9 @@ supersedes: null
 > `actionq-dispatcher-v0.2.0`). Native runtimes own execution, and the proposed replacement
 > authority is revision-CAS federation state described in
 > `docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md`. Preserve this protocol
-> for archive interpretation and compatibility tests until the owner approves its retention
-> cutoff; do not build new dispatchers or execution integrations against it.
+> as a writable compatibility protocol through W4, then for archive interpretation and
+> compatibility tests after W5 database privileges enforce read-only access; do not build new
+> dispatchers or execution integrations against it.
 
 ## Boundary
 
