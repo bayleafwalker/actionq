@@ -109,6 +109,70 @@ def _effective_symbol_dispositions(manifest: dict) -> dict[tuple[str, str], str]
     return effective
 
 
+def _effective_path_dispositions(manifest: dict) -> dict[str, set[str]]:
+    effective: dict[str, set[str]] = {}
+    def add(path: str, disposition: str) -> None:
+        effective.setdefault(path, set()).add(disposition)
+    for entry in manifest["python_surfaces"]:
+        add(entry["path"], entry["disposition"])
+    for entry in manifest["atomic_symbol_dispositions"]:
+        add(entry["path"], entry["disposition"])
+    for entry in manifest["bound_constant_dispositions"]:
+        add(entry["path"], entry["disposition"])
+    for entry in manifest["atomic_import_dispositions"]:
+        add(entry["path"], entry["disposition"])
+    for entry in manifest["migration_groups"]:
+        for migration in entry["migrations"]:
+            add(migration["path"], entry["disposition"])
+    for entry in manifest["semantic_assets"]:
+        for path in entry["paths"]:
+            add(path, entry["disposition"])
+    for entry in manifest["critical_file_dispositions"]:
+        for path in entry["paths"]:
+            add(path, entry["disposition"])
+    for entry in manifest["cli_command_groups"]:
+        add("actionq/cli.py", entry["disposition"])
+    for entry in manifest["catalog_operation_groups"]:
+        add("actionq/vuoro.py", entry["disposition"])
+    for entry in manifest["console_script_groups"]:
+        for script in entry["scripts"]:
+            add(script.split("|", 1)[0], entry["disposition"])
+    for section, field in (
+        ("workspace_package_groups", "paths"),
+        ("repository_consumer_groups", "paths"),
+        ("retired_plane_anchor_groups", "paths"),
+    ):
+        for entry in manifest[section]:
+            for path in entry[field]:
+                add(path, entry["disposition"])
+    return effective
+
+
+def _validate_external_path_proofs(manifest: dict) -> None:
+    consumers = {entry["id"]: entry for entry in manifest["external_consumers"]}
+    proofs = manifest["external_path_proofs"]
+    keys = [(item["consumer_id"], item["path"]) for item in proofs]
+    expected = [
+        (consumer["id"], path)
+        for consumer in manifest["external_consumers"]
+        for path in consumer["paths"]
+    ]
+    assert len(proofs) == 51
+    assert len(keys) == len(set(keys))
+    assert set(keys) == set(expected)
+    assert all(re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) for item in proofs)
+    for item in proofs:
+        consumer = consumers[item["consumer_id"]]
+        if item["consumer_id"] == "q-spec-stale-normative-contracts":
+            assert item["ref"] == "unversioned-file-digest"
+        else:
+            assert item["ref"] in set(consumer["commit_refs"].values())
+    agentops = consumers["agentops-generated-guidance"]
+    assert agentops["commit_refs"] == {
+        "canonical_program_record": "6c01869b8a0c5ad3dfaf3313385f9a162900dab8"
+    }
+
+
 def _local_import_edges() -> set[str]:
     edges: set[str] = set()
     for root, prefix in PYTHON_ROOTS:
@@ -345,16 +409,32 @@ def _check_mixed_symbols_constants_and_semantic_assets():
     source = (ROOT / "tests/test_cancellation_model.py").read_text(encoding="utf-8")
     _validate_r1_invariants(manifest, source)
     effective = _effective_symbol_dispositions(manifest)
+    effective_paths = _effective_path_dispositions(manifest)
+    critical = {entry["id"]: entry for entry in manifest["critical_reachability"]}
+    assert set(critical["completion-replay-and-rebuild"]["paths"]) == {
+        "actionq/completion_log.py", "actionq/completion_outbox.py"
+    }
+    assert {
+        "actionq/action_resource.py", "verification/run_action_resource_history.py",
+        "verification/validate_action_resource_owner_v1.py",
+        "verification/contexts/action-resource-owner-v1.json",
+        "verification/fixtures/action-resource-owner-v1/manifest.json",
+    } <= set(critical["coupled-resource-to-federation-successor"]["paths"])
     for entry in manifest["critical_reachability"]:
         for reference in entry["symbols"]:
             path, symbol = reference.split("#", 1)
             assert effective[path, symbol] == entry["disposition"], reference
+        for path in entry["paths"]:
+            assert path in effective_paths, path
+            assert entry["disposition"] in effective_paths[path], (entry["id"], path)
 
     selected = set()
     for pattern in (
         "tests/test_cancellation_model.py", "tests/test_candidate_action_cancellation_model.py",
         "tests/test_verification_contracts.py", "verification/contexts/action-claim-concurrency.json",
-        "verification/contexts/dispatch-enqueue-v2-contract.json", "verification/contexts/schema-migration-compatibility.json",
+            "verification/contexts/dispatch-enqueue-v2-contract.json", "verification/contexts/schema-migration-compatibility.json",
+            "verification/contexts/action-resource-owner-v1.json", "verification/run_action_resource_history.py",
+            "verification/validate_action_resource_owner_v1.py",
         "verification/fixtures/action-resource-owner-v1/*", "verification/history-receipts/*.json",
         "verification/results/action-resource-owner-*.json", "verification/*probe*.py",
         "verification/capture_claude_acp.py", "docs/operations/codex-luna-catalog-workaround.md",
@@ -396,6 +476,27 @@ def _check_mixed_symbols_constants_and_semantic_assets():
     assert vuoro["pins"]["schema_runtime_source_revision"] == "a002e5031b4235779462314c125903300636c5f1"
     assert len(vuoro["released_operation_sha256"]) == 22
     assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in vuoro["released_operation_sha256"].values())
+    _validate_external_path_proofs(manifest)
+    proof_repos = {
+        "vuoro-composition": Path("/projects/dev/vuoro"),
+        "actionq-dispatcher-tombstone": Path("/tmp/actionq-dispatch-proof"),
+        "sprintctl-actionq-lifecycle": Path("/projects/dev/sprintctl"),
+        "agentops-generated-guidance": Path("/projects/dev/agentops"),
+        "gitops-nixos-daemon-retirement": Path("/projects/dev/gitops-nixos"),
+        "appservice-ordered-retirement": Path("/projects/dev/appservice"),
+    }
+    for proof in manifest["external_path_proofs"]:
+        if proof["consumer_id"] == "q-spec-stale-normative-contracts":
+            path = Path("/projects/dev/q-spec") / proof["path"]
+            if path.is_file():
+                assert hashlib.sha256(path.read_bytes()).hexdigest() == proof["sha256"]
+            continue
+        repo = proof_repos[proof["consumer_id"]]
+        if repo.is_dir():
+            content = subprocess.check_output(
+                ["git", "show", f'{proof["ref"]}:{proof["path"]}'], cwd=repo
+            )
+            assert hashlib.sha256(content).hexdigest() == proof["sha256"]
     assert "historical compatibility launcher" not in (ROOT / "AGENTS.md").read_text()
 
 
@@ -461,6 +562,37 @@ def _check_r1_reviewer_corruption_probes():
                 assert _effective_symbol_dispositions(changed)[
                     "actionq/application_completion.py", "CompletionService.settle"
                 ] == "historicalize/delete"
+
+    changed = copy.deepcopy(manifest)
+    changed["external_path_proofs"].pop()
+    with pytest.raises(AssertionError):
+        _validate_external_path_proofs(changed)
+    changed = copy.deepcopy(manifest)
+    changed["external_path_proofs"][0]["sha256"] = "0" * 64
+    with pytest.raises(AssertionError):
+        assert changed["external_path_proofs"][0]["sha256"] == (
+            "6d2f9739c1ffa1a5fa3a9cfdf8dd22b81ed71d5a93eff211fa1db134ae8902f1"
+        )
+
+    changed = copy.deepcopy(manifest)
+    completion = next(
+        entry for entry in changed["critical_reachability"]
+        if entry["id"] == "completion-replay-and-rebuild"
+    )
+    completion["paths"].append("actionq/action_resource.py")
+    with pytest.raises(AssertionError):
+        paths = _effective_path_dispositions(changed)
+        assert completion["disposition"] in paths["actionq/action_resource.py"]
+    changed = copy.deepcopy(manifest)
+    completion = next(
+        entry for entry in changed["critical_reachability"]
+        if entry["id"] == "completion-replay-and-rebuild"
+    )
+    completion["paths"].remove("actionq/completion_outbox.py")
+    with pytest.raises(AssertionError):
+        assert set(completion["paths"]) == {
+            "actionq/completion_log.py", "actionq/completion_outbox.py"
+        }
 
 
 def test_critical_claim_runner_publication_cas_and_rebuild_symbols_are_bound():

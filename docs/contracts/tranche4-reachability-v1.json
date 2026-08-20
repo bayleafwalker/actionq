@@ -520,7 +520,7 @@
     },
     {
       "id": "coupled-resource-to-federation-successor",
-      "paths": ["actionq/action_resource.py", "actionq/application_core.py", "actionq/migrations/009_action_resource_owner.sql"],
+      "paths": ["actionq/action_resource.py", "actionq/application_core.py", "actionq/migrations/009_action_resource_owner.sql", "verification/run_action_resource_history.py", "verification/validate_action_resource_owner_v1.py", "verification/contexts/action-resource-owner-v1.json", "verification/fixtures/action-resource-owner-v1/manifest.json"],
       "symbols": ["actionq/action_resource.py#ActionResourceOwner.enqueue", "actionq/action_resource.py#ActionResourceOwner.snapshot", "actionq/action_resource.py#ActionResourceOwner.changes", "actionq/action_resource.py#ActionResourceOwner.project_state", "actionq/action_resource.py#ActionResourceOwner.prune", "actionq/application_core.py#AuthenticatedActionResourcePrincipal.derive", "actionq/application_core.py#ActionQCore.enqueue_action_resource", "actionq/application_core.py#ActionQCore.project_action_resource"],
       "operations": ["revision/change cursor", "recovery floor", "principal-scoped idempotency", "current action-row/claim projection coupling"],
       "disposition": "retain-as-frozen-archive",
@@ -529,7 +529,7 @@
     },
     {
       "id": "runner-proof-and-cancellation-fences",
-      "paths": ["actionq/runner_auth.py", "actionq/db.py", "actionq/application_completion.py", "actionq/migrations/004_cancellation_fencing.sql", "actionq/migrations/010_claim_attempt_binding.sql"],
+      "paths": ["actionq/runner_auth.py", "actionq/db.py", "actionq/application_completion.py"],
       "symbols": ["actionq/runner_auth.py#verify_runner_proof", "actionq/db.py#consume_runner_request", "actionq/db.py#receipt_digest", "actionq/db.py#cancel", "actionq/db.py#acknowledge_cancellation", "actionq/db.py#reap_cancellations", "actionq/application_completion.py#CompletionService.acknowledge_cancellation"],
       "operations": ["signed runner proof", "claim-attempt binding", "cancel request/acknowledgement/reap"],
       "disposition": "historicalize/delete",
@@ -538,7 +538,7 @@
     },
     {
       "id": "publication-evidence-and-cas",
-      "paths": ["actionq/cas.py", "actionq/db.py", "actionq/application_completion.py", "actionq/migrations/006_immutable_candidate_actions.sql", "actionq/migrations/007_dispatch_observation_watermarks.sql", "actionq/migrations/008_dispatch_v2_quarantine.sql"],
+      "paths": ["actionq/cas.py", "actionq/db.py", "actionq/application_completion.py"],
       "symbols": ["actionq/cas.py#artifact_ref", "actionq/cas.py#_DaemonCAS.put", "actionq/cas.py#_DaemonCAS.get", "actionq/db.py#create_immutable_action", "actionq/db.py#register_publication", "actionq/db.py#validate_dispatch_result", "actionq/db.py#_verify_dispatch_result_referent", "actionq/application_completion.py#CompletionService.register_publication"],
       "operations": ["immutable candidate", "publication record", "content-addressed referent verification", "dispatch observation watermark/quarantine"],
       "disposition": "replace-by-federation",
@@ -547,7 +547,7 @@
     },
     {
       "id": "completion-replay-and-rebuild",
-      "paths": ["actionq/completion_log.py", "actionq/completion_outbox.py", "actionq/action_resource.py", "actionq/migrations/011_session_completion_log.sql", "verification/run_action_resource_history.py", "verification/validate_action_resource_owner_v1.py", "verification/contexts/action-resource-owner-v1.json", "verification/fixtures/action-resource-owner-v1/manifest.json"],
+      "paths": ["actionq/completion_log.py", "actionq/completion_outbox.py"],
       "symbols": ["actionq/completion_log.py#CompletionLog.ingest", "actionq/completion_log.py#CompletionLog.list", "actionq/completion_log.py#CompletionLog.compact", "actionq/completion_outbox.py#CompletionOutbox.record", "actionq/completion_outbox.py#CompletionOutbox.retry", "actionq/completion_outbox.py#recover_capsules"],
       "operations": ["completion event identity/digest", "cursor/recovery floor", "response-loss retry", "capsule recovery", "resource projection/rebuild"],
       "disposition": "replace-by-federation",
@@ -556,12 +556,21 @@
     },
     {
       "id": "schema-migration-and-packaging",
-      "paths": ["actionq/schema.py", "actionq/db.py", "actionq/migrations/001_init.sql", "actionq/migrations/012_managed_dispatch_envelopes.sql", "pyproject.toml", "uv.lock", "packages/actionq-contracts/pyproject.toml", "packages/actionq-runner/pyproject.toml", ".github/workflows/ci.yml", ".github/workflows/release-actionq-wheel.yaml", ".github/scripts/verify-release-image-tag.py", "verification/validate_release_contract.py"],
+      "paths": ["actionq/schema.py", "actionq/db.py", "pyproject.toml", "uv.lock", ".github/workflows/ci.yml", ".github/workflows/release-actionq-wheel.yaml", ".github/scripts/verify-release-image-tag.py", "verification/validate_release_contract.py"],
       "symbols": ["actionq/schema.py#load_migrations", "actionq/schema.py#check_compatibility", "actionq/schema.py#migrate", "actionq/db.py#migrate", "actionq/db.py#check_compatibility"],
       "operations": ["execution v1 migrations 001-012", "schema compatibility facade", "wheel package data", "root and workspace console scripts"],
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "Migration assets/order/checksums drift, execution 013 exists, package data omits frozen assets, or an unclassified console script appears."
+    },
+    {
+      "id":"frozen-execution-migration-assets",
+      "paths":["actionq/migrations/001_init.sql","actionq/migrations/002_claim_receipts.sql","actionq/migrations/003_dispatch_request_v2.sql","actionq/migrations/004_cancellation_fencing.sql","actionq/migrations/005_execution_groups.sql","actionq/migrations/006_immutable_candidate_actions.sql","actionq/migrations/007_dispatch_observation_watermarks.sql","actionq/migrations/008_dispatch_v2_quarantine.sql","actionq/migrations/009_action_resource_owner.sql","actionq/migrations/010_claim_attempt_binding.sql","actionq/migrations/011_session_completion_log.sql","actionq/migrations/012_managed_dispatch_envelopes.sql"],
+      "symbols":[],
+      "operations":["immutable execution/v1 history and archive schema"],
+      "disposition":"retain-as-frozen-archive",
+      "owner":"actionq",
+      "falsifying_test":"Any execution migration is reclassified as federation successor schema, omitted, mutated, or extended by 013."
     }
   ],
   "external_consumers": [
@@ -650,7 +659,7 @@
       "id": "agentops-generated-guidance",
       "repository": "https://github.com/bayleafwalker/agentops.git",
       "commit_refs": {
-        "realignment_source": "6b41e6f7b14d7cb9b6e44acced4f05f457b810eb"
+        "canonical_program_record": "6c01869b8a0c5ad3dfaf3313385f9a162900dab8"
       },
       "paths": [
         "apps/web/lib/cockpit/actionq.js",
@@ -740,6 +749,8 @@
   "external_atomic_path_dispositions": [
     {"consumer_id":"vuoro-composition","disposition":"retain-as-frozen-archive","paths":["packages/vuoro-service/composition/adapter-pins.json","scripts/validate_released_execution_adapter.py","scripts/validate_released_catalog_composition.py","scripts/verify_pre_migration_startup.py"]},
     {"consumer_id":"vuoro-composition","disposition":"replace-by-federation","paths":["packages/vuoro-service/src/vuoro_service/composition.py","packages/vuoro-service/src/vuoro_service/execution_provenance.py","scripts/fetch_pinned_adapters.py"]},
+    {"consumer_id":"actionq-dispatcher-tombstone","disposition":"historicalize/delete","paths":["pyproject.toml","actionq_dispatcher/cli.py","docs/retirement-release.md","docs/runbook.md"]},
+    {"consumer_id":"q-spec-stale-normative-contracts","disposition":"historicalize/delete","paths":["actionq-spec.md","dispatcher-spec.md","sprintctl-spec.md"]},
     {"consumer_id":"agentops-generated-guidance","disposition":"historicalize/delete","paths":["apps/web/lib/cockpit/actionq.js","apps/web/lib/cockpit/dispatch.js","apps/web/app/cockpit/api/claims/route.js","apps/web/app/cockpit/api/dispatch/route.js"]},
     {"consumer_id":"agentops-generated-guidance","disposition":"retain-as-frozen-archive","paths":["apps/web/app/cockpit/api/dispatches/route.js","apps/web/tests/actionq-contract.test.js"]},
     {"consumer_id":"agentops-generated-guidance","disposition":"replace-by-federation","paths":["apps/web/lib/cockpit/env.js","apps/web/app/cockpit/api/mcp/route.js","apps/web/tests/route-shapes.test.js","apps/web/tests/write-surface.test.js"]},
@@ -755,6 +766,59 @@
     {"consumer_id":"agentops-generated-guidance","commit":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/actionq.js","sha256":"ba9050d863420c8c364b42edc44e265933c1be51af7372aba6ce8cd59dd7b456"},
     {"consumer_id":"sprintctl-actionq-lifecycle","commit":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"sprintctl/commands/lifecycle.py","sha256":"18b3b2a42af6195a264fb6b8d3d7a02bc3ba7703fac83a1dec7879f3f29fb9c5"},
     {"consumer_id":"appservice-ordered-retirement","commit":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml","sha256":"dbe82ae71c60941f77398a07e48059beb2b43b63f78d6e6a6ab3a6184f6a66e8"}
+  ],
+  "external_path_proofs": [
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/composition/adapter-pins.json","sha256":"6d2f9739c1ffa1a5fa3a9cfdf8dd22b81ed71d5a93eff211fa1db134ae8902f1"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/src/vuoro_service/composition.py","sha256":"d2e89e1751d9ce509bb63cb1eda96186f43d0a716219ea9966877b5bd4360af6"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"packages/vuoro-service/src/vuoro_service/execution_provenance.py","sha256":"6e399d1ab065638b48946f62a4ef98c4085cc9b96c8b45ddabf451487f6c827e"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/fetch_pinned_adapters.py","sha256":"f99b9dc1ecdb921d7a81727e0c7892b0ba925e1e369c00d6e36ff784bde94ad8"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/validate_released_execution_adapter.py","sha256":"30ce353f4cebe1df0d73e03c09f07d5a4315bba70c5a141cad33ed07444f1d75"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/validate_released_catalog_composition.py","sha256":"55256e27b8667d7e5ec8a9b86de32d37ee6bf9e4eed7c92ee739623e72a0e2a1"},
+    {"consumer_id":"vuoro-composition","ref":"9dc7efa8d3f546851218f49da7653f806d5e8ca4","path":"scripts/verify_pre_migration_startup.py","sha256":"e1eb6d8d5ddf1e2ec8a8c47f6d02a6d6570fc5f720034038a25c37424bd9224c"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"pyproject.toml","sha256":"d74e83a875fc124b01f8a270570168ff7b51e4cbdbf467f3c90f76f8b60f6610"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"actionq_dispatcher/cli.py","sha256":"68f8add3876c7a75598c3cefc2260605129740a298387e0d74a9e8ee26ae4f02"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"docs/retirement-release.md","sha256":"6efaf123d0bd97c9087c4edd0d0ac419ad913028a925bffcded53173acbdb9f5"},
+    {"consumer_id":"actionq-dispatcher-tombstone","ref":"510822a8ed1ee24e5eafdfd92aaf8a76f3f425e4","path":"docs/runbook.md","sha256":"6af7b261a0586ece445b45a35b4b315c9ac749904654354781fe9262ba1af183"},
+    {"consumer_id":"q-spec-stale-normative-contracts","ref":"unversioned-file-digest","path":"actionq-spec.md","sha256":"61181fb5f3916fe008cfc055004b4b00f75355340dd46a1b98e1e0dace64a4ff"},
+    {"consumer_id":"q-spec-stale-normative-contracts","ref":"unversioned-file-digest","path":"dispatcher-spec.md","sha256":"5ece7f9c6af0eaf96867e1a8ab98d8f4e17774549c283d1f785510d363e14c16"},
+    {"consumer_id":"q-spec-stale-normative-contracts","ref":"unversioned-file-digest","path":"sprintctl-spec.md","sha256":"25f74910b9af050fc3fabf0579bcc8f4e4b600c8c662722b0fc81b84648c0fe3"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"sprintctl/commands/lifecycle.py","sha256":"18b3b2a42af6195a264fb6b8d3d7a02bc3ba7703fac83a1dec7879f3f29fb9c5"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"tests/test_takeup.py","sha256":"6828c25b1da971ad78a7af8255b53aeb9545516342fc1ba9e4afd62d7a9fdf20"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"tests/test_takeup_pg_contract.py","sha256":"ea9bd80b1351d17ca30989ffb29ecd0a04914acfda57db3fc2c2749c805bb1e5"},
+    {"consumer_id":"sprintctl-actionq-lifecycle","ref":"db52e2fdc219eeb6b15a7667e079779e22128d4e","path":"docs/advanced/takeup.md","sha256":"5fedaf7cefab10c445dd22035848d4fd23d9f7f95e916fa6318c95dc9ddc9fcc"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/actionq.js","sha256":"ba9050d863420c8c364b42edc44e265933c1be51af7372aba6ce8cd59dd7b456"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/dispatch.js","sha256":"26058b3adf324fa03c87a64e42a2d8d8a844c65caad9992e7cf6b1fb08eee751"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/lib/cockpit/env.js","sha256":"bc9f3ff931d6ab13ea2b9772d6b0b019b741cc9e841927445d1d72503b31c4bf"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/claims/route.js","sha256":"808213193efde760943869e310f5303b8c4b7c86f46563cdd013fdd4b8f6581f"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/dispatch/route.js","sha256":"7a29a68812c83e6a2a4fc32762ddf3836a42902bfc5a39bef3f2272b388fe825"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/dispatches/route.js","sha256":"572dcc811ba1b5d07f0b2873393fd76daad91f831968a217be0200b3243d7b2e"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/app/cockpit/api/mcp/route.js","sha256":"1ed4b009725a8a1df690cb1a0e071d41b324ab3935cb04997eb5c8ac08886f33"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/tests/actionq-contract.test.js","sha256":"702887a1d94acba6c659c6f6ad5f154882c9a8cf1cd0fe205a3cb2ed01b6931a"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/tests/route-shapes.test.js","sha256":"116c16a77260dbf0a70a4e15118b9ddeeb90d2ba1e6880d16deaefff37f6c732"},
+    {"consumer_id":"agentops-generated-guidance","ref":"6c01869b8a0c5ad3dfaf3313385f9a162900dab8","path":"apps/web/tests/write-surface.test.js","sha256":"27cc9d09e5d92a6314bd23ee393f08e4668026158e82296d0e7b13faaca662e9"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"0df071a9d536d3244faa6a368532cc894eb453e9","path":"modules/system/actionq-dispatch.nix","sha256":"1dd970da0f3923be96ea54c8bf9a19c446587f206d5a7f25b2e3591bf08108c1"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"0df071a9d536d3244faa6a368532cc894eb453e9","path":"scripts/actionq-daemon-tmux.sh","sha256":"693726ff60df93d0a96eb53c662465e0267c37acca7891a22a0b53219cf23a26"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"0df071a9d536d3244faa6a368532cc894eb453e9","path":"scripts/actionq-handoff.sh","sha256":"ebca10a6c6a192fc58fc081215b71dc04bd50eaf125f1a6d5f3d84625d90415d"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"scripts/update-agentops-tools.sh","sha256":"a19769055cc041366a39b534cc0f8f4428bbf911ee89c483758dab23f5692097"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"modules/system/agentops-client-tools.nix","sha256":"097a815a620ca94dad5b17dec60078a29ca8c1c3010c982616e01b760ef53a9a"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"scripts/check-actionq-retirement.sh","sha256":"59d1d124bb50918518eaee07f30a772c6fdfc743d8c8dd5a8585e612e054b8ed"},
+    {"consumer_id":"gitops-nixos-daemon-retirement","ref":"50bc3d5b26cce703df52a1a90595121f6fdd8787","path":"docs/runbooks/actionq-devbox-dispatch.md","sha256":"663d12b6f405cef29c0f646ed81b3fc23ba99e8d605d56f929d5ea7866186f07"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/actionq-server/app/deployment.yaml","sha256":"dbe82ae71c60941f77398a07e48059beb2b43b63f78d6e6a6ab3a6184f6a66e8"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/actionq-db/app/actionq-runtime.secret.yaml","sha256":"2b6126733a6df77eec4b9b8a6f7447a3dc508ce1be526bf41f4a98d326df6a98"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/agent-cockpit/app/deployment.yaml","sha256":"24a27f9fe4bcdcac659bcaca5f5f3f54358723a165623539be1bbdee19fef582"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared/app/deployment.yaml","sha256":"468f04b5508ad36d7914d8b9d525711736583970c45e6cc3911bc50881827ebf"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev/app/deployment.yaml","sha256":"52a834a7e95b3dd3f9b3799aa5837c7b1195fd9ba323059d11ca9487788a8f8c"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared/app/managed-dispatch-policy.yaml","sha256":"ba1324760229ca91568d915fe9134972a3cdb64042172ee94cc9b140db1e42e8"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-runtime.secret.yaml","sha256":"47b4ab94ba588fa45c4dc1311a64dbdfb09d57b8104871b32a0b8e6625ef469b"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migration.secret.yaml","sha256":"819e6648cc81daa56a549973c238d8f88d810e414e80533d86033569cd4b365f"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","sha256":"1d213f40bfb1f74a64b0660be3fea964382d65811ecfd50d0f1b3e019917cd4f"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-completion-read-runtime.secret.yaml","sha256":"c2c195300116dd4bb82c8718b14bde22cc4b6c0c52db6c2a0a3ce367d889d2c7"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-shared-db/app/vuoro-execution-migrate-v12.yaml","sha256":"e80fcf4afec5d8dfac4eaadd61a042c893e63b4735570993ecdb0af768c1294c"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-runtime.secret.yaml","sha256":"ecf49f134d677a21798a0b3099298d4d9d2d0087505c41af4b36be7635934d06"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-migration.secret.yaml","sha256":"c7c2ffe4fc1e4fe75339ce87afce3b44f39701b73e5110c6d59d3de0aa94ac53"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-ingest-runtime.secret.yaml","sha256":"3f23a1ff36b22459c9fd4fc2db8cd3fe1bd68862a7186543a6eb8202ff052bbe"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-execution-completion-read-runtime.secret.yaml","sha256":"b5e8d349a4ac3a0a9106d149a66eecb6bd8640b6cc602c711eba7279415ebfca"},
+    {"consumer_id":"appservice-ordered-retirement","ref":"72a145b03472fd3b00c912f84c9a5c86fc3a1e1c","path":"clusters/main/kubernetes/apps/vuoro-dev-db/app/vuoro-migrate-v1.yaml","sha256":"334bb125574ac22a8e39c75284bc732f413f16d1622955fe34c14809155ee0b6"}
   ],
   "atomic_symbol_dispositions": [
     {"path":"actionq/application_completion.py","disposition":"historicalize/delete","symbols":["CompletionService._terminal","CompletionService.complete","CompletionService.fail","CompletionService.reject","CompletionService.settle","CompletionService.cancel","CompletionService.sweep","CompletionService.acknowledge_cancellation"]},
@@ -787,12 +851,13 @@
     {"path":"actionq/vuoro.py","names":["DISPATCH_STOP_REASONS","DISPATCH_TERMINAL_STATUSES"],"disposition":"historicalize/delete"}
   ],
   "semantic_assets": [
-    {"disposition":"retain-as-frozen-archive","paths":["tests/test_cancellation_model.py","tests/test_candidate_action_cancellation_model.py","tests/test_verification_contracts.py","verification/contexts/action-claim-concurrency.json","verification/contexts/dispatch-enqueue-v2-contract.json","verification/contexts/schema-migration-compatibility.json","verification/fixtures/action-resource-owner-v1/manifest.json","verification/fixtures/action-resource-owner-v1/not-found.json","verification/fixtures/action-resource-owner-v1/protocol-responses.json","verification/fixtures/action-resource-owner-v1/required-histories.json","verification/history-receipts/bounded-wait.json","verification/history-receipts/fencing.json","verification/history-receipts/non-disclosure.json","verification/history-receipts/pruning.json","verification/history-receipts/redaction.json","verification/history-receipts/response-loss.json","verification/history-receipts/snapshot-race.json","verification/results/action-resource-owner-bounded-wait.json","verification/results/action-resource-owner-fencing.json","verification/results/action-resource-owner-non-disclosure.json","verification/results/action-resource-owner-pruning.json","verification/results/action-resource-owner-redaction.json","verification/results/action-resource-owner-response-loss.json","verification/results/action-resource-owner-snapshot-race.json"]},
+    {"disposition":"retain-as-frozen-archive","paths":["tests/test_cancellation_model.py","tests/test_candidate_action_cancellation_model.py","tests/test_verification_contracts.py","verification/contexts/action-claim-concurrency.json","verification/contexts/dispatch-enqueue-v2-contract.json","verification/contexts/schema-migration-compatibility.json","verification/contexts/action-resource-owner-v1.json","verification/run_action_resource_history.py","verification/validate_action_resource_owner_v1.py","verification/fixtures/action-resource-owner-v1/manifest.json","verification/fixtures/action-resource-owner-v1/not-found.json","verification/fixtures/action-resource-owner-v1/protocol-responses.json","verification/fixtures/action-resource-owner-v1/required-histories.json","verification/history-receipts/bounded-wait.json","verification/history-receipts/fencing.json","verification/history-receipts/non-disclosure.json","verification/history-receipts/pruning.json","verification/history-receipts/redaction.json","verification/history-receipts/response-loss.json","verification/history-receipts/snapshot-race.json","verification/results/action-resource-owner-bounded-wait.json","verification/results/action-resource-owner-fencing.json","verification/results/action-resource-owner-non-disclosure.json","verification/results/action-resource-owner-pruning.json","verification/results/action-resource-owner-redaction.json","verification/results/action-resource-owner-response-loss.json","verification/results/action-resource-owner-snapshot-race.json"]},
     {"disposition":"historicalize/delete","paths":["verification/capture_claude_acp.py","verification/probe_claude_acp_set_model.py","verification/probe_claude_acp_settings_binding.py","verification/probe_native_harness_binding.py","docs/operations/codex-luna-catalog-workaround.md","docs/plans/acp-execution-adapter.md","docs/verification/2026-08-13-adapter-kit-depth-2-survey.md","docs/verification/2026-08-13-schema-runtime-depth-2-survey.md",".agents/overlays/actionq.hybrid-worker.md"]},
     {"disposition":"replace-by-federation","paths":["actionq/migrations/__init__.py","AGENTS.md"]}
   ],
   "semantic_asset_inheritance":{"owner":"actionq","falsifying_test":"A selected semantic root is added, removed, or changes category without an explicit W1 disposition."},
   "effective_disposition_rule":"atomic symbol/import/constant entries override their python-surface or import-group inventory default; critical_reachability is an index only and must reconcile every symbol to that single effective disposition; successor semantics must use distinct names and may not override frozen legacy symbols.",
+  "critical_file_dispositions":[{"disposition":"replace-by-federation","paths":["uv.lock",".github/workflows/ci.yml",".github/workflows/release-actionq-wheel.yaml",".github/scripts/verify-release-image-tag.py","verification/validate_release_contract.py"]}],
   "host_local_anchors": [
     {"path":"/projects/dev/AGENTS.md","sha256":"afda50a10c7dcd2df0c3193016b09170585a59dd2e6b5ea01c92f864d572093c","limitation":"host-local mutable workspace guidance","disposition":"historicalize/delete"}
   ],
@@ -809,7 +874,7 @@
       "id": "coupled-action-resource-owner",
       "path": "actionq/action_resource.py",
       "symbols": ["ResourceNotFound", "CursorExpired", "CursorExpired.__init__", "IdempotencyConflict", "canonical_request", "serialize_envelope", "new_resource_ref", "_iso", "_projection", "_event", "EnqueueResult", "ActionResourceOwner", "ActionResourceOwner.__init__", "ActionResourceOwner._cursor", "ActionResourceOwner._parse_cursor", "ActionResourceOwner.enqueue", "ActionResourceOwner._lookup", "ActionResourceOwner.snapshot", "ActionResourceOwner.changes", "ActionResourceOwner.project_state", "ActionResourceOwner.prune"],
-      "disposition": "replace-by-federation",
+      "disposition": "retain-as-frozen-archive",
       "owner": "actionq",
       "falsifying_test": "The resource owner remains action-row/claim coupled, loses a callable during later facade work, or a symbol changes without updating this manifest."
     },
