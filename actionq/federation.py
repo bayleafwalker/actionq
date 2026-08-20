@@ -34,8 +34,10 @@ class FederationPrincipal:
     authorities: frozenset[str]
 
     def __post_init__(self) -> None:
-        if not self.environment or not self.principal_id:
-            raise ValueError("authenticated federation principal requires environment and principal_id")
+        if not isinstance(self.environment, str) or not self.environment:
+            raise ValueError("authenticated federation principal requires a non-empty string environment")
+        if not isinstance(self.principal_id, str) or not self.principal_id:
+            raise ValueError("authenticated federation principal requires a non-empty string principal_id")
         if not all(isinstance(item, str) and item for item in self.authorities):
             raise ValueError("federation authorities must be non-empty strings")
 
@@ -193,8 +195,15 @@ class FederationAuthority:
 
     def _execute(self, *, principal: FederationPrincipal, operation: str, idempotency_key: str,
                  request: dict[str, Any], apply: Callable[[Any], tuple[str, int | None, int | None]]) -> CommandDecision:
-        if not idempotency_key:
-            raise ValueError("federation commands require a non-empty idempotency key")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            # Type-checked here, not just truthiness: identity below is
+            # joined into a single advisory-lock key string, and a non-str
+            # idempotency_key (or a non-str principal.environment/
+            # principal_id -- see FederationPrincipal.__post_init__, which
+            # rejects those the same way) would otherwise leak a bare
+            # TypeError from that join instead of the module's public
+            # exception, after a transaction is already open.
+            raise db.ActionQError("federation commands require a non-empty string idempotency key")
         try:
             request_bytes = canonical_bytes(request)
         except (TypeError, ValueError) as malformed:
@@ -387,7 +396,18 @@ class FederationAuthority:
         # durably recorded as a rejected decision rather than raised before
         # the command even reaches the idempotency machinery.
         valid_evidence_bytes = isinstance(evidence_bytes, (bytes, bytearray))
-        actual_digest = _digest(bytes(evidence_bytes)) if valid_evidence_bytes else _digest(repr(evidence_bytes).encode("utf-8"))
+        if valid_evidence_bytes:
+            actual_digest = _digest(bytes(evidence_bytes))
+        else:
+            try:
+                descriptor = repr(evidence_bytes)
+            except Exception:
+                # A malformed value's own __repr__ can itself raise; fall
+                # back to something deterministic per type so the digest
+                # below (and idempotent replay of the resulting rejection)
+                # doesn't depend on succeeding at describing the bad input.
+                descriptor = f"<unrepresentable {type(evidence_bytes).__name__}>"
+            actual_digest = _digest(descriptor.encode("utf-8", errors="replace"))
         request = {"resource_ref": resource_ref, "evidence_ref": evidence_ref, "evidence_digest": actual_digest, "assurance_type": assurance_type, "expected_revision": expected_revision}
         def apply(conn: Any) -> tuple[str, int, int]:
             self._require_authority(principal, "federation.evidence.ingest")

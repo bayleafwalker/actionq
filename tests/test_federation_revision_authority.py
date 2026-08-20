@@ -177,6 +177,55 @@ def test_unserializable_request_argument_raises_public_error_not_a_bare_typeerro
         authority.supersede(principal=owner, idempotency_key="bad-arg", resource_ref=b"not-a-string", expected_revision=0)
 
 
+def test_non_string_idempotency_key_raises_public_error_not_a_bare_typeerror(postgres_urls) -> None:
+    # idempotency_key is never part of the canonicalized request -- it is
+    # joined directly into an advisory-lock key string inside an already-open
+    # transaction -- so it needs its own type check ahead of that join
+    # instead of relying on the request-serialization guard.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    owner = _principal("owner", "federation.create")
+
+    with pytest.raises(db.ActionQError):
+        authority.create(principal=owner, idempotency_key=b"not-a-string", expected_revision=0)
+    with pytest.raises(db.ActionQError):
+        authority.create(principal=owner, idempotency_key="", expected_revision=0)
+
+
+def test_federation_principal_rejects_non_string_environment_or_principal_id() -> None:
+    with pytest.raises(ValueError):
+        FederationPrincipal.authenticated(environment=1, principal_id="p", authorities=())
+    with pytest.raises(ValueError):
+        FederationPrincipal.authenticated(environment="env", principal_id=1, authorities=())
+
+
+def test_record_evidence_tolerates_evidence_bytes_whose_repr_raises(postgres_urls) -> None:
+    class _Unrepresentable:
+        def __repr__(self):
+            raise RuntimeError("boom")
+
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("creator", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+
+    decision = authority.record_evidence(
+        principal=_principal("ingester", "federation.evidence.ingest"), idempotency_key="unrepresentable",
+        resource_ref=resource, evidence_ref="artifact:sha256:" + "0" * 64,
+        evidence_bytes=_Unrepresentable(), assurance_type="verified", expected_revision=1,
+    )
+    assert decision.status == "rejected" and decision.code == "invalid-evidence-bytes"
+    replay = authority.record_evidence(
+        principal=_principal("ingester", "federation.evidence.ingest"), idempotency_key="unrepresentable",
+        resource_ref=resource, evidence_ref="artifact:sha256:" + "0" * 64,
+        evidence_bytes=_Unrepresentable(), assurance_type="verified", expected_revision=1,
+    )
+    assert replay.replayed is True and replay.response_digest == decision.response_digest
+
+
 def test_malformed_command_with_valid_idempotency_identity_is_durable_and_replayable(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
@@ -417,7 +466,7 @@ def test_opposite_relation_attempts_serialize_cycle_check(postgres_urls) -> None
     barrier = Barrier(2)
 
     def relate(principal, key, source, target):
-        barrier.wait()
+        barrier.wait(timeout=30)
         return authority.add_relation(
             principal=principal, idempotency_key=key, source_ref=source,
             relation_type="parent-of", target_ref=target, expected_revision=1,
@@ -428,7 +477,7 @@ def test_opposite_relation_attempts_serialize_cycle_check(postgres_urls) -> None
             executor.submit(relate, owner_a, "left-right", left, right),
             executor.submit(relate, owner_b, "right-left", right, left),
         ]
-        decisions = [future.result() for future in results]
+        decisions = [future.result(timeout=30) for future in results]
 
     assert sorted(decision.status for decision in decisions) == ["accepted", "rejected"]
     assert {decision.code for decision in decisions} == {"accepted", "relation-cycle"}
