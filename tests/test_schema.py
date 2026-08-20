@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from actionq import db, schema, server
+from actionq import db, schema
 from actionq.cli import cli
 from vuoro_schema_runtime import MigrationAsset
 
@@ -983,69 +983,3 @@ def test_check_compatibility_cli_exits_three_for_incompatible_schema(monkeypatch
     assert json.loads(result.output)["state"] == "uninitialized"
 
 
-def test_server_checks_compatibility_before_binding(monkeypatch):
-    calls: list[str] = []
-
-    def compatible():
-        calls.append("compatibility")
-        return {"state": "compatible", "observed_schema_version": 1}
-
-    class RefusingServer:
-        def __init__(self, *args, **kwargs):
-            calls.append("bind")
-            raise RuntimeError("stop after bind")
-
-    monkeypatch.setattr(server, "_require_runtime_compatibility", compatible)
-    monkeypatch.setattr(server, "HTTPServer", RefusingServer)
-
-    with pytest.raises(RuntimeError, match="stop after bind"):
-        server.main()
-
-    assert calls == ["compatibility", "bind"]
-
-
-def test_server_never_binds_when_schema_is_incompatible(monkeypatch, capsys):
-    def incompatible():
-        raise schema.SchemaCompatibilityError("unsupported schema")
-
-    monkeypatch.setattr(server, "_require_runtime_compatibility", incompatible)
-    monkeypatch.setattr(
-        server,
-        "HTTPServer",
-        lambda *args, **kwargs: pytest.fail("server bound before compatibility check"),
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        server.main()
-    assert excinfo.value.code == 3
-    assert "startup refused" in capsys.readouterr().err
-
-
-def test_server_request_connections_recheck_compatibility_without_ddl(monkeypatch):
-    conn = FakeSchemaConnection(ledger_exists=True, applied=_packaged_checksums())
-    monkeypatch.setattr(db, "connect", lambda: conn)
-
-    assert server._sessions("") == []
-
-    assert conn.rollbacks == 1
-
-    assert any(statement.startswith("SELECT to_regclass") for statement, _ in conn.executed)
-    assert all(
-        not statement.startswith(("CREATE", "ALTER", "DROP"))
-        for statement, _ in conn.executed
-    )
-
-
-def test_server_reports_schema_incompatibility_as_unavailable(monkeypatch):
-    def incompatible(_query):
-        raise schema.SchemaCompatibilityError("too new")
-
-    responses = []
-    handler = object.__new__(server._Handler)
-    handler.path = "/sessions"
-    handler._send_json = lambda status, body: responses.append((status, body))
-    monkeypatch.setattr(server, "_sessions", incompatible)
-
-    handler.do_GET()
-
-    assert responses == [(503, {"error": "schema incompatible"})]

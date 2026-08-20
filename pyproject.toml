@@ -42,8 +42,6 @@ Issues = "https://github.com/bayleafwalker/actionq/issues"
 
 [project.scripts]
 actionctl = "actionq.cli:cli"
-actionq-server = "actionq.server:main"
-actionq-daemon = "actionq.daemon:main"
 actionq-completion-outbox = "actionq.completion_outbox:main"
 
 [project.optional-dependencies]
@@ -58,7 +56,6 @@ actionq = ["migrations/*.sql"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "real_daemon_result_cas: exercise the production durable-CAS boundary without the unit-test CAS shim",
 ]
 
 [tool.uv.workspace]

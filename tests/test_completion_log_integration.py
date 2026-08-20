@@ -12,7 +12,6 @@ import pytest
 from actionq import db
 from actionq.application import ActionQApplication
 from actionq.completion_log import CompletionConflictError
-from actionq import server
 
 
 def _event(*, event_id: str, stream_id: str, sequence: int, failed: bool = False) -> dict:
@@ -122,80 +121,6 @@ def test_completion_log_retention_preserves_ack_and_rejects_stale_cursor(complet
     assert retry["server_cursor"] == first_ack["server_cursor"]
 
 
-def test_compatibility_http_api_is_capability_scoped_and_replayable(completion_application, monkeypatch):
-    stream = "1a2b3c4d-5e6f-4788-9a0b-1c2d3e4f5061"
-    event = _event(event_id="4d5e6f70-8192-4a3b-8c0d-3e4f50617283", stream_id=stream, sequence=1, failed=True)
-    monkeypatch.setenv("ACTIONQ_SCHEMA", completion_application.schema)
-    monkeypatch.setenv("ACTIONQ_URL", os.environ["ACTIONQ_TEST_RUNTIME_URL"])
-    previous = server._completion_authenticator
-    server.set_completion_authenticator_for_testing(
-        lambda _headers, _capability: server.AuthenticatedDispatchIdentity("completion:test", "test", ())
-    )
-    httpd = server.HTTPServer(("127.0.0.1", 0), server._Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
-        raw = json.dumps(event, separators=(",", ":"))
-        connection.request("POST", "/session-completions", body=raw, headers={"content-type": "application/json"})
-        response = connection.getresponse()
-        assert response.status == 200
-        acknowledgement = json.loads(response.read())
-        assert acknowledgement["acknowledged"] is True
-
-        connection.request("POST", "/session-completions", body=raw, headers={"content-type": "application/json"})
-        response = connection.getresponse()
-        assert response.status == 200
-        assert json.loads(response.read())["replayed"] is True
-
-        connection.request("GET", "/session-completions?cursor=0&limit=10")
-        response = connection.getresponse()
-        page = json.loads(response.read())
-        assert response.status == 200
-        assert [item["event_id"] for item in page["events"]] == [event["event_id"]]
-
-        connection.request("GET", "/session-completions/health")
-        response = connection.getresponse()
-        assert response.status == 200
-        assert json.loads(response.read())["event_count"] == 1
-
-        with db.connect(os.environ["ACTIONQ_TEST_URL"]) as conn:
-            conn.execute(
-                f'UPDATE "{completion_application.schema}".session_completion_events SET received_at=now()-interval \'2 days\''
-            )
-            conn.commit()
-        assert completion_application.compact_session_completions(older_than_seconds=60) == 1
-        connection.request("GET", "/session-completions?cursor=0&limit=10&replay=true")
-        response = connection.getresponse()
-        stale_page = json.loads(response.read())
-        assert response.status == 409
-        assert stale_page["status"] == "cursor_expired"
-        assert stale_page["advance_cursor"] is False
-        assert stale_page["next_cursor"] == 0
-        connection.close()
-    finally:
-        httpd.shutdown()
-        thread.join(3)
-        httpd.server_close()
-        server._completion_authenticator = previous
-
-
-def test_completion_credentials_are_not_queue_credentials(monkeypatch):
-    previous = server._completion_authenticator
-    server._completion_authenticator = None
-    monkeypatch.setenv("ACTIONQ_COMPLETION_INGEST_TOKEN", "ingest-only")
-    monkeypatch.setenv("ACTIONQ_COMPLETION_READ_TOKEN", "read-only")
-    try:
-        assert server._completion_identity({"authorization": "Bearer read-only"}, "read").actor == "completion:read"
-        assert server._completion_identity({"authorization": "Bearer ingest-only"}, "ingest").actor == "completion:ingest"
-        with pytest.raises(db.ActionQError):
-            server._completion_identity({"authorization": "Bearer read-only"}, "ingest")
-        with pytest.raises(db.ActionQError):
-            server._completion_identity({"authorization": "Bearer ingest-only"}, "read")
-    finally:
-        server._completion_authenticator = previous
-
-
 def test_completion_roles_have_no_queue_dml_privileges(completion_application, postgres_urls):
     schema = completion_application.schema
     if postgres_urls["completion_ingest"] == postgres_urls["runtime"]:
@@ -220,34 +145,3 @@ def test_completion_roles_have_no_queue_dml_privileges(completion_application, p
         ).fetchone()["allowed"] is True
 
 
-def test_completion_bearers_cannot_escalate_to_queue_routes(completion_application, monkeypatch):
-    monkeypatch.setenv("ACTIONQ_COMPLETION_INGEST_TOKEN", "ingest-only")
-    monkeypatch.setenv("ACTIONQ_COMPLETION_READ_TOKEN", "read-only")
-    monkeypatch.setenv("ACTIONQ_SCHEMA", completion_application.schema)
-    previous_authenticator = server._completion_authenticator
-    server._completion_authenticator = None
-    httpd = server.HTTPServer(("127.0.0.1", 0), server._Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
-        for method, path, token in (
-            ("POST", "/dispatch", "ingest-only"),
-            ("POST", "/dispatch", "read-only"),
-            ("GET", "/sessions", "read-only"),
-            ("GET", "/sessions", "ingest-only"),
-            ("GET", "/dispatches", "read-only"),
-            ("GET", "/health", "read-only"),
-        ):
-            headers = {"Authorization": f"Bearer {token}"}
-            body = "{}" if method == "POST" else None
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            assert response.status == 403
-            assert json.loads(response.read())["error"]["code"] == "completion-credential-scope"
-        connection.close()
-    finally:
-        httpd.shutdown()
-        thread.join(3)
-        httpd.server_close()
-        server._completion_authenticator = previous_authenticator

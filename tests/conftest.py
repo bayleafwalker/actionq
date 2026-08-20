@@ -74,41 +74,6 @@ def signed_runner_proof(runner_identity):
     return sign
 
 
-@pytest.fixture(autouse=True)
-def daemon_test_result_cas(tmp_path: Path, request, monkeypatch):
-    """Give legacy daemon unit doubles an explicitly test-only CAS.
-
-    Production ``Daemon._cas`` still requires ``DaemonConfig.artifact_root``
-    and uses the strict FilesystemCAS checks.  Most older coordinator tests
-    predate result artifacts and intentionally focus on lifecycle wiring, so
-    this fixture supplies an unsafe temporary CAS only to those unit doubles.
-    Tests for the fail-closed root boundary opt out with the marker below.
-    """
-    if request.node.get_closest_marker("real_daemon_result_cas"):
-        yield
-        return
-    from actionq.daemon import Daemon
-    from actionq_runner import FilesystemCAS
-
-    root = Path("/dev/shm") / f"actionq-daemon-test-cas-{uuid.uuid4().hex}"
-    root.mkdir(mode=0o700)
-
-    def test_cas(self):
-        if self.config.artifact_root is None:
-            # Real ActionctlClient doubles settle through a subprocess. Point
-            # that subprocess at the same test-only CAS that the daemon used
-            # to write the verified result packet; otherwise the full-suite
-            # harness supplies bytes to one root and verifies another.
-            if hasattr(self.client, "artifact_root"):
-                self.client.artifact_root = root
-            return FilesystemCAS(root, allow_unsafe_test_root=True)
-        return FilesystemCAS(self.config.artifact_root, allow_unsafe_test_root=True)
-
-    monkeypatch.setattr(Daemon, "_cas", test_cas)
-    yield
-    shutil.rmtree(root, ignore_errors=True)
-
-
 @pytest.fixture
 def server_cas_root():
     """Provision a real owner-controlled CAS outside test-runner staging."""
