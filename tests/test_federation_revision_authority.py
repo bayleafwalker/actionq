@@ -231,6 +231,28 @@ def test_column_default_check_tolerates_a_shadowed_now_function(postgres_urls) -
             conn.execute(f'DROP SCHEMA "{shadow_schema}" CASCADE')
 
 
+def test_column_type_check_tolerates_a_shadowed_text_domain(postgres_urls) -> None:
+    # information_schema.columns.data_type is subject to the same
+    # pg_catalog-demoted rendering as CHECK/default text: a domain literally
+    # named "text" ahead of pg_catalog on search_path makes every plain
+    # "text" column's data_type report as "pg_catalog.text" rather than
+    # "text", with no bearing on the schema's actual shape.
+    selected = _new_schema("fed_text_shadow")
+    _migrate(postgres_urls["admin"], selected)
+    shadow_schema = "fed_text_shadow_ns_" + uuid.uuid4().hex[:10]
+    with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+        conn.execute(f'CREATE SCHEMA "{shadow_schema}"')
+        conn.execute(f'CREATE DOMAIN "{shadow_schema}".text AS text')
+    try:
+        with db.connect(postgres_urls["admin"]) as conn:
+            conn.execute(f'SET search_path TO "{shadow_schema}", pg_catalog, public')
+            result = federation_schema.check_compatibility(conn, selected)
+        assert result.state == "compatible", result.detail
+    finally:
+        with db.connect(postgres_urls["admin"]) as conn, conn.transaction():
+            conn.execute(f'DROP SCHEMA "{shadow_schema}" CASCADE')
+
+
 def test_snapshot_requires_authenticated_federation_read_authority(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
@@ -316,6 +338,42 @@ def test_record_evidence_tolerates_evidence_bytes_whose_repr_raises(postgres_url
         evidence_bytes=_Unrepresentable(), assurance_type="verified", expected_revision=1,
     )
     assert replay.replayed is True and replay.response_digest == decision.response_digest
+
+
+def test_record_evidence_valid_and_malformed_bytes_cannot_collide_on_request_digest(postgres_urls) -> None:
+    # actual_digest on the valid path must stay plain sha256(evidence_bytes)
+    # -- honest callers independently compute that same hash to construct
+    # evidence_ref, so it can't carry a domain-separating prefix -- which
+    # means its value space, by construction, can coincide with some other
+    # value's repr() descriptor on the malformed path. b"'abc'" (valid
+    # bytes) and "abc" (a str -- malformed) hash identically once encoded:
+    # sha256(b"'abc'") == sha256(repr("abc").encode()). Without a field
+    # distinguishing which path produced evidence_digest, that coincidence
+    # collides the two calls' canonical request bytes under the same
+    # idempotency identity, and the second (malformed) call would silently
+    # replay the first (valid) call's accepted decision instead of being
+    # independently evaluated as invalid-evidence-bytes.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("owner", "federation.create")
+    resource = authority.create(principal=creator, idempotency_key="create", expected_revision=0).resource_ref
+    assert resource
+    ingester = _principal("ingester", "federation.evidence.ingest")
+    evidence_ref = "artifact:sha256:" + hashlib.sha256(b"'abc'").hexdigest()
+
+    valid = authority.record_evidence(
+        principal=ingester, idempotency_key="collision", resource_ref=resource,
+        evidence_ref=evidence_ref, evidence_bytes=b"'abc'", assurance_type="verified", expected_revision=1,
+    )
+    malformed = authority.record_evidence(
+        principal=ingester, idempotency_key="collision", resource_ref=resource,
+        evidence_ref=evidence_ref, evidence_bytes="abc", assurance_type="verified", expected_revision=1,
+    )
+    assert valid.status == "accepted" and valid.replayed is False
+    assert malformed.replayed is False
+    assert malformed.code != "accepted"
+    assert malformed.response_digest != valid.response_digest
 
 
 def test_malformed_command_with_valid_idempotency_identity_is_durable_and_replayable(postgres_urls) -> None:

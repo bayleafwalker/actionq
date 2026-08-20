@@ -406,7 +406,24 @@ class FederationAuthority:
                 # doesn't depend on succeeding at describing the bad input.
                 descriptor = f"<unrepresentable {type(evidence_bytes).__name__}>"
             actual_digest = _digest(descriptor.encode("utf-8", errors="replace"))
-        request = {"resource_ref": resource_ref, "evidence_ref": evidence_ref, "evidence_digest": actual_digest, "assurance_type": assurance_type, "expected_revision": expected_revision}
+        request = {
+            "resource_ref": resource_ref, "evidence_ref": evidence_ref, "evidence_digest": actual_digest,
+            # A raw byte string is an arbitrary, externally-fixed content-
+            # addressing input (actual_digest above must stay plain
+            # sha256(evidence_bytes) with no added prefix, since honest
+            # callers independently compute that same hash to construct
+            # evidence_ref) -- so its value space can, by construction,
+            # contain the same bytes as some non-bytes value's repr()
+            # descriptor. Without this field, that coincidence collides the
+            # two paths' canonical request bytes on the same idempotency
+            # identity, and a malformed submission silently replays an
+            # unrelated valid one's accepted decision instead of being
+            # independently evaluated. Recording which path produced
+            # evidence_digest keeps the two paths' request bytes distinct
+            # regardless of any digest coincidence.
+            "evidence_bytes_valid": valid_evidence_bytes,
+            "assurance_type": assurance_type, "expected_revision": expected_revision,
+        }
         def apply(conn: Any) -> tuple[str, int, int]:
             self._require_authority(principal, "federation.evidence.ingest")
             if not valid_evidence_bytes:

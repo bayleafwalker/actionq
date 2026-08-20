@@ -344,7 +344,12 @@ def _column_issues(conn: Any, schema: str) -> list[str]:
             issues.append(f"column-unexpected:{table}.{column}")
             continue
         observed[table][column] = (
-            str(_row(row, "data_type", 2)),
+            # information_schema.columns.data_type is subject to the same
+            # pg_catalog-demoted rendering as CHECK/default text (e.g. a
+            # domain literally named "text" shadowing the built-in ahead of
+            # pg_catalog on search_path renders every plain "text" column's
+            # data_type as "pg_catalog.text") -- same normalization needed.
+            _strip_pg_catalog_qualifier(str(_row(row, "data_type", 2))),
             str(_row(row, "is_nullable", 3)),
             _canonical_default(_row(row, "column_default", 4)),
         )
