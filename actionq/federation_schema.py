@@ -521,10 +521,14 @@ def _index_issues(conn: Any, schema: str) -> list[str]:
 
 def _shape_issues(conn: Any, schema: str) -> tuple[str, ...]:
     issues: list[str] = []
-    for table in REQUIRED_TABLES:
-        row = conn.execute("SELECT to_regclass(%s) AS relation", (db.qname(schema, table),)).fetchone()
-        if not row or not _row(row, "relation"):
-            issues.append(f"table-missing:{table}")
+    existing_tables = {
+        str(_row(row, "table_name"))
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema=%s AND table_name = ANY(%s)",
+            (schema, list(REQUIRED_TABLES)),
+        ).fetchall()
+    }
+    issues.extend(f"table-missing:{table}" for table in REQUIRED_TABLES if table not in existing_tables)
     if issues:
         # Column/constraint/index checks assume every required table exists;
         # a missing table already fails compatibility on its own.

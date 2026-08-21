@@ -60,7 +60,7 @@ def serialize_envelope(value: dict[str, Any]) -> bytes:
 
 
 def new_resource_ref() -> str:
-    return "aqr1_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+    return db.new_opaque_ref("aqr1_")
 
 
 def _iso(value: Any) -> str | None:

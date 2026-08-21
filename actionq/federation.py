@@ -6,11 +6,8 @@ Sprintctl, catalog, CLI, or provider side effects.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import re
-import secrets
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -23,6 +20,11 @@ from . import federation_schema
 RESOURCE_RE = re.compile(r"^aqf1_[A-Za-z0-9_-]{43}$")
 RELATION_TYPES = frozenset({"parent-of", "depends-on", "derived-from", "supersedes"})
 CYCLIC_RELATION_TYPES = frozenset({"parent-of", "depends-on"})
+# Single source of truth for the group's iteration order: the per-add
+# advisory lock and the cycle-reachability CTE both need the exact same
+# member list, and computing it once here means a future addition/removal
+# from CYCLIC_RELATION_TYPES only has to happen at the constant itself.
+_CYCLIC_RELATION_TYPES_ORDERED = sorted(CYCLIC_RELATION_TYPES)
 
 
 @dataclass(frozen=True)
@@ -71,15 +73,15 @@ class _Rejected(Exception):
 
 
 def _new_resource_ref() -> str:
-    return "aqf1_" + base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+    return db.new_opaque_ref("aqf1_")
 
 
 def _raw_digest(raw: bytes) -> str:
-    # Plain sha256 of already-final bytes, with no canonicalization step --
-    # unlike actionq_contracts.sha256_digest (imported below as
-    # contract_digest), which JSON-canonicalizes its input before hashing
-    # and so cannot be used for raw evidence bytes or a repr() descriptor.
-    return "sha256:" + hashlib.sha256(raw).hexdigest()
+    # db.raw_digest with no canonicalization step -- unlike
+    # actionq_contracts.sha256_digest (imported below as contract_digest),
+    # which JSON-canonicalizes its input before hashing and so cannot be
+    # used for raw evidence bytes or a repr() descriptor.
+    return db.raw_digest(raw)
 
 
 def _decision_from_row(row: Any, *, replayed: bool) -> CommandDecision:
@@ -102,6 +104,15 @@ class FederationAuthority:
 
     def _q(self, table: str) -> str:
         return db.qname(self.schema, table)
+
+    def _lock(self, conn: Any, key: str) -> None:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
+
+    def _reject_duplicate(self, conn: Any, *, table: str, where: str, params: tuple[Any, ...],
+                          code: str, message: str, resource_ref: str, before_revision: int) -> None:
+        exists = conn.execute(f"SELECT 1 FROM {self._q(table)} WHERE {where}", params).fetchone()
+        if exists:
+            raise _Rejected(code, message, resource_ref=resource_ref, before_revision=before_revision)
 
     def _response(self, *, status: str, code: str, message: str, operation: str,
                   resource_ref: str | None, before_revision: int | None,
@@ -160,7 +171,7 @@ class FederationAuthority:
                          expected_revision: int, owner_required: bool = False) -> Any:
         self._require_resource_ref(resource_ref)
         self._require_revision(expected_revision)
-        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"federation-resource/v1:{resource_ref}",))
+        self._lock(conn, f"federation-resource/v1:{resource_ref}")
         row = self._resource(conn, resource_ref)
         if row is None:
             raise _Rejected("resource-not-found", "federation resource does not exist", resource_ref=resource_ref)
@@ -220,19 +231,12 @@ class FederationAuthority:
         with self.connection() as conn, conn.transaction():
             federation_schema.require_compatible(conn, self.schema)
             identity = (principal.environment, principal.principal_id, operation, idempotency_key)
-            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("\x1f".join(("federation-command/v1", *identity)),))
+            self._lock(conn, "\x1f".join(("federation-command/v1", *identity)))
             bound = conn.execute(
                 f"SELECT request_digest FROM {self._q('federation_idempotency_bindings')} "
                 "WHERE environment=%s AND principal_id=%s AND operation=%s AND idempotency_key=%s",
                 identity,
             ).fetchone()
-            prior = conn.execute(
-                f"SELECT * FROM {self._q('federation_command_decisions')} "
-                "WHERE environment=%s AND principal_id=%s AND operation=%s AND idempotency_key=%s AND request_digest=%s",
-                (*identity, request_digest),
-            ).fetchone()
-            if prior is not None:
-                return _decision_from_row(prior, replayed=True)
             if bound is not None and str(bound["request_digest"]) != request_digest:
                 return self._record_decision(
                     conn, principal=principal, operation=operation, idempotency_key=idempotency_key,
@@ -240,7 +244,23 @@ class FederationAuthority:
                     message="idempotency key was first bound to different canonical request bytes",
                     resource_ref=None, before_revision=None, after_revision=None,
                 )
-            if bound is None:
+            if bound is not None:
+                # A binding row and its matching decision row are only ever
+                # committed together (both inserted inside this same
+                # transaction, on every code path below) -- so a decision
+                # can only exist here when bound's digest already matches
+                # request_digest, which is exactly the case just confirmed
+                # above. No need to probe federation_command_decisions when
+                # bound is absent (nothing could be recorded yet) or when
+                # its digest differs (the conflict above already returned).
+                prior = conn.execute(
+                    f"SELECT * FROM {self._q('federation_command_decisions')} "
+                    "WHERE environment=%s AND principal_id=%s AND operation=%s AND idempotency_key=%s AND request_digest=%s",
+                    (*identity, request_digest),
+                ).fetchone()
+                if prior is not None:
+                    return _decision_from_row(prior, replayed=True)
+            else:
                 conn.execute(
                     f"INSERT INTO {self._q('federation_idempotency_bindings')} "
                     "(environment, principal_id, operation, idempotency_key, request_digest) VALUES (%s,%s,%s,%s,%s)",
@@ -289,7 +309,7 @@ class FederationAuthority:
                 raise _Rejected("expected-absence-required", "create requires expected_revision 0")
             selected = _new_resource_ref() if resource_ref is None else resource_ref
             self._require_resource_ref(selected)
-            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"federation-resource/v1:{selected}",))
+            self._lock(conn, f"federation-resource/v1:{selected}")
             if self._resource(conn, selected) is not None:
                 raise _Rejected("resource-exists", "federation resource already exists", resource_ref=selected)
             conn.execute(
@@ -321,10 +341,7 @@ class FederationAuthority:
             # graph that predates the other edge.  Lock both endpoints in a
             # stable order before checking ownership, existence and cycles.
             for locked_ref in sorted((source_ref, target_ref)):
-                conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                    (f"federation-resource/v1:{locked_ref}",),
-                )
+                self._lock(conn, f"federation-resource/v1:{locked_ref}")
             if relation_type in CYCLIC_RELATION_TYPES:
                 # Endpoint locks alone only serialize writes that share an
                 # endpoint. Two concurrent adds with pairwise-disjoint
@@ -335,12 +352,10 @@ class FederationAuthority:
                 # types is still a cycle), so every cycle-checked write locks
                 # the whole CYCLIC_RELATION_TYPES group, not just its own
                 # relation type, closing the gap for both same-type and
-                # cross-type races.
-                for cyclic_type in sorted(CYCLIC_RELATION_TYPES):
-                    conn.execute(
-                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                        (f"federation-cycle/v1:{cyclic_type}",),
-                    )
+                # cross-type races. Uses the same precomputed member order
+                # as the reachability CTE below so the two never drift.
+                for cyclic_type in _CYCLIC_RELATION_TYPES_ORDERED:
+                    self._lock(conn, f"federation-cycle/v1:{cyclic_type}")
             source = self._locked_existing(conn, principal=principal, resource_ref=source_ref, expected_revision=expected_revision, owner_required=True)
             if source_ref == target_ref:
                 raise _Rejected("self-relation", "self relations are forbidden", resource_ref=source_ref, before_revision=int(source["revision"]))
@@ -349,24 +364,26 @@ class FederationAuthority:
                 raise _Rejected("target-not-found", "relation target does not exist", resource_ref=source_ref, before_revision=int(source["revision"]))
             if target["state"] == "superseded":
                 raise _Rejected("target-superseded", "relation target is superseded and immutable", resource_ref=source_ref, before_revision=int(source["revision"]))
-            exists = conn.execute(
-                f"SELECT 1 FROM {self._q('federation_relations')} WHERE source_ref=%s AND relation_type=%s AND target_ref=%s",
-                (source_ref, relation_type, target_ref),
-            ).fetchone()
-            if exists:
-                raise _Rejected("relation-exists", "directed relation already exists", resource_ref=source_ref, before_revision=int(source["revision"]))
+            self._reject_duplicate(
+                conn, table="federation_relations",
+                where="source_ref=%s AND relation_type=%s AND target_ref=%s", params=(source_ref, relation_type, target_ref),
+                code="relation-exists", message="directed relation already exists",
+                resource_ref=source_ref, before_revision=int(source["revision"]),
+            )
             if relation_type in CYCLIC_RELATION_TYPES:
                 # parent-of and depends-on are checked as one joint acyclic
                 # graph: a cycle formed by mixing both types (A --parent-of->
                 # B, B --depends-on-> A) is still a live cycle, so reachability
                 # traverses every edge whose type is in CYCLIC_RELATION_TYPES
-                # rather than only the type being added.
+                # rather than only the type being added. Uses the same
+                # precomputed member order as the advisory lock above so the
+                # two never drift.
                 cycle = conn.execute(
                     f"WITH RECURSIVE reachable(ref) AS ("
                     f"SELECT target_ref FROM {self._q('federation_relations')} WHERE source_ref=%s AND relation_type = ANY(%s) "
                     f"UNION SELECT relation.target_ref FROM {self._q('federation_relations')} relation JOIN reachable ON relation.source_ref=reachable.ref WHERE relation.relation_type = ANY(%s)) "
                     "SELECT 1 FROM reachable WHERE ref=%s LIMIT 1",
-                    (target_ref, list(CYCLIC_RELATION_TYPES), list(CYCLIC_RELATION_TYPES), source_ref),
+                    (target_ref, _CYCLIC_RELATION_TYPES_ORDERED, _CYCLIC_RELATION_TYPES_ORDERED, source_ref),
                 ).fetchone()
                 if cycle:
                     raise _Rejected("relation-cycle", "relation would create a directed cycle", resource_ref=source_ref, before_revision=int(source["revision"]))
@@ -390,9 +407,11 @@ class FederationAuthority:
                 raise _Rejected("invalid-execution-reference", "execution_ref is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
             if not isinstance(assurance_type, str) or not assurance_type:
                 raise _Rejected("invalid-assurance-type", "assurance_type is required", resource_ref=resource_ref, before_revision=int(row["revision"]))
-            exists = conn.execute(f"SELECT 1 FROM {self._q('federation_execution_refs')} WHERE resource_ref=%s AND execution_ref=%s", (resource_ref, execution_ref)).fetchone()
-            if exists:
-                raise _Rejected("execution-reference-exists", "execution reference already exists", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            self._reject_duplicate(
+                conn, table="federation_execution_refs", where="resource_ref=%s AND execution_ref=%s", params=(resource_ref, execution_ref),
+                code="execution-reference-exists", message="execution reference already exists",
+                resource_ref=resource_ref, before_revision=int(row["revision"]),
+            )
             def insert(after: int) -> None:
                 conn.execute(f"INSERT INTO {self._q('federation_execution_refs')} (resource_ref, execution_ref, assurance_type, source_revision) VALUES (%s,%s,%s,%s)", (resource_ref, execution_ref, assurance_type, after))
             before, after = self._advance(conn, row=row, principal=principal, operation="record-execution-ref", state=str(row["state"]), payload=request, side_effect=insert)
@@ -450,9 +469,11 @@ class FederationAuthority:
             expected_ref = "artifact:" + actual_digest
             if evidence_ref != expected_ref:
                 raise _Rejected("evidence-digest-mismatch", "evidence bytes do not match the content-addressed reference", resource_ref=resource_ref, before_revision=int(row["revision"]))
-            exists = conn.execute(f"SELECT 1 FROM {self._q('federation_evidence')} WHERE resource_ref=%s AND evidence_ref=%s", (resource_ref, evidence_ref)).fetchone()
-            if exists:
-                raise _Rejected("evidence-exists", "evidence reference already exists", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            self._reject_duplicate(
+                conn, table="federation_evidence", where="resource_ref=%s AND evidence_ref=%s", params=(resource_ref, evidence_ref),
+                code="evidence-exists", message="evidence reference already exists",
+                resource_ref=resource_ref, before_revision=int(row["revision"]),
+            )
             def insert(after: int) -> None:
                 conn.execute(f"INSERT INTO {self._q('federation_evidence')} (resource_ref, evidence_ref, evidence_digest, assurance_type, source_revision) VALUES (%s,%s,%s,%s,%s)", (resource_ref, evidence_ref, actual_digest, assurance_type, after))
             before, after = self._advance(conn, row=row, principal=principal, operation="record-evidence", state="evidence-recorded", payload=request, side_effect=insert)
@@ -506,9 +527,11 @@ class FederationAuthority:
             row = self._locked_existing(conn, principal=principal, resource_ref=resource_ref, expected_revision=expected_revision)
             if str(row["state"]) not in {"accepted", "rejected"} or not isinstance(fact_ref, str) or not fact_ref:
                 raise _Rejected("invalid-state-transition", "settlement requires accepted/rejected state and a cited fact", resource_ref=resource_ref, before_revision=int(row["revision"]))
-            exists = conn.execute(f"SELECT 1 FROM {self._q('federation_settlements')} WHERE resource_ref=%s", (resource_ref,)).fetchone()
-            if exists:
-                raise _Rejected("settlement-exists", "resource has already been settled", resource_ref=resource_ref, before_revision=int(row["revision"]))
+            self._reject_duplicate(
+                conn, table="federation_settlements", where="resource_ref=%s", params=(resource_ref,),
+                code="settlement-exists", message="resource has already been settled",
+                resource_ref=resource_ref, before_revision=int(row["revision"]),
+            )
             def insert(after: int) -> None:
                 conn.execute(f"INSERT INTO {self._q('federation_settlements')} (resource_ref, source_revision, fact_ref, reconciled_by) VALUES (%s,%s,%s,%s)", (resource_ref, after, fact_ref, principal.principal_id))
             before, after = self._advance(conn, row=row, principal=principal, operation="record-settlement", state=str(row["state"]), payload=request, side_effect=insert)
