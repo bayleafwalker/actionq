@@ -478,6 +478,19 @@ def test_create_is_action_independent_and_response_loss_replays_exact_bytes(post
         assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_command_decisions')}").fetchone()["n"] == 2
 
 
+def test_create_rejects_an_explicit_empty_string_resource_ref_instead_of_substituting(postgres_urls) -> None:
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("creator", "federation.create")
+
+    decision = authority.create(principal=creator, idempotency_key="create-empty", expected_revision=0, resource_ref="")
+
+    assert decision.status == "rejected" and decision.code == "invalid-resource-ref"
+    with db.connect(postgres_urls["admin"]) as conn:
+        assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_resources')}").fetchone()["n"] == 0
+
+
 def test_non_string_free_form_fields_are_rejected_not_silently_stored_or_crashed(postgres_urls) -> None:
     # execution_ref, assurance_type, policy_ref, evidence_ref, and fact_ref
     # were only truthiness-checked, not type-checked. A non-str value that is
@@ -865,6 +878,31 @@ def test_disjoint_endpoint_relation_attempts_cannot_jointly_create_a_cycle(postg
     # edge, the other stays at 1 because its attempt was rejected.
     total_revision = sum(authority.snapshot(principal=reader, resource_ref=nodes[name])["revision"] for name in "abcd")
     assert total_revision == 7
+
+
+def test_mixed_parent_of_depends_on_relations_still_reject_a_cycle(postgres_urls) -> None:
+    # CYCLIC_RELATION_TYPES groups parent-of and depends-on as one joint
+    # acyclic graph: A --parent-of--> B then B --depends-on--> A must be
+    # rejected even though no single relation_type's own edges form a cycle.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    owner_a = _principal("a", "federation.create", "federation.relate")
+    owner_b = _principal("b", "federation.create", "federation.relate")
+    left = authority.create(principal=owner_a, idempotency_key="left", expected_revision=0).resource_ref
+    right = authority.create(principal=owner_b, idempotency_key="right", expected_revision=0).resource_ref
+
+    forward = authority.add_relation(
+        principal=owner_a, idempotency_key="a-parent-of-b", source_ref=left,
+        relation_type="parent-of", target_ref=right, expected_revision=1,
+    )
+    backward = authority.add_relation(
+        principal=owner_b, idempotency_key="b-depends-on-a", source_ref=right,
+        relation_type="depends-on", target_ref=left, expected_revision=1,
+    )
+
+    assert forward.status == "accepted"
+    assert backward.status == "rejected" and backward.code == "relation-cycle"
 
 
 def test_postgres_roles_separate_migration_command_and_end_actor_authority(postgres_urls) -> None:

@@ -287,7 +287,7 @@ class FederationAuthority:
             self._require_revision(expected_revision)
             if expected_revision != 0:
                 raise _Rejected("expected-absence-required", "create requires expected_revision 0")
-            selected = resource_ref or _new_resource_ref()
+            selected = _new_resource_ref() if resource_ref is None else resource_ref
             self._require_resource_ref(selected)
             conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"federation-resource/v1:{selected}",))
             if self._resource(conn, selected) is not None:
@@ -330,13 +330,17 @@ class FederationAuthority:
                 # endpoint. Two concurrent adds with pairwise-disjoint
                 # endpoints (e.g. existing A->B, C->D; concurrent B->C and
                 # D->A) would each pass a cycle probe against committed-only
-                # state and jointly create a cycle. A lock scoped to the
-                # relation type serializes every cycle-checked write of that
-                # type, closing the gap.
-                conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                    (f"federation-cycle/v1:{relation_type}",),
-                )
+                # state and jointly create a cycle. `parent-of` and
+                # `depends-on` share one acyclic graph (a cycle mixing both
+                # types is still a cycle), so every cycle-checked write locks
+                # the whole CYCLIC_RELATION_TYPES group, not just its own
+                # relation type, closing the gap for both same-type and
+                # cross-type races.
+                for cyclic_type in sorted(CYCLIC_RELATION_TYPES):
+                    conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"federation-cycle/v1:{cyclic_type}",),
+                    )
             source = self._locked_existing(conn, principal=principal, resource_ref=source_ref, expected_revision=expected_revision, owner_required=True)
             if source_ref == target_ref:
                 raise _Rejected("self-relation", "self relations are forbidden", resource_ref=source_ref, before_revision=int(source["revision"]))
@@ -352,12 +356,17 @@ class FederationAuthority:
             if exists:
                 raise _Rejected("relation-exists", "directed relation already exists", resource_ref=source_ref, before_revision=int(source["revision"]))
             if relation_type in CYCLIC_RELATION_TYPES:
+                # parent-of and depends-on are checked as one joint acyclic
+                # graph: a cycle formed by mixing both types (A --parent-of->
+                # B, B --depends-on-> A) is still a live cycle, so reachability
+                # traverses every edge whose type is in CYCLIC_RELATION_TYPES
+                # rather than only the type being added.
                 cycle = conn.execute(
                     f"WITH RECURSIVE reachable(ref) AS ("
-                    f"SELECT target_ref FROM {self._q('federation_relations')} WHERE source_ref=%s AND relation_type=%s "
-                    f"UNION SELECT relation.target_ref FROM {self._q('federation_relations')} relation JOIN reachable ON relation.source_ref=reachable.ref WHERE relation.relation_type=%s) "
+                    f"SELECT target_ref FROM {self._q('federation_relations')} WHERE source_ref=%s AND relation_type = ANY(%s) "
+                    f"UNION SELECT relation.target_ref FROM {self._q('federation_relations')} relation JOIN reachable ON relation.source_ref=reachable.ref WHERE relation.relation_type = ANY(%s)) "
                     "SELECT 1 FROM reachable WHERE ref=%s LIMIT 1",
-                    (target_ref, relation_type, relation_type, source_ref),
+                    (target_ref, list(CYCLIC_RELATION_TYPES), list(CYCLIC_RELATION_TYPES), source_ref),
                 ).fetchone()
                 if cycle:
                     raise _Rejected("relation-cycle", "relation would create a directed cycle", resource_ref=source_ref, before_revision=int(source["revision"]))
