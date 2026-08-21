@@ -233,7 +233,6 @@ _FOREIGN_KEY_UPDATE_ACTION = "a"  # NO ACTION, the unspecified-clause default
 # expression tuple as pg_get_indexdef renders each key, partial predicate).
 _REQUIRED_INDEXES: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {
     "federation_relations_target_idx": ("federation_relations", False, ("target_ref", "relation_type", "source_ref"), None),
-    "federation_changes_order_idx": ("federation_resource_changes", False, ("resource_ref", "revision"), None),
 }
 
 _DEFAULT_CAST_RE = re.compile(r"::[A-Za-z0-9_ \"]+(\([^)]*\))?\s*$")

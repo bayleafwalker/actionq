@@ -100,4 +100,3 @@ CREATE TABLE {{schema}}.federation_command_decisions (
 );
 
 CREATE INDEX federation_relations_target_idx ON {{schema}}.federation_relations(target_ref, relation_type, source_ref);
-CREATE INDEX federation_changes_order_idx ON {{schema}}.federation_resource_changes(resource_ref, revision);
