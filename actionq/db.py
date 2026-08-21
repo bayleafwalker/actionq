@@ -68,6 +68,10 @@ class ClaimRejected(ActionQError):
         self.requested_by = requested_by
 
 
+def lock(conn: Any, key: str) -> None:
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
+
+
 def raw_digest(raw: bytes) -> str:
     """Plain sha256 of already-final bytes, with no canonicalization step."""
     return "sha256:" + hashlib.sha256(raw).hexdigest()

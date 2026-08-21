@@ -106,7 +106,7 @@ class FederationAuthority:
         return db.qname(self.schema, table)
 
     def _lock(self, conn: Any, key: str) -> None:
-        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
+        db.lock(conn, key)
 
     def _reject_duplicate(self, conn: Any, *, table: str, where: str, params: tuple[Any, ...],
                           code: str, message: str, resource_ref: str, before_revision: int) -> None:

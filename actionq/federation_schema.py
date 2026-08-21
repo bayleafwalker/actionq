@@ -604,7 +604,7 @@ def migrate(conn: Any, schema: str | None = None) -> dict[str, Any]:
     assets = load_migrations()
     applied_now: list[int] = []
     with conn.transaction():
-        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"actionq:federation:{selected}:schema-migration",))
+        db.lock(conn, f"actionq:federation:{selected}:schema-migration")
         conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{selected}"')
         conn.execute(
             f"CREATE TABLE IF NOT EXISTS {db.qname(selected, MIGRATION_TABLE)} ("
