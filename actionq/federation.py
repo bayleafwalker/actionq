@@ -237,22 +237,16 @@ class FederationAuthority:
                 "WHERE environment=%s AND principal_id=%s AND operation=%s AND idempotency_key=%s",
                 identity,
             ).fetchone()
-            if bound is not None and str(bound["request_digest"]) != request_digest:
-                return self._record_decision(
-                    conn, principal=principal, operation=operation, idempotency_key=idempotency_key,
-                    request_digest=request_digest, status="rejected", code="idempotency-key-conflict",
-                    message="idempotency key was first bound to different canonical request bytes",
-                    resource_ref=None, before_revision=None, after_revision=None,
-                )
             if bound is not None:
-                # A binding row and its matching decision row are only ever
-                # committed together (both inserted inside this same
-                # transaction, on every code path below) -- so a decision
-                # can only exist here when bound's digest already matches
-                # request_digest, which is exactly the case just confirmed
-                # above. No need to probe federation_command_decisions when
-                # bound is absent (nothing could be recorded yet) or when
-                # its digest differs (the conflict above already returned).
+                # A decision row can exist for *any* request_digest ever
+                # seen under this identity -- not only the bound one: a
+                # rejected idempotency-key-conflict decision below is
+                # itself recorded keyed by the conflicting request_digest,
+                # so a repeat of that exact conflicting call must replay it
+                # rather than re-insert into command_decisions' (identity,
+                # request_digest) primary key a second time. Nothing can be
+                # recorded yet when bound is absent, so the probe is
+                # skipped in that case only.
                 prior = conn.execute(
                     f"SELECT * FROM {self._q('federation_command_decisions')} "
                     "WHERE environment=%s AND principal_id=%s AND operation=%s AND idempotency_key=%s AND request_digest=%s",
@@ -260,6 +254,13 @@ class FederationAuthority:
                 ).fetchone()
                 if prior is not None:
                     return _decision_from_row(prior, replayed=True)
+                if str(bound["request_digest"]) != request_digest:
+                    return self._record_decision(
+                        conn, principal=principal, operation=operation, idempotency_key=idempotency_key,
+                        request_digest=request_digest, status="rejected", code="idempotency-key-conflict",
+                        message="idempotency key was first bound to different canonical request bytes",
+                        resource_ref=None, before_revision=None, after_revision=None,
+                    )
             else:
                 conn.execute(
                     f"INSERT INTO {self._q('federation_idempotency_bindings')} "

@@ -478,6 +478,34 @@ def test_create_is_action_independent_and_response_loss_replays_exact_bytes(post
         assert conn.execute(f"SELECT count(*) AS n FROM {db.qname(selected, 'federation_command_decisions')}").fetchone()["n"] == 2
 
 
+def test_repeating_the_exact_same_conflicting_call_replays_its_rejection_instead_of_crashing(postgres_urls) -> None:
+    # A rejected idempotency-key-conflict decision is itself durably
+    # recorded, keyed by (identity, the conflicting request_digest) --
+    # federation_command_decisions' primary key. A caller retrying that
+    # exact same conflicting call (e.g. after a dropped response) must
+    # replay that stored rejection, not attempt a second INSERT at the
+    # same primary key and raise an unhandled UniqueViolation.
+    selected = _new_schema()
+    _migrate(postgres_urls["admin"], selected)
+    authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)
+    creator = _principal("creator", "federation.create")
+
+    authority.create(principal=creator, idempotency_key="create-1", expected_revision=0)
+    first_conflict = authority.create(
+        principal=creator, idempotency_key="create-1", expected_revision=0,
+        resource_ref="aqf1_" + "A" * 43,
+    )
+    second_conflict = authority.create(
+        principal=creator, idempotency_key="create-1", expected_revision=0,
+        resource_ref="aqf1_" + "A" * 43,
+    )
+
+    assert first_conflict.status == "rejected" and first_conflict.code == "idempotency-key-conflict"
+    assert second_conflict.replayed is True
+    assert second_conflict.response_bytes == first_conflict.response_bytes
+    assert second_conflict.response_digest == first_conflict.response_digest
+
+
 def test_create_rejects_an_explicit_empty_string_resource_ref_instead_of_substituting(postgres_urls) -> None:
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
