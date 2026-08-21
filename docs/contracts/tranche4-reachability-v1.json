@@ -38,6 +38,10 @@
         "actionq.completion_log|from|actionq|schema",
         "actionq.db|from|actionq|schema",
         "actionq.db|from|actionq.cas|_DaemonCAS",
+        "actionq.federation|from|actionq|db",
+        "actionq.federation|from|actionq|federation_schema",
+        "actionq.federation|from|actionq_contracts|canonical_bytes,sha256_digest",
+        "actionq.federation_schema|from|actionq|db",
         "actionq.schema|from|actionq|db",
         "actionq.vuoro|from|actionq|db",
         "actionq.vuoro|from|actionq.application|ActionQApplication,InvocationProvenance",
@@ -371,6 +375,7 @@
         "actionq/application_outbox.py",
         "actionq/cli.py",
         "actionq/db.py",
+        "actionq/federation.py",
         "actionq/schema.py",
         "actionq/vuoro.py",
         "docs/contracts/action-resource-owner-v1.md",
@@ -384,6 +389,7 @@
         "tests/test_application_structure.py",
         "tests/test_completion_log_integration.py",
         "tests/test_completion_outbox.py",
+        "tests/test_federation_revision_authority.py",
         "tests/test_integration_immutable_actions.py",
         "tests/test_integration_postgres.py",
         "tests/test_release_contract.py",
@@ -840,7 +846,7 @@
   ],
   "bound_constant_dispositions": [
     {"path":"actionq/action_resource.py","names":["RESOURCE_RE","TERMINAL","OUTCOMES","PROJECTION_KEYS","SESSION_KEYS","EVENT_KEYS","ROOT_STORAGE_KEYS","SESSION_STORAGE_KEYS","EVENT_STORAGE_KEYS"],"disposition":"retain-as-frozen-archive"},
-    {"path":"actionq/schema.py","names":["DOMAIN","API_VERSION","MIN_SCHEMA_VERSION","MAX_SCHEMA_VERSION","PRE_MIGRATION_BRIDGE_VERSION","MIGRATION_TABLE","_MIGRATION_RE","_COLUMN_SHAPE","_REQUIRED_COLUMNS","_REQUIRED_CONSTRAINT_COUNTS","_REQUIRED_INDEXES","Migration"],"disposition":"retain-as-frozen-archive"},
+    {"path":"actionq/schema.py","names":["DOMAIN","API_VERSION","MIN_SCHEMA_VERSION","MAX_SCHEMA_VERSION","PRE_MIGRATION_BRIDGE_VERSION","MIGRATION_TABLE","_MIGRATION_RE","_COLUMN_SHAPE","_REQUIRED_COLUMNS","_REQUIRED_CONSTRAINT_COUNTS","_REQUIRED_INDEXES","Migration","_row_value"],"disposition":"retain-as-frozen-archive"},
     {"path":"actionq/db.py","names":["MAX_CHAIN_DEPTH","DEFAULT_RATE_LIMIT_PER_HOUR","SCHEMA_RE","SESSION_EVENT_TYPES","_ARTIFACT_REF_RE","_GIT_OBJECT_RE","_ATTEMPT_ID_RE","_IMMUTABLE_REF_RE","_IMMUTABLE_DIGEST_RE","_IMMUTABLE_ROLE_CONTRACTS","_GROUP_CONTRACT_ID","_PLAN_REF_RE"],"disposition":"retain-as-frozen-archive"},
     {"path":"actionq/completion_log.py","names":["SCHEMA_VERSION","_TERMINAL_REASONS"],"disposition":"replace-by-federation"},
     {"path":"actionq/completion_outbox.py","names":["SCHEMA_VERSION","DEFAULT_OUTBOX_PATH","MAX_RETRY_SECONDS","DEFAULT_ACK_RETENTION_SECONDS","MAX_ACK_RETENTION_SECONDS","SQLITE_BUSY_TIMEOUT_SECONDS","SQLITE_LOCK_RETRY_SECONDS","_SAFE_ERROR_CLASSES"],"disposition":"replace-by-federation"},
@@ -979,7 +985,7 @@
     {
       "id": "monolithic-db-seam",
       "path": "actionq/db.py",
-      "symbols": ["ActionQError", "NoActionAvailable", "ClaimRejected", "ClaimRejected.__init__", "receipt_digest", "consume_runner_request", "immutable_input_set_digest", "_immutable_snapshot", "immutable_spec_input_refs", "create_immutable_action", "register_publication", "_import_psycopg", "schema_name", "qname", "connect", "json_default", "to_json", "parse_json", "_event_payload", "_text", "_parse_timestamp", "_session_deadline", "summarize_sessions", "migrate", "check_compatibility", "require_compatible", "insert_event", "event_payload_with_provenance", "get_action", "redact_action", "_rate_limited_source", "enqueue", "prune_dispatch_observation_events", "list_actions", "_json_list", "summarize_dispatches", "list_dispatches", "_group_projection", "get_execution_group", "list_execution_groups", "realize_execution_group", "stop_execution_group", "action_events", "_validate_immutable_claim", "claim", "_runtime_schema_version", "_claim_schema3", "_renewal_rejection_reason", "renew", "_transition_terminal", "complete", "fail", "reject", "settle_dispatch_result", "validate_dispatch_result", "_verify_dispatch_result_referent", "cancel", "acknowledge_cancellation", "reap_cancellations", "sweep", "list_events", "follow_events", "list_sessions"],
+      "symbols": ["ActionQError", "NoActionAvailable", "ClaimRejected", "ClaimRejected.__init__", "lock", "raw_digest", "receipt_digest", "new_opaque_ref", "consume_runner_request", "immutable_input_set_digest", "_immutable_snapshot", "immutable_spec_input_refs", "create_immutable_action", "register_publication", "_import_psycopg", "schema_name", "qname", "row_value", "migration_ledger_exists", "connect", "json_default", "to_json", "parse_json", "_event_payload", "_text", "_parse_timestamp", "_session_deadline", "summarize_sessions", "migrate", "check_compatibility", "require_compatible", "insert_event", "event_payload_with_provenance", "get_action", "redact_action", "_rate_limited_source", "enqueue", "prune_dispatch_observation_events", "list_actions", "_json_list", "summarize_dispatches", "list_dispatches", "_group_projection", "get_execution_group", "list_execution_groups", "realize_execution_group", "stop_execution_group", "action_events", "_validate_immutable_claim", "claim", "_runtime_schema_version", "_claim_schema3", "_renewal_rejection_reason", "renew", "_transition_terminal", "complete", "fail", "reject", "settle_dispatch_result", "validate_dispatch_result", "_verify_dispatch_result_referent", "cancel", "acknowledge_cancellation", "reap_cancellations", "sweep", "list_events", "follow_events", "list_sessions"],
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "Later splitting loses a current facade callable, preserves claim/lease in storage, or leaves db/schema circular through the new storage seam."
@@ -1001,9 +1007,25 @@
       "falsifying_test": "Runner proof becomes permission to create or mutate a federation resource."
     },
     {
+      "id": "federation-v1-command-authority",
+      "path": "actionq/federation.py",
+      "symbols": ["FederationPrincipal", "FederationPrincipal.__post_init__", "FederationPrincipal.authenticated", "CommandDecision", "CommandDecision.response", "_Rejected", "_Rejected.__init__", "_new_resource_ref", "_raw_digest", "_decision_from_row", "FederationAuthority", "FederationAuthority.__init__", "FederationAuthority._q", "FederationAuthority._lock", "FederationAuthority._reject_duplicate", "FederationAuthority._response", "FederationAuthority._record_decision", "FederationAuthority._resource", "FederationAuthority._require_resource_ref", "FederationAuthority._require_revision", "FederationAuthority._require_authority", "FederationAuthority._locked_existing", "FederationAuthority._advance", "FederationAuthority._execute", "FederationAuthority.create", "FederationAuthority.add_relation", "FederationAuthority.record_execution_ref", "FederationAuthority.record_evidence", "FederationAuthority.decide_acceptance", "FederationAuthority.record_settlement", "FederationAuthority.supersede", "FederationAuthority.snapshot"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "The federation root imports execution policy, omits ACL/CAS/idempotency authority, or gains runtime/catalog side effects."
+    },
+    {
+      "id": "federation-v1-schema-authority",
+      "path": "actionq/federation_schema.py",
+      "symbols": ["FederationSchemaError", "Compatibility", "Compatibility.as_dict", "configured_schema", "load_migrations", "_statements", "_ledger_exists", "_strip_pg_catalog_qualifier", "_canonical_default", "_column_issues", "_constraint_issues", "_index_issues", "_shape_issues", "check_compatibility", "require_compatible", "migrate", "configure_role_boundaries"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Federation migrations enter the execution domain, compatibility is conflated, or database roles can cross their frozen authority boundary."
+    },
+    {
       "id": "execution-schema-and-migration-mechanics",
       "path": "actionq/schema.py",
-      "symbols": ["SchemaCompatibilityError", "SchemaMigrationError", "Compatibility", "Compatibility.as_dict", "_migration_root", "load_migrations", "_render", "_statements", "_row_value", "_ledger_exists", "_applied_migrations", "_ledger_report", "_require_schema8_dispatch_root_quiescence", "_lock_schema8_dispatch_roots", "_data_tables_exist", "_canonical_sql", "_without_redundant_outer_parentheses", "_canonical_default", "_runtime_principal_issue", "_shape_issues", "_unversioned_v1_shape_issues", "_schema3_bridge_shape_issues", "_has_legacy_v1_status_constraint", "check_compatibility", "require_compatible", "_grant_runtime_privileges", "_completion_role", "_grant_completion_privileges", "migrate"],
+      "symbols": ["SchemaCompatibilityError", "SchemaMigrationError", "Compatibility", "Compatibility.as_dict", "_migration_root", "load_migrations", "_render", "_statements", "_ledger_exists", "_applied_migrations", "_ledger_report", "_require_schema8_dispatch_root_quiescence", "_lock_schema8_dispatch_roots", "_data_tables_exist", "_canonical_sql", "_without_redundant_outer_parentheses", "_canonical_default", "_runtime_principal_issue", "_shape_issues", "_unversioned_v1_shape_issues", "_schema3_bridge_shape_issues", "_has_legacy_v1_status_constraint", "check_compatibility", "require_compatible", "_grant_runtime_privileges", "_completion_role", "_grant_completion_privileges", "migrate"],
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "Execution migration bytes/order/checksums drift, execution 013 appears, or schema mechanics keep importing the monolithic db after seam extraction."

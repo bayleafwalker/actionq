@@ -51,7 +51,7 @@ dev = ["pytest>=8"]
 include = ["actionq*"]
 
 [tool.setuptools.package-data]
-actionq = ["migrations/*.sql"]
+actionq = ["migrations/*.sql", "federation_migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

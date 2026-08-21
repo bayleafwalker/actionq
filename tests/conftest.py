@@ -94,6 +94,7 @@ def _needs_postgres(config) -> bool:
         or "runner_auth" in argument
         or "cross_authority" in argument
         or "dispatch_settlement" in argument
+        or "federation_revision_authority" in argument
         for argument in args
     )
 

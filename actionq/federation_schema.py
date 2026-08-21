@@ -1,0 +1,710 @@
+"""Migration and compatibility authority for ``federation-schema/v1``.
+
+This domain is physically and logically independent of the frozen execution
+schema.  In particular, it never imports or delegates to ``actionq.schema``.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import asdict, dataclass
+from importlib import resources
+from typing import Any
+
+from vuoro_schema_runtime import MigrationAsset, compatibility_report, sha256_text, validate_contiguous_migrations
+
+from . import db
+
+
+DOMAIN = "federation"
+API_VERSION = "v1"
+COMPATIBILITY_LABEL = "federation-schema/v1"
+MIN_SCHEMA_VERSION = 1
+MAX_SCHEMA_VERSION = 1
+MIGRATION_TABLE = "schema_migrations"
+DEFAULT_SCHEMA = "actionq_federation"
+_MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_[a-z0-9_]+\.sql$")
+REQUIRED_TABLES = (
+    MIGRATION_TABLE, "federation_resources", "federation_resource_changes",
+    "federation_relations", "federation_execution_refs", "federation_evidence",
+    "federation_acceptance_decisions", "federation_settlements",
+    "federation_idempotency_bindings", "federation_command_decisions",
+)
+
+# Column shape: table -> column -> (data_type, is_nullable, canonical_default).
+# canonical_default is compared against information_schema.column_default after
+# stripping type casts and quoting -- None means "no default".
+_COLUMN_SHAPE: dict[str, dict[str, tuple[str, str, str | None]]] = {
+    MIGRATION_TABLE: {
+        "domain": ("text", "NO", None),
+        "version": ("integer", "NO", None),
+        "name": ("text", "NO", None),
+        "checksum": ("text", "NO", None),
+        "applied_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_resources": {
+        "resource_ref": ("text", "NO", None),
+        "owner_principal_id": ("text", "NO", None),
+        "state": ("text", "NO", None),
+        "revision": ("bigint", "NO", None),
+        "recovery_floor": ("bigint", "NO", "0"),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+        "updated_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_resource_changes": {
+        "resource_ref": ("text", "NO", None),
+        "revision": ("bigint", "NO", None),
+        "operation": ("text", "NO", None),
+        "state": ("text", "NO", None),
+        "actor_principal_id": ("text", "NO", None),
+        "payload_bytes": ("bytea", "NO", None),
+        "payload_digest": ("text", "NO", None),
+        "occurred_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_relations": {
+        "source_ref": ("text", "NO", None),
+        "relation_type": ("text", "NO", None),
+        "target_ref": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_execution_refs": {
+        "resource_ref": ("text", "NO", None),
+        "execution_ref": ("text", "NO", None),
+        "assurance_type": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_evidence": {
+        "resource_ref": ("text", "NO", None),
+        "evidence_ref": ("text", "NO", None),
+        "evidence_digest": ("text", "NO", None),
+        "assurance_type": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_acceptance_decisions": {
+        "resource_ref": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "outcome": ("text", "NO", None),
+        "policy_ref": ("text", "NO", None),
+        "evidence_ref": ("text", "YES", None),
+        "decided_by": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_settlements": {
+        "resource_ref": ("text", "NO", None),
+        "source_revision": ("bigint", "NO", None),
+        "fact_ref": ("text", "NO", None),
+        "reconciled_by": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_idempotency_bindings": {
+        "environment": ("text", "NO", None),
+        "principal_id": ("text", "NO", None),
+        "operation": ("text", "NO", None),
+        "idempotency_key": ("text", "NO", None),
+        "request_digest": ("text", "NO", None),
+        "created_at": ("timestamp with time zone", "NO", "now()"),
+    },
+    "federation_command_decisions": {
+        "environment": ("text", "NO", None),
+        "principal_id": ("text", "NO", None),
+        "operation": ("text", "NO", None),
+        "idempotency_key": ("text", "NO", None),
+        "request_digest": ("text", "NO", None),
+        "status": ("text", "NO", None),
+        "code": ("text", "NO", None),
+        "message": ("text", "NO", None),
+        "response_bytes": ("bytea", "NO", None),
+        "response_digest": ("text", "NO", None),
+        "resource_ref": ("text", "YES", None),
+        "before_revision": ("bigint", "YES", None),
+        "after_revision": ("bigint", "YES", None),
+        "decided_at": ("timestamp with time zone", "NO", "now()"),
+    },
+}
+
+# Constraint counts by pg_constraint.contype ('p'=primary key, 'f'=foreign key,
+# 'c'=check, 'u'=unique). PostgreSQL 18 also emits 'n' (not-null) catalog
+# entries for every NOT NULL column; those are validated via the nullability
+# field in _COLUMN_SHAPE instead, so 'n' is deliberately excluded here.
+_REQUIRED_CONSTRAINT_COUNTS: dict[str, dict[str, int]] = {
+    MIGRATION_TABLE: {"p": 1, "c": 1},
+    "federation_resources": {"p": 1, "c": 3},
+    "federation_resource_changes": {"p": 1, "f": 1, "c": 3},
+    "federation_relations": {"p": 1, "f": 2, "c": 3},
+    "federation_execution_refs": {"p": 1, "f": 1, "c": 1},
+    "federation_evidence": {"p": 1, "f": 1, "c": 2},
+    "federation_acceptance_decisions": {"p": 1, "f": 1, "c": 2},
+    "federation_settlements": {"p": 1, "f": 1, "c": 1},
+    "federation_idempotency_bindings": {"p": 1, "c": 1},
+    "federation_command_decisions": {"p": 1, "c": 5},
+}
+
+# Exact CHECK constraint bodies (pg_get_constraintdef output, deparsed by
+# PostgreSQL itself) per table. A count match alone lets any CHECK be
+# swapped for a same-count vacuous one (e.g. CHECK (true)) without being
+# noticed, so the deparsed expression is compared too.
+_REQUIRED_CHECK_EXPRESSIONS: dict[str, frozenset[str]] = {
+    MIGRATION_TABLE: frozenset({"CHECK ((version > 0))"}),
+    "federation_resources": frozenset({
+        "CHECK ((state = ANY (ARRAY['registered'::text, 'evidence-recorded'::text, 'accepted'::text, 'rejected'::text, 'superseded'::text])))",
+        "CHECK ((revision > 0))",
+        "CHECK ((recovery_floor = 0))",
+    }),
+    "federation_resource_changes": frozenset({
+        "CHECK ((revision > 0))",
+        "CHECK ((state = ANY (ARRAY['registered'::text, 'evidence-recorded'::text, 'accepted'::text, 'rejected'::text, 'superseded'::text])))",
+        "CHECK ((payload_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+    }),
+    "federation_relations": frozenset({
+        "CHECK ((relation_type = ANY (ARRAY['parent-of'::text, 'depends-on'::text, 'derived-from'::text, 'supersedes'::text])))",
+        "CHECK ((source_revision > 0))",
+        "CHECK ((source_ref <> target_ref))",
+    }),
+    "federation_execution_refs": frozenset({"CHECK ((source_revision > 0))"}),
+    "federation_evidence": frozenset({
+        "CHECK ((evidence_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+        "CHECK ((source_revision > 0))",
+    }),
+    "federation_acceptance_decisions": frozenset({
+        "CHECK ((outcome = ANY (ARRAY['accepted'::text, 'rejected'::text])))",
+        "CHECK ((source_revision > 0))",
+    }),
+    "federation_settlements": frozenset({"CHECK ((source_revision > 0))"}),
+    "federation_idempotency_bindings": frozenset({"CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text))"}),
+    "federation_command_decisions": frozenset({
+        "CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+        "CHECK ((status = ANY (ARRAY['accepted'::text, 'rejected'::text])))",
+        "CHECK ((response_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+        "CHECK (((before_revision IS NULL) OR (before_revision >= 0)))",
+        "CHECK (((after_revision IS NULL) OR (after_revision >= 0)))",
+    }),
+}
+
+# Exact PRIMARY KEY bodies (pg_get_constraintdef output), same rationale as
+# _REQUIRED_CHECK_EXPRESSIONS: a count match alone lets a PK's column
+# composition be swapped for anything of the same count. This is the sole
+# uniqueness guarantee behind, e.g., "one idempotency key binds one digest".
+_REQUIRED_PRIMARY_KEYS: dict[str, str] = {
+    MIGRATION_TABLE: "PRIMARY KEY (domain, version)",
+    "federation_resources": "PRIMARY KEY (resource_ref)",
+    "federation_resource_changes": "PRIMARY KEY (resource_ref, revision)",
+    "federation_relations": "PRIMARY KEY (source_ref, relation_type, target_ref)",
+    "federation_execution_refs": "PRIMARY KEY (resource_ref, execution_ref)",
+    "federation_evidence": "PRIMARY KEY (resource_ref, evidence_ref)",
+    "federation_acceptance_decisions": "PRIMARY KEY (resource_ref, source_revision)",
+    "federation_settlements": "PRIMARY KEY (resource_ref, source_revision)",
+    "federation_idempotency_bindings": "PRIMARY KEY (environment, principal_id, operation, idempotency_key)",
+    "federation_command_decisions": "PRIMARY KEY (environment, principal_id, operation, idempotency_key, request_digest)",
+}
+
+# Expected FOREIGN KEY shape: table -> set of local column tuples that must
+# each reference federation_resources(resource_ref) ON DELETE RESTRICT.
+#
+# This is deliberately structural (catalog OIDs and column names), not a
+# comparison against pg_get_constraintdef's rendered text. That text
+# qualifies the referenced table with its schema only when the table is NOT
+# already visible on search_path -- so the same, correct FK renders
+# differently depending on session search_path, the connecting role's name
+# (the implicit "$user" schema), or the federation schema simply being
+# "public". A schema=schema.federation_resources template (even with the
+# schema name quoted correctly) still hardcoded "always qualified" and
+# false-positived shape-mismatch -- or made migrate() itself unmigratable
+# when schema="public" -- on any of those. Comparing confrelid's actual
+# resolved (schema, table) and confkey's resolved column names sidesteps
+# rendering assumptions entirely: both are catalog lookups, never deparsed.
+_REQUIRED_FOREIGN_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "federation_resource_changes": (("resource_ref",),),
+    "federation_relations": (("source_ref",), ("target_ref",)),
+    "federation_execution_refs": (("resource_ref",),),
+    "federation_evidence": (("resource_ref",),),
+    "federation_acceptance_decisions": (("resource_ref",),),
+    "federation_settlements": (("resource_ref",),),
+}
+_FOREIGN_KEY_TARGET_TABLE = "federation_resources"
+_FOREIGN_KEY_TARGET_COLUMNS = ("resource_ref",)
+_FOREIGN_KEY_DELETE_ACTION = "r"  # RESTRICT (pg_constraint.confdeltype)
+_FOREIGN_KEY_UPDATE_ACTION = "a"  # NO ACTION, the unspecified-clause default
+
+# Non-primary-key indexes: index name -> (table, unique?, ordered column/
+# expression tuple as pg_get_indexdef renders each key, partial predicate).
+_REQUIRED_INDEXES: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {
+    "federation_relations_target_idx": ("federation_relations", False, ("target_ref", "relation_type", "source_ref"), None),
+}
+
+_DEFAULT_CAST_RE = re.compile(r"::[A-Za-z0-9_ \"]+(\([^)]*\))?\s*$")
+_PG_CATALOG_QUALIFIER_RE = re.compile(r"\bpg_catalog\.")
+
+
+class FederationSchemaError(db.ActionQError):
+    """The selected federation schema cannot be migrated or served safely."""
+
+
+@dataclass(frozen=True)
+class Compatibility:
+    domain: str
+    api_version: str
+    compatibility_label: str
+    observed_schema_version: int | None
+    state: str
+    compatible: bool
+    detail: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def configured_schema() -> str:
+    return db.schema_name(os.environ.get("ACTIONQ_FEDERATION_SCHEMA", DEFAULT_SCHEMA))
+
+
+def load_migrations() -> tuple[MigrationAsset, ...]:
+    root = resources.files("actionq").joinpath("federation_migrations")
+    result: list[MigrationAsset] = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        match = _MIGRATION_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        raw = path.read_text(encoding="utf-8")
+        result.append(MigrationAsset(int(match.group("version")), path.name, raw, sha256_text(raw)))
+    try:
+        contiguous = validate_contiguous_migrations(result)
+    except ValueError as exc:
+        raise FederationSchemaError(str(exc)) from exc
+    if [asset.version for asset in contiguous] != list(range(1, MAX_SCHEMA_VERSION + 1)):
+        raise FederationSchemaError("federation migration assets are not exactly contiguous v1")
+    return contiguous
+
+
+def _statements(asset: MigrationAsset, schema: str) -> tuple[str, ...]:
+    quoted = f'"{db.schema_name(schema)}"'
+    rendered = asset.sql.replace("{{schema}}", quoted)
+    if "{{schema}}" in rendered:
+        raise FederationSchemaError(f"unresolved schema placeholder in {asset.name}")
+    return tuple(statement.strip() for statement in rendered.split(";") if statement.strip())
+
+
+_row = db.row_value
+
+
+def _ledger_exists(conn: Any, schema: str) -> bool:
+    return db.migration_ledger_exists(conn, schema, MIGRATION_TABLE)
+
+
+def _strip_pg_catalog_qualifier(text: str) -> str:
+    """Undo PostgreSQL's pg_catalog-demoted rendering of built-in types and
+    functions (e.g. '...'::pg_catalog.text instead of '...'::text,
+    pg_catalog.now() instead of now()).
+
+    A connection whose search_path explicitly reorders pg_catalog behind a
+    schema that shadows a built-in name (deliberately, or via a same-named
+    object elsewhere) makes PostgreSQL qualify every reference to the real
+    built-in to disambiguate it -- a rendering difference with no bearing
+    on the schema's actual shape. Every expected string in this module
+    (_REQUIRED_CHECK_EXPRESSIONS, this function's own "now()" check below)
+    is written unqualified, so the observed text needs the same
+    normalization before comparison.
+    """
+    return _PG_CATALOG_QUALIFIER_RE.sub("", text)
+
+
+def _canonical_default(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = _strip_pg_catalog_qualifier(str(value).strip())
+    while True:
+        match = _DEFAULT_CAST_RE.search(text)
+        if match is None:
+            break
+        text = text[: match.start()].strip()
+    if len(text) >= 2 and text.startswith("'") and text.endswith("'"):
+        text = text[1:-1]
+    if text.lower().startswith("now("):
+        return "now()"
+    return text
+
+
+def _column_issues(conn: Any, schema: str) -> list[str]:
+    issues: list[str] = []
+    tables = tuple(_COLUMN_SHAPE)
+    rows = conn.execute(
+        "SELECT table_name, column_name, data_type, is_nullable, column_default "
+        "FROM information_schema.columns WHERE table_schema=%s AND table_name = ANY(%s)",
+        (schema, list(tables)),
+    ).fetchall()
+    observed: dict[str, dict[str, tuple[str, str, str | None]]] = {table: {} for table in tables}
+    for row in rows:
+        table = str(_row(row, "table_name"))
+        column = str(_row(row, "column_name", 1))
+        if table not in observed:
+            continue
+        if column not in _COLUMN_SHAPE[table]:
+            issues.append(f"column-unexpected:{table}.{column}")
+            continue
+        observed[table][column] = (
+            # information_schema.columns.data_type is subject to the same
+            # pg_catalog-demoted rendering as CHECK/default text (e.g. a
+            # domain literally named "text" shadowing the built-in ahead of
+            # pg_catalog on search_path renders every plain "text" column's
+            # data_type as "pg_catalog.text") -- same normalization needed.
+            _strip_pg_catalog_qualifier(str(_row(row, "data_type", 2))),
+            str(_row(row, "is_nullable", 3)),
+            _canonical_default(_row(row, "column_default", 4)),
+        )
+    for table, columns in _COLUMN_SHAPE.items():
+        for column, expected in columns.items():
+            actual = observed[table].get(column)
+            if actual is None:
+                issues.append(f"column-missing:{table}.{column}")
+                continue
+            expected_type, expected_nullable, expected_default = expected
+            if actual[0] != expected_type:
+                issues.append(f"column-type:{table}.{column}")
+            if actual[1] != expected_nullable:
+                issues.append(f"column-nullability:{table}.{column}")
+            if actual[2] != expected_default:
+                issues.append(f"column-default:{table}.{column}")
+    return issues
+
+
+def _constraint_issues(conn: Any, schema: str) -> list[str]:
+    issues: list[str] = []
+    tables = tuple(_REQUIRED_CONSTRAINT_COUNTS)
+    rows = conn.execute(
+        """SELECT relation.relname AS table_name, constraint_record.contype AS contype,
+                  pg_get_constraintdef(constraint_record.oid) AS definition,
+                  ARRAY(
+                      SELECT attribute_record.attname
+                      FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_record(attnum, position)
+                      JOIN pg_attribute attribute_record
+                        ON attribute_record.attrelid=constraint_record.conrelid AND attribute_record.attnum=key_record.attnum
+                      ORDER BY key_record.position
+                  ) AS local_columns,
+                  foreign_namespace.nspname AS foreign_schema,
+                  foreign_relation.relname AS foreign_table,
+                  ARRAY(
+                      SELECT foreign_attribute.attname
+                      FROM unnest(constraint_record.confkey) WITH ORDINALITY AS key_record(attnum, position)
+                      JOIN pg_attribute foreign_attribute
+                        ON foreign_attribute.attrelid=constraint_record.confrelid AND foreign_attribute.attnum=key_record.attnum
+                      ORDER BY key_record.position
+                  ) AS foreign_columns,
+                  constraint_record.confdeltype AS delete_action,
+                  constraint_record.confupdtype AS update_action
+           FROM pg_constraint constraint_record
+           JOIN pg_class relation ON relation.oid=constraint_record.conrelid
+           JOIN pg_namespace namespace_record ON namespace_record.oid=relation.relnamespace
+           LEFT JOIN pg_class foreign_relation ON foreign_relation.oid=constraint_record.confrelid
+           LEFT JOIN pg_namespace foreign_namespace ON foreign_namespace.oid=foreign_relation.relnamespace
+           WHERE namespace_record.nspname=%s AND relation.relname = ANY(%s)""",
+        (schema, list(tables)),
+    ).fetchall()
+    counts: dict[str, dict[str, int]] = {table: {} for table in tables}
+    checks: dict[str, set[str]] = {table: set() for table in tables}
+    primary_keys: dict[str, str] = {}
+    # Structural FK identity (catalog OIDs and resolved column names), not
+    # rendered text -- see the comment on _REQUIRED_FOREIGN_KEYS for why.
+    foreign_keys: dict[str, set[tuple[tuple[str, ...], str, str, tuple[str, ...], str, str]]] = {table: set() for table in tables}
+    for row in rows:
+        table = str(_row(row, "table_name"))
+        contype = str(_row(row, "contype", 1))
+        definition = str(_row(row, "definition", 2))
+        if table not in counts:
+            continue
+        counts[table][contype] = counts[table].get(contype, 0) + 1
+        if contype == "c":
+            checks[table].add(_strip_pg_catalog_qualifier(definition))
+        elif contype == "p":
+            primary_keys[table] = definition
+        elif contype == "f":
+            foreign_keys[table].add((
+                tuple(_row(row, "local_columns", 3) or ()),
+                str(_row(row, "foreign_schema", 4)),
+                str(_row(row, "foreign_table", 5)),
+                tuple(_row(row, "foreign_columns", 6) or ()),
+                str(_row(row, "delete_action", 7)),
+                str(_row(row, "update_action", 8)),
+            ))
+    for table, expected_counts in _REQUIRED_CONSTRAINT_COUNTS.items():
+        actual_counts = counts.get(table, {})
+        for contype, expected_n in expected_counts.items():
+            actual_n = actual_counts.get(contype, 0)
+            if actual_n != expected_n:
+                issues.append(f"constraint-count:{table}.{contype}:{actual_n}!={expected_n}")
+        for contype, actual_n in actual_counts.items():
+            # 'n' (not-null) catalog entries are validated via column
+            # nullability instead; anything else unexpected is a real drift.
+            if contype != "n" and contype not in expected_counts and actual_n:
+                issues.append(f"constraint-unexpected:{table}.{contype}")
+    for table, expected_checks in _REQUIRED_CHECK_EXPRESSIONS.items():
+        # A count match alone lets any CHECK be swapped for a same-count
+        # vacuous one (e.g. CHECK (true)); compare PostgreSQL's own
+        # deparsed expression text so a body swap is caught even when the
+        # count above is unchanged. The same applies to PRIMARY KEY and
+        # FOREIGN KEY column composition below -- e.g. a same-count PK swap
+        # would otherwise silently drop the sole DB-level guarantee that one
+        # idempotency key binds one request digest.
+        actual_checks = checks.get(table, set())
+        if actual_checks != expected_checks:
+            issues.append(f"check-expression:{table}")
+    for table, expected_pk in _REQUIRED_PRIMARY_KEYS.items():
+        if primary_keys.get(table) != expected_pk:
+            issues.append(f"primary-key:{table}")
+    for table, expected_local_columns in _REQUIRED_FOREIGN_KEYS.items():
+        expected = {
+            (columns, schema, _FOREIGN_KEY_TARGET_TABLE, _FOREIGN_KEY_TARGET_COLUMNS, _FOREIGN_KEY_DELETE_ACTION, _FOREIGN_KEY_UPDATE_ACTION)
+            for columns in expected_local_columns
+        }
+        if foreign_keys.get(table, set()) != expected:
+            issues.append(f"foreign-key:{table}")
+    return issues
+
+
+def _index_issues(conn: Any, schema: str) -> list[str]:
+    issues: list[str] = []
+    tables = tuple(_COLUMN_SHAPE)
+    rows = conn.execute(
+        """SELECT index_class.relname AS index_name, table_class.relname AS table_name,
+                  index_record.indisunique AS is_unique,
+                  pg_get_expr(index_record.indpred, index_record.indrelid, true) AS predicate,
+                  index_record.indexrelid AS index_oid, index_record.indrelid AS table_oid,
+                  index_record.indnatts AS key_count
+           FROM pg_index index_record
+           JOIN pg_class index_class ON index_class.oid=index_record.indexrelid
+           JOIN pg_class table_class ON table_class.oid=index_record.indrelid
+           JOIN pg_namespace namespace_record ON namespace_record.oid=table_class.relnamespace
+           WHERE namespace_record.nspname=%s AND table_class.relname = ANY(%s) AND NOT index_record.indisprimary""",
+        (schema, list(tables)),
+    ).fetchall()
+    index_oids = [_row(row, "index_oid", 4) for row in rows]
+    # pg_get_indexdef per key position renders both plain columns and
+    # expression keys as text, unlike joining pg_attribute directly (which
+    # silently drops expression keys, attnum=0). Fetched for every index's
+    # every key position in one LATERAL query instead of one round trip per
+    # position, which is what made this an N+1 query before.
+    key_rows = conn.execute(
+        """SELECT index_record.indexrelid AS index_oid, position_record.position AS position,
+                  pg_get_indexdef(index_record.indexrelid, position_record.position, true) AS key
+           FROM pg_index index_record
+           CROSS JOIN LATERAL generate_series(1, index_record.indnatts) AS position_record(position)
+           WHERE index_record.indexrelid = ANY(%s)
+           ORDER BY index_record.indexrelid, position_record.position""",
+        (index_oids,),
+    ).fetchall() if index_oids else []
+    keys_by_oid: dict[Any, list[str]] = {}
+    for key_row in key_rows:
+        keys_by_oid.setdefault(_row(key_row, "index_oid"), []).append(str(_row(key_row, "key", 2)))
+    observed: dict[str, tuple[str, bool, tuple[str, ...], str | None]] = {}
+    for row in rows:
+        name = str(_row(row, "index_name"))
+        table = str(_row(row, "table_name", 1))
+        is_unique = bool(_row(row, "is_unique", 2))
+        predicate = _row(row, "predicate", 3)
+        index_oid = _row(row, "index_oid", 4)
+        keys = tuple(keys_by_oid.get(index_oid, []))
+        observed[name] = (table, is_unique, keys, str(predicate) if predicate is not None else None)
+    for name, expected in _REQUIRED_INDEXES.items():
+        actual = observed.get(name)
+        if actual is None:
+            issues.append(f"index-missing:{name}")
+        elif actual != expected:
+            issues.append(f"index-shape:{name}")
+    issues.extend(
+        f"index-unexpected:{name}" for name in sorted(set(observed) - set(_REQUIRED_INDEXES))
+    )
+    return issues
+
+
+def _shape_issues(conn: Any, schema: str) -> tuple[str, ...]:
+    issues: list[str] = []
+    existing_tables = {
+        str(_row(row, "table_name"))
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema=%s AND table_name = ANY(%s)",
+            (schema, list(REQUIRED_TABLES)),
+        ).fetchall()
+    }
+    issues.extend(f"table-missing:{table}" for table in REQUIRED_TABLES if table not in existing_tables)
+    if issues:
+        # Column/constraint/index checks assume every required table exists;
+        # a missing table already fails compatibility on its own.
+        return tuple(sorted(issues))
+    issues.extend(_column_issues(conn, schema))
+    issues.extend(_constraint_issues(conn, schema))
+    issues.extend(_index_issues(conn, schema))
+    rows = conn.execute(
+        """SELECT source.relname AS source_table, target_namespace.nspname AS target_schema
+           FROM pg_constraint constraint_record
+           JOIN pg_class source ON source.oid=constraint_record.conrelid
+           JOIN pg_namespace source_namespace ON source_namespace.oid=source.relnamespace
+           JOIN pg_class target ON target.oid=constraint_record.confrelid
+           JOIN pg_namespace target_namespace ON target_namespace.oid=target.relnamespace
+           WHERE constraint_record.contype='f' AND source_namespace.nspname=%s
+             AND target_namespace.nspname<>%s""",
+        (schema, schema),
+    ).fetchall()
+    issues.extend(
+        f"cross-domain-foreign-key:{_row(row, 'source_table')}:{_row(row, 'target_schema', 1)}"
+        for row in rows
+    )
+    return tuple(sorted(issues))
+
+
+def check_compatibility(conn: Any, schema: str | None = None) -> Compatibility:
+    # Ledger-verdict classification (uninitialized/too-new/incomplete/
+    # checksum-mismatch) delegates to vuoro_schema_runtime.compatibility_report,
+    # the same pure verdict algorithm actionq.schema uses for its own ledger --
+    # dummy matching current_role/configured_role sidestep its role-mismatch
+    # check, which has no federation-domain equivalent (there is no runtime
+    # principal concept here, only schema shape).
+    selected = db.schema_name(schema or configured_schema())
+    if not _ledger_exists(conn, selected):
+        return Compatibility(DOMAIN, API_VERSION, COMPATIBILITY_LABEL, None, "uninitialized", False, "federation migration ledger is absent")
+    rows = conn.execute(
+        f"SELECT version, name, checksum FROM {db.qname(selected, MIGRATION_TABLE)} WHERE domain=%s ORDER BY version",
+        (DOMAIN,),
+    ).fetchall()
+    applied = {int(_row(item, "version")): (str(_row(item, "name", 1)), str(_row(item, "checksum", 2))) for item in rows}
+    ledger_report = compatibility_report(
+        load_migrations(), applied,
+        schema="federation_ledger_verdict", domain_api_version=API_VERSION,
+        minimum_schema_version=MIN_SCHEMA_VERSION, maximum_schema_version=MAX_SCHEMA_VERSION,
+        current_role="federation_ledger_verifier", configured_role="federation_ledger_verifier",
+    )
+    observed = ledger_report.installed_schema_version or 0
+    if not applied:
+        state, detail = "uninitialized", "federation migration ledger has no federation rows"
+    elif "schema_too_new" in ledger_report.reasons:
+        state, detail = "too-new", f"federation schema version {observed} exceeds {MAX_SCHEMA_VERSION}"
+    elif "migration_ledger_not_contiguous" in ledger_report.reasons:
+        state, detail = "incomplete", "federation migration ledger is not contiguous"
+    elif "migration_ledger_drift" in ledger_report.reasons:
+        state, detail = "checksum-mismatch", "federation migration name or checksum differs from packaged v1"
+    else:
+        issues = _shape_issues(conn, selected)
+        if issues:
+            state, detail = "shape-mismatch", "federation schema shape is invalid: " + ",".join(issues)
+        else:
+            state, detail = "compatible", "schema is compatible with federation-schema/v1"
+    return Compatibility(DOMAIN, API_VERSION, COMPATIBILITY_LABEL, observed or None, state, state == "compatible", detail)
+
+
+def require_compatible(conn: Any, schema: str | None = None) -> Compatibility:
+    result = check_compatibility(conn, schema)
+    if not result.compatible:
+        raise FederationSchemaError(f"federation schema is {result.state}: {result.detail}")
+    return result
+
+
+def migrate(conn: Any, schema: str | None = None) -> dict[str, Any]:
+    selected = db.schema_name(schema or configured_schema())
+    assets = load_migrations()
+    applied_now: list[int] = []
+    with conn.transaction():
+        db.lock(conn, f"actionq:federation:{selected}:schema-migration")
+        conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{selected}"')
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {db.qname(selected, MIGRATION_TABLE)} ("
+            "domain TEXT NOT NULL, version INTEGER NOT NULL CHECK (version > 0), name TEXT NOT NULL, "
+            "checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(domain, version))"
+        )
+        rows = conn.execute(
+            f"SELECT version, name, checksum FROM {db.qname(selected, MIGRATION_TABLE)} WHERE domain=%s ORDER BY version",
+            (DOMAIN,),
+        ).fetchall()
+        applied = {int(_row(item, "version")): (str(_row(item, "name", 1)), str(_row(item, "checksum", 2))) for item in rows}
+        known = {asset.version: asset for asset in assets}
+        for version, recorded in applied.items():
+            if version not in known or recorded != (known[version].name, known[version].sha256):
+                raise FederationSchemaError(f"federation migration ledger drift at version {version}")
+        for asset in assets:
+            if asset.version in applied:
+                continue
+            for statement in _statements(asset, selected):
+                conn.execute(statement)
+            conn.execute(
+                f"INSERT INTO {db.qname(selected, MIGRATION_TABLE)} (domain, version, name, checksum) VALUES (%s,%s,%s,%s)",
+                (DOMAIN, asset.version, asset.name, asset.sha256),
+            )
+            applied_now.append(asset.version)
+    result = check_compatibility(conn, selected)
+    if not result.compatible:
+        raise FederationSchemaError(result.detail)
+    return {"domain": DOMAIN, "api_version": API_VERSION, "schema": selected, "applied": applied_now, "compatibility": result.as_dict()}
+
+
+def configure_role_boundaries(
+    conn: Any,
+    schema: str | None = None,
+    *,
+    object_owner_role: str,
+    migration_role: str,
+    command_role: str,
+    denied_roles: tuple[str, ...] = (),
+) -> None:
+    """Install the frozen v1 database-role boundary as a deployment action.
+
+    The caller must be a role administrator.  ``object_owner_role`` is a
+    NOLOGIN ownership role which is not granted to either service role.  The
+    migration role keeps schema CREATE and migration-ledger DML, while the
+    command role gets only federation fact/decision DML.  End-actor and legacy
+    roles belong in ``denied_roles`` and receive no direct federation access.
+    """
+    from psycopg import sql
+
+    selected = db.schema_name(schema or configured_schema())
+    names = (object_owner_role, migration_role, command_role, *denied_roles)
+    if not all(db.SCHEMA_RE.fullmatch(name) for name in names):
+        raise FederationSchemaError("federation database roles must be simple identifiers")
+    role_rows = conn.execute(
+        "SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname=ANY(%s)",
+        (list(names),),
+    ).fetchall()
+    observed_roles = {_row(row, "rolname"): bool(_row(row, "rolcanlogin", 1)) for row in role_rows}
+    missing_roles = sorted(set(names) - set(observed_roles))
+    if missing_roles:
+        raise FederationSchemaError("federation database roles are absent: " + ",".join(missing_roles))
+    if observed_roles[object_owner_role]:
+        raise FederationSchemaError("federation object owner must be NOLOGIN")
+    for service_role in (migration_role, command_role):
+        membership = conn.execute("SELECT pg_has_role(%s,%s,'MEMBER') AS member", (service_role, object_owner_role)).fetchone()
+        if membership and bool(_row(membership, "member")):
+            raise FederationSchemaError(f"{service_role} must not be a member of the federation object-owner role")
+    for denied_role in denied_roles:
+        for service_role in (object_owner_role, migration_role, command_role):
+            # REVOKE ALL below is issued directly against denied_role; a role
+            # that also inherits from object_owner_role/migration_role/
+            # command_role would keep that role's privileges (ownership, in
+            # the object-owner case -- stronger than a mere grant) through
+            # inheritance regardless, making the direct REVOKE cosmetic
+            # rather than an actual denial.
+            membership = conn.execute("SELECT pg_has_role(%s,%s,'MEMBER') AS member", (denied_role, service_role)).fetchone()
+            if membership and bool(_row(membership, "member")):
+                raise FederationSchemaError(f"{denied_role} must not be a member of {service_role} (would inherit federation access despite the direct REVOKE)")
+    owner = sql.Identifier(object_owner_role)
+    migrator = sql.Identifier(migration_role)
+    command = sql.Identifier(command_role)
+    schema_id = sql.Identifier(selected)
+    tables = REQUIRED_TABLES[1:]
+    conn.execute(sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(schema_id, owner))
+    for table in (MIGRATION_TABLE, *tables):
+        conn.execute(sql.SQL("ALTER TABLE {}.{} OWNER TO {}").format(schema_id, sql.Identifier(table), owner))
+    conn.execute(sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(schema_id))
+    conn.execute(sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM PUBLIC").format(schema_id))
+    for role_name in (migration_role, command_role, *denied_roles):
+        role = sql.Identifier(role_name)
+        conn.execute(sql.SQL("REVOKE ALL ON SCHEMA {} FROM {}").format(schema_id, role))
+        conn.execute(sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {}").format(schema_id, role))
+    conn.execute(sql.SQL("GRANT USAGE, CREATE ON SCHEMA {} TO {}").format(schema_id, migrator))
+    conn.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {}.{} TO {}").format(schema_id, sql.Identifier(MIGRATION_TABLE), migrator))
+    conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema_id, command))
+    conn.execute(sql.SQL("GRANT SELECT ON TABLE {}.{} TO {}").format(schema_id, sql.Identifier(MIGRATION_TABLE), command))
+    conn.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {}.{} TO {}").format(schema_id, sql.Identifier("federation_resources"), command))
+    append_only_tables = sql.SQL(", ").join(
+        sql.SQL("{}.{}").format(schema_id, sql.Identifier(table))
+        for table in tables if table != "federation_resources"
+    )
+    conn.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(append_only_tables, command))

@@ -316,18 +316,11 @@ def _statements(rendered_sql: str) -> tuple[str, ...]:
     return tuple(statement.strip() for statement in rendered_sql.split(";") if statement.strip())
 
 
-def _row_value(row: Any, key: str, index: int = 0) -> Any:
-    if isinstance(row, dict):
-        return row[key]
-    return row[index]
+_row_value = db.row_value
 
 
 def _ledger_exists(conn, schema: str) -> bool:
-    row = conn.execute(
-        "SELECT to_regclass(%s) AS relation",
-        (db.qname(schema, MIGRATION_TABLE),),
-    ).fetchone()
-    return bool(row and _row_value(row, "relation"))
+    return db.migration_ledger_exists(conn, schema, MIGRATION_TABLE)
 
 
 def _applied_migrations(conn, schema: str) -> dict[int, tuple[str, str]]:

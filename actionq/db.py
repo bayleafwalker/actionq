@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 import os
@@ -67,8 +68,21 @@ class ClaimRejected(ActionQError):
         self.requested_by = requested_by
 
 
+def lock(conn: Any, key: str) -> None:
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
+
+
+def raw_digest(raw: bytes) -> str:
+    """Plain sha256 of already-final bytes, with no canonicalization step."""
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def receipt_digest(receipt: str) -> str:
-    return "sha256:" + hashlib.sha256(receipt.encode("utf-8")).hexdigest()
+    return raw_digest(receipt.encode("utf-8"))
+
+
+def new_opaque_ref(prefix: str) -> str:
+    return prefix + base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
 
 
 def consume_runner_request(
@@ -347,6 +361,17 @@ def schema_name(value: str | None = None) -> str:
 def qname(schema: str, table: str) -> str:
     schema_name(schema)
     return f'"{schema}"."{table}"'
+
+
+def row_value(row: Any, key: str, index: int = 0) -> Any:
+    """Read a psycopg row cell by name (dict rows) or position (tuple rows)."""
+    return row[key] if isinstance(row, dict) else row[index]
+
+
+def migration_ledger_exists(conn: Any, schema: str, table: str) -> bool:
+    """Whether a domain's migration ledger table exists in ``schema``."""
+    row = conn.execute("SELECT to_regclass(%s) AS relation", (qname(schema, table),)).fetchone()
+    return bool(row and row_value(row, "relation"))
 
 
 def connect(url: str | None = None):
