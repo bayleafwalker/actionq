@@ -14,14 +14,28 @@ freeze (§6 proof cases, §7).
 Current baseline: actionq `f26e50e` / wheel v0.1.27 (`11bcedf6…`), vuoro `ab00d29`, reference
 profile revision `23cfc276…`.
 
-**Correction to the draft.** It stated that the federation schema reports `uninitialized` in
-every environment. That is what the code guarantees *until its migration runs*
-(`federation_schema.check_compatibility` returns `uninitialized` when the ledger is absent), and
-no migration has been run under this plan — but it is not something this document verified. The
-appservice cluster was not reachable from where the draft was reviewed, and reading a live
-production database to decorate a plan is not a trade worth making. **Confirming the actual
-state of each environment is the first action of 5.3**, before the migration job, not an
-assumption underneath it.
+**Correction to the draft, since verified.** The draft stated that the federation schema reports
+`uninitialized` in every environment. That was inference from code
+(`federation_schema.check_compatibility` returns `uninitialized` when the ledger is absent), not
+an observation, and the document said so.
+
+It has since been checked against the cluster, read-only: **no federation migration job has ever
+existed in any namespace of the appservice cluster.** The `vscode` namespace carries
+`actionq-schema-migrate-v1` … `-v12` (execution domain; v12 completed 2026-08-15T11:26:45Z, run
+from `ghcr.io/bayleafwalker/actionq-server@sha256:2d5121cf…`) and nothing federation-named
+anywhere. Since the federation ledger can only be created by that job, the schema is
+uninitialized cluster-wide, and 5.3 is the first thing that would change it.
+
+Two facts found in the same pass that 5.3 and 5.6 both need, and which no document recorded:
+
+* **There are three vuoro-service deployments, on three different image digests** — `vuoro-dev`,
+  `vuoro-shared`, and `agent-cockpit` in the `vscode` namespace. "Deploy that validated
+  composition" (release-order step 5) is therefore not one action, and which of the three is in
+  scope is an input 5.3 and 5.6 need before either runs.
+* **Three migration jobs are suspended, not completed** — `actionq-schema-migrate-v4`,
+  `-v5`, and `actionq-schema-v8-quiescence` (superseded by `-v2`). They are execution-domain and
+  do not block federation, but a consumer inventory (5.9 record 1) that treats every job as
+  evidence of a run would misread them.
 
 ## W5 — consumer cutover and legacy-write fence
 
