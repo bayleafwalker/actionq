@@ -32,12 +32,14 @@ from actionq.action_resource import ActionResourceOwner
 from actionq.completion_log import CompletionLog
 from actionq.federation import FederationAuthority, FederationPrincipal
 from actionq.federation_backfill import (
+    _EXPORT_TABLES,
     BACKFILL_AUTHORITIES,
     BACKFILL_MAPPING_VERSION,
     BACKFILL_PRINCIPAL_ID,
     FORBIDDEN_BACKFILL_AUTHORITIES,
     LEGACY_ASSURANCE_PREFIX,
     BackfillCommand,
+    BackfillDrift,
     BackfillRejected,
     ExportError,
     FederationBackfill,
@@ -485,6 +487,113 @@ def test_backfilled_changes_are_distinguishable_from_native_changes(planes) -> N
         row for row in rows if str(row["resource_ref"]) == native_ref
     ]
     assert assurances and all(item.startswith(LEGACY_ASSURANCE_PREFIX) for item in assurances)
+
+
+def test_backfill_principal_id_is_pinned_not_caller_supplied(planes) -> None:
+    """The reserved id is half of invariant 5; a caller must not be able to
+    write backfilled changes that report as native."""
+    import inspect
+    from actionq import federation_backfill
+
+    assert "principal_id" not in inspect.signature(backfill_principal).parameters
+    assert "principal_id" not in inspect.signature(FederationBackfill.__init__).parameters
+    assert backfill_principal(environment=ENVIRONMENT).principal_id == BACKFILL_PRINCIPAL_ID
+    assert federation_backfill.BACKFILL_PRINCIPAL_ID == BACKFILL_PRINCIPAL_ID
+
+
+def test_a_truncated_legacy_read_is_refused_not_silently_imported(planes) -> None:
+    """A short read would produce a quietly incomplete import that verify()
+    still passes, because verification never sees the legacy side."""
+    narrow = FederationBackfill(
+        authority=_authority(planes),
+        source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"], limit=2),
+        environment=ENVIRONMENT,
+    )
+    with pytest.raises(db.ActionQError, match="row limit"):
+        narrow.plan()
+    assert _count(planes, "federation_resources") == 0
+
+
+def _add_event(planes: dict, action_id: int) -> None:
+    with db.connect(planes["url"]) as conn:
+        db.insert_event(conn, planes["execution"], action_id=action_id,
+                        event_type="dispatch.observed", actor="test", payload={})
+        conn.commit()
+
+
+def test_a_purely_appending_source_change_is_imported_not_refused(planes) -> None:
+    """A new fact at the end of a resource's chain needs no new revision for any
+    fact already recorded, so it is ordinary monotonic growth."""
+    backfill = _backfill(planes)
+    backfill.run()
+    before = _count(planes, "federation_resource_changes")
+
+    # The completed action carries no action-resource or candidate refs, so a
+    # new event lands at the end of its chain.
+    _add_event(planes, int(planes["history"]["completed"]))
+    report = backfill.run()
+
+    assert report.applied == 1
+    assert _count(planes, "federation_resource_changes") == before + 1
+    assert all(result["matches"] for result in backfill.verify())
+
+
+def test_a_source_that_changed_under_a_part_recorded_import_is_refused_upfront(planes) -> None:
+    """Expected revisions come from the plan, so a fact inserted *before*
+    already-recorded ones re-issues their idempotency keys under different
+    requests -- which the command ledger rejects permanently. Detect it before
+    writing anything."""
+    backfill = _backfill(planes)
+    backfill.run()
+    before = _count(planes, "federation_resource_changes")
+
+    # This action's chain continues past its events with action-resource refs,
+    # so a new event shifts the revision every one of those was recorded at.
+    action_id = int(planes["history"]["action_resource_action"])
+    _add_event(planes, action_id)
+
+    with pytest.raises(BackfillDrift) as drift:
+        backfill.run()
+    assert drift.value.resource_ref == _resource_ref(action_id)
+    # The first fact whose recorded position no longer matches its planned one:
+    # the new event itself, planned mid-chain while the resource is already past
+    # that revision.
+    assert drift.value.fact.startswith("execution-ref:") and "#event:" in drift.value.fact
+    assert _count(planes, "federation_resource_changes") == before
+
+
+def test_a_legacy_fact_that_disappeared_is_refused_upfront(planes) -> None:
+    backfill = _backfill(planes)
+    backfill.run()
+    before = _count(planes, "federation_resource_changes")
+
+    action_id = int(planes["history"]["completed"])
+    with db.connect(planes["url"]) as conn:
+        conn.execute(
+            f"DELETE FROM {db.qname(planes['execution'], 'events')} WHERE action_id=%s "
+            "AND id = (SELECT max(id) FROM " + db.qname(planes["execution"], "events") + " WHERE action_id=%s)",
+            (action_id, action_id),
+        )
+        conn.commit()
+
+    with pytest.raises(BackfillDrift) as drift:
+        backfill.run()
+    assert drift.value.resource_ref == _resource_ref(action_id)
+    assert _count(planes, "federation_resource_changes") == before
+
+
+def test_export_column_shape_matches_the_frozen_schema(planes) -> None:
+    """A migration that adds a column must fail here, not silently drop it from
+    the artifact the retention contract calls the indefinite record."""
+    exported = {table: [name for name, _ in columns] for table, columns in _EXPORT_TABLES}
+    declared = {
+        table: sorted(columns)
+        for table, columns in federation_schema._COLUMN_SHAPE.items()
+        if table != federation_schema.MIGRATION_TABLE
+    }
+    assert set(exported) == set(declared)
+    for table, names in exported.items():
+        assert sorted(names) == declared[table], table
 
 
 def test_backfill_refuses_to_issue_a_non_provenance_command(planes) -> None:
