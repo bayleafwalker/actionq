@@ -61,9 +61,9 @@ authoritative record while demoting a mechanism (CNPG/Barman) that is compressed
 versioned and offsite. The retention *windows* are as stated, but the engineering around
 the designated artifact is not yet equivalent: redundancy, snapshot policy, an offsite
 copy, a stored digest sidecar and a periodic integrity check are all W5 operator
-obligations and none of them exist today. No export has yet been written to that path. Scheduling the periodic write is W5 operator
-deployment work; W3 owns and proves the code path and the format, and names the target path
-here so W5 has nothing left to invent.
+obligations and none of them exist today, and no export has yet been written to that path.
+Scheduling the periodic write is W5 operator deployment work; W3 owns and proves the code
+path and the format, and names the target path here so W5 has nothing left to invent.
 
 ## 3. Restore objective
 
@@ -140,7 +140,28 @@ principal is granted `federation.create` in an environment.** The freeze doc's r
 ordering already arranges this; stating it here makes the dependency explicit rather than
 incidental.
 
-## 7. What this contract does not do
+## 7. Backfill is a cutover-time import, not a scheduled job
+
+The mapping records moving legacy values — an action's status, action-resource and completion
+recovery floors, the completion log's `last_cursor` — as facts. Each run against a live system
+therefore contributes new references for whichever of those have moved, and §1's indefinite
+retention plus §4's absence of any delete-capable surface means that growth is permanent and
+unreclaimable by design.
+
+That is correct for what backfill is: a one-time import run at cutover, per the freeze doc's
+release ordering, possibly resumed a few times. **It must not be scheduled to run
+periodically against a live execution database**, which would grow `federation_execution_refs`
+and `federation_resource_changes` without bound and with no sanctioned way to reclaim them.
+The periodic job that W5 owns is the *export*, not the import.
+
+Identity is `(mapping_version, environment, source_id, legacy id)`. Changing any of the first
+three starts a new import namespace rather than continuing an existing one — deliberately, so
+that re-importing a different database, or under a revised mapping, can never merge into
+records already written. `source_id` is a required, explicit operator statement precisely
+because "these two databases are the same source" must never be inferred from a shared
+environment name.
+
+## 8. What this contract does not do
 
 It does not change the execution-schema retention window, the CNPG policy, any Vuoro
 catalog, or W7's authorization state.

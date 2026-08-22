@@ -63,6 +63,7 @@ from actionq.federation_backfill import (
 
 ROOT = Path(__file__).parents[1]
 ENVIRONMENT = "test"
+SOURCE_ID = "primary"
 CONTRACT_DOC = ROOT / "docs/plans/2026-08-21-w3-retention-export-restore.md"
 
 
@@ -273,12 +274,12 @@ def _backfill(planes: dict) -> FederationBackfill:
     return FederationBackfill(
         authority=_authority(planes),
         source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"]),
-        environment=ENVIRONMENT,
+        environment=ENVIRONMENT, source_id=SOURCE_ID,
     )
 
 
 def _resource_ref(action_id: int) -> str:
-    return deterministic_resource_ref(legacy_execution_ref(environment=ENVIRONMENT, action_id=action_id))
+    return deterministic_resource_ref(legacy_execution_ref(environment=ENVIRONMENT, source_id=SOURCE_ID, action_id=action_id))
 
 
 def _execution_refs(planes: dict, resource_ref: str) -> dict[str, str]:
@@ -324,21 +325,29 @@ def test_retention_export_restore_contract_is_checked_in() -> None:
     assert "prerequisite of any W7 destructive-retirement plan" in flowed
     assert "before any native principal is granted `federation.create`" in flowed
     assert "Known gap, owned by W5" in flowed
+    assert "must not be scheduled to run periodically" in flowed
+    assert "required, explicit operator statement" in flowed
 
 
 def test_deterministic_identity_is_stable_shaped_and_mapping_scoped() -> None:
-    legacy = legacy_execution_ref(environment=ENVIRONMENT, action_id=7)
-    assert legacy == "actionq-execution/v1:test:7"
+    legacy = legacy_execution_ref(environment=ENVIRONMENT, source_id=SOURCE_ID, action_id=7)
+    assert legacy == "actionq-execution/v1:test:primary:7"
     first = deterministic_resource_ref(legacy)
     assert first == deterministic_resource_ref(legacy)
     assert first.startswith("aqf1_") and len(first) == len("aqf1_") + 43
     assert first != deterministic_resource_ref(legacy, mapping_version="federation-backfill/v2")
-    assert first != deterministic_resource_ref(legacy_execution_ref(environment=ENVIRONMENT, action_id=8))
-    assert deterministic_resource_ref(legacy_completion_ref(environment=ENVIRONMENT)) != first
+    assert first != deterministic_resource_ref(legacy_execution_ref(environment=ENVIRONMENT, source_id=SOURCE_ID, action_id=8))
+    assert deterministic_resource_ref(legacy_completion_ref(environment=ENVIRONMENT, source_id=SOURCE_ID)) != first
     with pytest.raises(db.ActionQError):
-        legacy_execution_ref(environment="bad:environment", action_id=1)
+        legacy_execution_ref(environment="bad:environment", source_id=SOURCE_ID, action_id=1)
     with pytest.raises(db.ActionQError):
-        legacy_execution_ref(environment=ENVIRONMENT, action_id=0)
+        legacy_execution_ref(environment=ENVIRONMENT, source_id=SOURCE_ID, action_id=0)
+    with pytest.raises(db.ActionQError):
+        legacy_execution_ref(environment=ENVIRONMENT, source_id="bad:source", action_id=1)
+    # Two legacy databases under one environment name must not collide.
+    assert first != deterministic_resource_ref(
+        legacy_execution_ref(environment=ENVIRONMENT, source_id="secondary", action_id=7)
+    )
 
 
 def test_backfill_principal_cannot_decide_accept_settle_or_supersede(planes) -> None:
@@ -390,7 +399,7 @@ def test_backfill_imports_every_legacy_lifecycle_state_as_provenance(planes) -> 
     }
     for name, status in expected_states.items():
         resource_ref = _resource_ref(int(history[name]))
-        legacy = legacy_execution_ref(environment=ENVIRONMENT, action_id=int(history[name]))
+        legacy = legacy_execution_ref(environment=ENVIRONMENT, source_id=SOURCE_ID, action_id=int(history[name]))
         refs = _execution_refs(planes, resource_ref)
         assert refs[legacy] == legacy_assurance_type("action")
         assert refs[f"{legacy}#status:{status}"] == legacy_assurance_type("status")
@@ -422,7 +431,7 @@ def test_backfill_imports_every_legacy_lifecycle_state_as_provenance(planes) -> 
     assert len(floor_refs) == 1 and floor_refs[0].endswith("#action-resource-recovery-floor:1")
 
     # Completion recovery floor.
-    completion = _execution_refs(planes, deterministic_resource_ref(legacy_completion_ref(environment=ENVIRONMENT)))
+    completion = _execution_refs(planes, deterministic_resource_ref(legacy_completion_ref(environment=ENVIRONMENT, source_id=SOURCE_ID)))
     assert legacy_assurance_type("completion-recovery-floor") in completion.values()
     assert any(ref.endswith("#recovery-floor:1") for ref in completion)
 
@@ -506,6 +515,7 @@ def test_backfill_principal_id_is_pinned_not_caller_supplied(planes) -> None:
 
     assert "principal_id" not in inspect.signature(backfill_principal).parameters
     assert "principal_id" not in inspect.signature(FederationBackfill.__init__).parameters
+    assert "source_id" in inspect.signature(FederationBackfill.__init__).parameters
     assert backfill_principal(environment=ENVIRONMENT).principal_id == BACKFILL_PRINCIPAL_ID
     assert federation_backfill.BACKFILL_PRINCIPAL_ID == BACKFILL_PRINCIPAL_ID
 
@@ -516,11 +526,23 @@ def test_a_truncated_legacy_read_is_refused_not_silently_imported(planes) -> Non
     narrow = FederationBackfill(
         authority=_authority(planes),
         source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"], limit=2),
-        environment=ENVIRONMENT,
+        environment=ENVIRONMENT, source_id=SOURCE_ID,
     )
-    with pytest.raises(db.ActionQError, match="row limit"):
+    with pytest.raises(db.ActionQError, match="exceeded the 2-row limit"):
         narrow.plan()
     assert _count(planes, "federation_resources") == 0
+
+    # A read that returns exactly the bound was not truncated and must import.
+    with db.connect(planes["url"]) as conn:
+        total = int(conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(planes['execution'], 'actions')}"
+        ).fetchone()["n"])
+    exact = FederationBackfill(
+        authority=_authority(planes),
+        source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"], limit=total),
+        environment=ENVIRONMENT, source_id=SOURCE_ID,
+    )
+    assert exact.plan()
 
 
 def _add_event(planes: dict, action_id: int) -> None:
@@ -557,7 +579,7 @@ def test_a_legacy_status_transition_is_appended_keeping_the_earlier_status(plane
         conn.commit()
     pending_id = int(claimed["id"])
     resource_ref = _resource_ref(pending_id)
-    legacy = legacy_execution_ref(environment=ENVIRONMENT, action_id=pending_id)
+    legacy = legacy_execution_ref(environment=ENVIRONMENT, source_id=SOURCE_ID, action_id=pending_id)
     assert f"{legacy}#status:pending" in _execution_refs(planes, resource_ref)
 
     report = backfill.run()
@@ -592,6 +614,84 @@ def test_a_legacy_fact_that_disappeared_is_replayed_not_refused(planes) -> None:
     assert _count(planes, "federation_resource_changes") == before
 
 
+def test_a_second_legacy_database_under_one_environment_cannot_merge(planes) -> None:
+    """Deterministic refs are a function of the source too, so two unrelated
+    legacy databases sharing an environment name cannot silently merge their
+    provenance into one resource."""
+    other = _new_schema("aqbf_other")
+    with db.connect(planes["url"]) as conn:
+        db.migrate(conn, other)
+        conn.commit()
+    with db.connect(planes["url"]) as conn:
+        _enqueue(conn, other, "other-db-action")
+        conn.commit()
+
+    _backfill(planes).run()
+    second = FederationBackfill(
+        authority=_authority(planes),
+        source=LegacySource(connection=_factory(planes["url"]), schema=other),
+        environment=ENVIRONMENT, source_id="secondary",
+    )
+    report = second.run()
+    try:
+        assert set(report.resource_refs).isdisjoint(_backfill(planes).run().resource_refs)
+        for resource_ref in report.resource_refs:
+            refs = _execution_refs(planes, resource_ref)
+            assert all(":secondary" in ref for ref in refs)
+    finally:
+        with db.connect(planes["url"]) as conn:
+            conn.execute(f'DROP SCHEMA "{other}" CASCADE')
+            conn.commit()
+
+
+def test_a_moved_assurance_type_is_refused_not_permanently_rejected(planes) -> None:
+    """assurance_type is in the request digest but not in the fact key, so a
+    legacy event_type that moved under an already-recorded reference would
+    re-issue a bound key under a different digest and be rejected forever."""
+    backfill = _backfill(planes)
+    backfill.run()
+    action_id = int(planes["history"]["completed"])
+    with db.connect(planes["url"]) as conn:
+        events = db.qname(planes["execution"], "events")
+        conn.execute(
+            f"UPDATE {events} SET event_type='mutated' WHERE id = "
+            f"(SELECT max(id) FROM {events} WHERE action_id=%s)",
+            (action_id,),
+        )
+        conn.commit()
+    with pytest.raises(BackfillDrift) as drift:
+        backfill.run()
+    assert drift.value.resource_ref == _resource_ref(action_id)
+    assert "assurance" in str(drift.value)
+
+
+def test_a_rejected_command_can_still_be_imported_by_a_later_run(planes) -> None:
+    """A rejection is durably bound to the digest carrying its expected
+    revision. If the key omitted that revision, the fact would be unimportable
+    by every future run."""
+    backfill = _backfill(planes)
+    backfill.run()
+    action_id = int(planes["history"]["completed"])
+    resource_ref = _resource_ref(action_id)
+    _add_event(planes, action_id)
+
+    appended = [c for c in backfill.plan() if c.resource_ref == resource_ref][-1]
+    # Burn the appended command's expected revision with an unrelated write, so
+    # dispatching it now is durably rejected as stale.
+    _authority(planes).record_execution_ref(
+        principal=backfill.principal, idempotency_key="burn", resource_ref=resource_ref,
+        execution_ref="burn:1", assurance_type=legacy_assurance_type("burn"),
+        expected_revision=appended.expected_revision,
+    )
+    assert backfill._dispatch(appended).code == "stale-revision"
+
+    report = backfill.run()
+    assert report.applied >= 1
+    refs = _execution_refs(planes, resource_ref)
+    assert appended.arguments["execution_ref"] in refs
+    assert all(result["matches"] for result in backfill.verify(report.resource_refs))
+
+
 def test_a_foreign_principal_writing_to_a_backfilled_resource_is_refused(planes) -> None:
     """The one thing that really is corruption: the deterministic identity was
     taken over by a principal that is not backfill."""
@@ -621,7 +721,7 @@ def test_the_mapping_version_scopes_identity_keys_and_assurance_together(planes)
     second = FederationBackfill(
         authority=_authority(planes),
         source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"]),
-        environment=ENVIRONMENT, mapping_version="federation-backfill/v2",
+        environment=ENVIRONMENT, source_id=SOURCE_ID, mapping_version="federation-backfill/v2",
     )
     _backfill(planes).run()
     report = second.run()
@@ -690,7 +790,7 @@ def test_a_command_rejected_by_the_authority_aborts_the_import(planes) -> None:
     backfill = _Rejecting(
         authority=_authority(planes),
         source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"]),
-        environment=ENVIRONMENT,
+        environment=ENVIRONMENT, source_id=SOURCE_ID,
     )
     with pytest.raises(BackfillRejected) as raised:
         backfill.run()
