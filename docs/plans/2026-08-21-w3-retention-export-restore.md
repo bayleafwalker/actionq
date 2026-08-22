@@ -17,6 +17,7 @@ no scheduled deletion. V1 chose no pruning of federation changes (CAS/projection
 
 Expiring any of it requires the separate ratified destructive-retirement plan that W7 is
 still waiting on. This contract does not authorize it.
+<!-- claim: w3-retention-no-deletion -->
 
 ## 2. Durable-authoritative export target
 
@@ -55,6 +56,7 @@ artifact could not evidence the invariant it is retained to evidence. `produced_
 `source` are caller-supplied rather than read from the environment, so an export stays a
 pure function of its inputs and the byte-identity property above holds when they are
 omitted.
+<!-- claim: w3-export-byte-identical -->
 
 **Known gap, owned by W5.** This designates a single TrueNAS path as the durable-
 authoritative record while demoting a mechanism (CNPG/Barman) that is compressed,
@@ -75,6 +77,7 @@ every federation resource exactly, and re-exporting the restored schema yields b
 export bytes. `actionq.federation_backfill.restore_federation` refuses to write into a
 schema that already holds federation resources, so a restore can never partially overlay
 live data.
+<!-- claim: w3-restore-preserves-projection -->
 
 ## 4. Destructive-archive authorization
 
@@ -91,6 +94,7 @@ frozen boundary installs — migration, command, or a denied end-actor role — 
 or `TRUNCATE` on any of the nine federation tables. A source-level check that no module
 contains a delete statement would not survive a third module, a later migration, or an
 operator at a `psql` prompt; a privilege assertion does.
+<!-- claim: w3-no-delete-capable-surface -->
 
 ## 5. Backfilled versus native facts
 
@@ -110,13 +114,15 @@ the distinction is **convention over reserved values**, not a schema feature:
 principal id is pinned in code rather than being a caller-supplied parameter. W3 asserts
 both, and asserts that no backfilled resource ever reaches `accepted`, `rejected` or a
 settlement.
+<!-- claim: w3-backfilled-distinguishable -->
 
 ## 6. What W3 preserves, and what it does not
 
 W3 preserves legacy **identity and shape**, not content. From a federation resource plus
 the export you can recover that an action existed, its status at import time, the ids and
 types of its events, its action-resource root and recovery floor, its candidate request,
-and its parent. You cannot recover anything descriptive or temporal: `action_type`,
+and its parent.
+<!-- claim: w3-preserves-identity-and-shape --> You cannot recover anything descriptive or temporal: `action_type`,
 `project`, `target_ref`, `created_by`, `priority`, `result_ref`, `failure_reason` and
 every legacy timestamp are deliberately not imported, and `federation_execution_refs.
 created_at` records the *import* time, not the legacy time. Execution groups, dispatch
@@ -153,6 +159,7 @@ release ordering, possibly resumed a few times. **It must not be scheduled to ru
 periodically against a live execution database**, which would grow `federation_execution_refs`
 and `federation_resource_changes` without bound and with no sanctioned way to reclaim them.
 The periodic job that W5 owns is the *export*, not the import.
+<!-- claim: w3-cutover-time-import -->
 
 Identity is `(mapping_version, environment, source_id, legacy id)`. Changing any of the first
 three starts a new import namespace rather than continuing an existing one — deliberately, so
@@ -160,6 +167,7 @@ that re-importing a different database, or under a revised mapping, can never me
 records already written. `source_id` is a required, explicit operator statement precisely
 because "these two databases are the same source" must never be inferred from a shared
 environment name.
+<!-- claim: w3-source-scoped-identity -->
 
 The `federation-backfill/v1` mapping **has never been applied to any database**. Its
 definition — including the reference format and the idempotency-key composition — was still
@@ -171,3 +179,65 @@ imported under the old one.
 
 It does not change the execution-schema retention window, the CNPG policy, any Vuoro
 catalog, or W7's authorization state.
+
+## 9. Falsifiers
+
+Every claim carrying an inline `claim:` HTML-comment marker above appears here with the test
+that would fail if it were untrue, and the scope that test actually establishes. `tests/test_falsifier_coverage.py`
+enforces that the two sets agree, that each named test exists, and that each declared scope is
+restated in that test's own docstring — so a claim cannot be broadened without touching the
+test that is supposed to prove it.
+
+```falsifiers
+[
+  {
+    "id": "w3-retention-no-deletion",
+    "claim": "Federation v1 data is retained indefinitely; nothing expires or deletes it.",
+    "scope": "no role the frozen boundary installs holds DELETE or TRUNCATE on any federation table",
+    "test": "tests/test_federation_backfill_rebuild.py::test_no_federation_pruning_capability_exists"
+  },
+  {
+    "id": "w3-export-byte-identical",
+    "claim": "Two exports of identical database content are byte-identical, so the artifact is independently digestible.",
+    "scope": "within one producing wheel, with produced_at and source omitted",
+    "test": "tests/test_federation_backfill_rebuild.py::test_export_restore_round_trip_preserves_the_canonical_projection"
+  },
+  {
+    "id": "w3-restore-preserves-projection",
+    "claim": "Restoring an export into a freshly migrated empty schema reproduces every resource's canonical projection exactly.",
+    "scope": "into a freshly migrated, empty federation schema",
+    "test": "tests/test_federation_backfill_rebuild.py::test_export_restore_round_trip_preserves_the_canonical_projection"
+  },
+  {
+    "id": "w3-no-delete-capable-surface",
+    "claim": "Destructive archive action is manual only; no code or role can prune a federation row.",
+    "scope": "no role the frozen boundary installs holds DELETE or TRUNCATE on any federation table",
+    "test": "tests/test_federation_backfill_rebuild.py::test_no_federation_pruning_capability_exists"
+  },
+  {
+    "id": "w3-backfilled-distinguishable",
+    "claim": "Backfilled archive facts are distinguishable from post-cutover native federation changes.",
+    "scope": "by reserved actor principal id and legacy-provenance assurance prefix",
+    "test": "tests/test_federation_backfill_rebuild.py::test_backfilled_changes_are_distinguishable_from_native_changes"
+  },
+  {
+    "id": "w3-preserves-identity-and-shape",
+    "claim": "W3 preserves legacy identity and shape: every lifecycle state, reclaims, renewals, stale receipts, cancellations, candidate publications, cursor pruning and completion floors.",
+    "scope": "identity and shape only; descriptive and temporal legacy content is deliberately not imported",
+    "test": "tests/test_federation_backfill_rebuild.py::test_backfill_imports_every_legacy_lifecycle_state_as_provenance"
+  },
+  {
+    "id": "w3-source-scoped-identity",
+    "claim": "Two unrelated legacy databases sharing an environment name cannot merge their provenance.",
+    "scope": "deterministic references are a function of the source, so the merge is impossible rather than detected",
+    "test": "tests/test_federation_backfill_rebuild.py::test_a_second_legacy_database_under_one_environment_cannot_merge"
+  },
+  {
+    "id": "w3-cutover-time-import",
+    "claim": "Backfill is a cutover-time import and must not be scheduled periodically against a live execution database.",
+    "scope": "operator-procedural: no code surface schedules the import, and the periodic job W5 owns is the export",
+    "test": null,
+    "gap": "Procedural, not mechanisable here. Nothing in the package schedules a backfill, so there is no code path to assert against; the enforceable half is W5 deployment configuration, which this repository does not contain. Revisit when W5 lands a scheduler."
+  }
+]
+```

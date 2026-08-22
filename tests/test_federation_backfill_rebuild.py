@@ -388,6 +388,10 @@ def test_backfill_principal_cannot_decide_accept_settle_or_supersede(planes) -> 
 
 
 def test_backfill_imports_every_legacy_lifecycle_state_as_provenance(planes) -> None:
+    """Scope: identity and shape only; descriptive and temporal legacy content
+    is deliberately not imported. This asserts that each named legacy fact has a
+    corresponding federation reference, never that the fact's content survives.
+    """
     report = _backfill(planes).run()
     history = planes["history"]
     assert report.mapping_version == BACKFILL_MAPPING_VERSION
@@ -488,6 +492,9 @@ def test_rerun_changes_no_identity_digest_or_row_count(planes) -> None:
 
 
 def test_backfilled_changes_are_distinguishable_from_native_changes(planes) -> None:
+    """Scope: by reserved actor principal id and legacy-provenance assurance
+    prefix. The frozen change ledger has no provenance column, so this is a
+    convention over reserved values, not a schema-enforced property."""
     _backfill(planes).run()
     native = _principal("native:one", "federation.create", "federation.relate")
     native_ref = _authority(planes).create(principal=native, idempotency_key="native-1",
@@ -634,7 +641,11 @@ def test_a_self_parenting_legacy_action_is_refused_rather_than_planned(planes) -
 def test_a_second_legacy_database_under_one_environment_cannot_merge(planes) -> None:
     """Deterministic refs are a function of the source too, so two unrelated
     legacy databases sharing an environment name cannot silently merge their
-    provenance into one resource."""
+    provenance into one resource.
+
+    Scope: deterministic references are a function of the source, so the merge
+    is impossible rather than detected -- there is no runtime check to bypass.
+    """
     other = _new_schema("aqbf_other")
     with db.connect(planes["url"]) as conn:
         db.migrate(conn, other)
@@ -938,6 +949,11 @@ def test_no_federation_pruning_capability_exists(postgres_urls) -> None:
     caller -- module, migration, or an operator at a psql prompt under a
     service role -- can prune one.  A source grep would survive a
     string-concatenated statement, a third module, or a later migration.
+
+    Scope: no role the frozen boundary installs holds DELETE or TRUNCATE on any
+    federation table. It says nothing about a superuser or the table owner,
+    which is why destructive archive stays a manual, owner-approved action
+    rather than something the schema alone can prevent.
     """
     selected = _new_schema("aqbf_acl")
     suffix = uuid.uuid4().hex[:8]
@@ -1046,7 +1062,15 @@ def _export(planes: dict, schema: str | None = None) -> bytes:
 
 def test_export_restore_round_trip_preserves_the_canonical_projection(planes) -> None:
     """Falsifiers: export/restore changes the canonical projection; a configured
-    retention objective cannot be restored."""
+    retention objective cannot be restored.
+
+    Scope: restoring into a freshly migrated, empty federation schema
+    reproduces every resource's canonical projection, and re-exporting it is
+    byte-identical within one producing wheel, with produced_at and source
+    omitted. Cross-wheel byte-identity is a narrower claim -- producer_version
+    and the migration ledger are inside the digested document -- and comparing
+    across versions means comparing the tables block, not the whole document.
+    """
     report = _backfill(planes).run()
     exported = _export(planes)
     assert exported == _export(planes)
