@@ -33,6 +33,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -45,6 +47,27 @@ HISTORIES = (
     "pruning", "snapshot-race", "non-disclosure", "redaction",
     "response-loss", "bounded-wait", "fencing",
 )
+ROUND_RECORDS = ROOT / "docs/evidence/w3-review-rounds.jsonl"
+
+
+def _require_postgres() -> str | None:
+    """The suite and the packets both need initdb/pg_ctl on PATH.
+
+    Checked up front rather than left to fail seven packets in: on this machine
+    they come from a nix store path that is not on a fresh shell's PATH, so the
+    first thing a new session sees would otherwise be a confusing packet
+    failure. Reports the missing binaries and how to get them instead.
+    """
+    missing = [name for name in ("initdb", "pg_ctl") if shutil.which(name) is None]
+    if not missing:
+        return None
+    return (
+        f"PostgreSQL binaries not on PATH: {', '.join(missing)}.\n"
+        "  Put them there before running, e.g.\n"
+        "    export PATH=\"$(dirname $(nix build --no-link --print-out-paths "
+        "nixpkgs#postgresql)/bin/initdb):$PATH\"\n"
+        "  or set ACTIONQ_PG_BIN to a directory containing initdb and pg_ctl."
+    )
 
 
 def _contract_module():
@@ -111,6 +134,31 @@ def _patch_manifest(*, dry_run: bool) -> tuple[bool, list[str]]:
     return not blocked, notes
 
 
+def _append_round_record(round_number: int, *, skipped_wheel: bool) -> None:
+    """Emit the round's mechanical-failure count from the thing that made it zero.
+
+    Only ever reached after every step above has passed, so the count is an
+    observation rather than an assertion: this sequence cannot reach here having
+    run the suite against stale derived artifacts. The finding counts and
+    classification stay hand-written -- those are judgment, and an orchestrator
+    that filled them in would be deciding rather than recording.
+    """
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                          capture_output=True, text=True).stdout.strip()
+    record = {
+        "round": round_number,
+        "fix_head": head,
+        "mechanical_failure_rounds": 0,
+        "mechanical_failure_cause": None,
+        "emitted_by": "verification/run_round_checks.py",
+        "wheel_built": not skipped_wheel,
+        "note": "counts, classification and channel findings are added by hand; "
+                "this line records only what the sequence itself observed",
+    }
+    with ROUND_RECORDS.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
 def _run(command: list[str], *, label: str) -> bool:
     print(f"--- {label}", flush=True)
     completed = subprocess.run(command, cwd=ROOT)
@@ -125,7 +173,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="skip the wheel build when iterating on tests")
     parser.add_argument("--pytest", default="uv run --no-sync pytest",
                         help="pytest invocation (default: %(default)s)")
+    parser.add_argument("--record-round", type=int, metavar="N",
+                        help="append a round record for round N, with mechanical_failures 0")
     arguments = parser.parse_args(argv)
+
+    pg_bin = os.environ.get("ACTIONQ_PG_BIN")
+    if pg_bin:
+        os.environ["PATH"] = f"{pg_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+    if not arguments.dry_run:
+        # Only the real run needs a database; --dry-run inspects files alone.
+        complaint = _require_postgres()
+        if complaint:
+            print(f"FAILED: {complaint}")
+            return 1
 
     ok, notes = _patch_manifest(dry_run=arguments.dry_run)
     print("--- reachability manifest")
@@ -155,6 +215,10 @@ def main(argv: list[str] | None = None) -> int:
     if not arguments.skip_wheel and not _run(["uv", "build", "--wheel"], label="wheel"):
         print("\nFAILED: wheel build.")
         return 1
+
+    if arguments.record_round is not None:
+        _append_round_record(arguments.record_round, skipped_wheel=arguments.skip_wheel)
+        print(f"--- round record appended for round {arguments.record_round}")
 
     print("\nOK: derived artifacts refreshed before the suite, suite green twice"
           + ("" if arguments.skip_wheel else ", wheel clean"))

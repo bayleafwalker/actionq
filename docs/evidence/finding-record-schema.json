@@ -18,7 +18,7 @@
     "first_attempt_pass": "boolean, or null when not captured",
     "collateral_breakage": "boolean, or null when not captured",
     "caught_by": "one of tests, review, probe, n/a -- how the finding itself surfaced",
-    "unavailable_reason": "string, required whenever first_attempt_pass is null",
+    "unavailable_reason": "string, required whenever first_attempt_pass OR collateral_breakage is null; an unmeasured field is never guessed",
     "notes": "string, optional"
   },
   "known_limits": [

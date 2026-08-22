@@ -111,13 +111,15 @@ def test_unmeasured_fields_are_null_with_a_reason_rather_than_guessed() -> None:
         for field in ("first_attempt_pass", "collateral_breakage"):
             value = record[field]
             assert value is None or isinstance(value, bool), f"{identifier}: {field} must be boolean or null"
-        if record["first_attempt_pass"] is None:
+        unmeasured = [field for field in ("first_attempt_pass", "collateral_breakage")
+                      if record[field] is None]
+        if unmeasured:
             assert str(record.get("unavailable_reason", "")).strip(), (
-                f"{identifier}: first_attempt_pass is null without an unavailable_reason"
+                f"{identifier}: {' and '.join(unmeasured)} null without an unavailable_reason"
             )
         else:
             assert "unavailable_reason" not in record, (
-                f"{identifier}: carries an unavailable_reason but also a measured first_attempt_pass"
+                f"{identifier}: carries an unavailable_reason but every field is measured"
             )
         if tier is None:
             assert record["first_attempt_pass"] is None, (

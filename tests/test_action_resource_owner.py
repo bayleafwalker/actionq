@@ -1,3 +1,5 @@
+import base64
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -35,7 +37,17 @@ def test_cursor_is_opaque_integrity_protected_and_scope_root_bound():
     owner = _owner()
     ref = new_resource_ref()
     cursor = owner._cursor(ref, "scope-a", 17)
-    assert "17" not in cursor and ref not in cursor
+    # The property is that the cursor does not carry its payload in the clear.
+    # Asserting the digits "17" are absent from the cursor *string* looks like
+    # that check and is not one: the body is base64url over a random nonce, and
+    # that alphabet includes digits, so "17" turns up by chance in ~2.9% of
+    # cursors -- a real 1-in-34 flake that failed a full suite run. Decode and
+    # look for the actual serialized payload, which encryption makes absent
+    # deterministically.
+    body = cursor.split("_", 1)[1]
+    decoded = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+    assert json.dumps([ref, "scope-a", 17], separators=(",", ":")).encode() not in decoded
+    assert ref not in cursor
     assert owner._parse_cursor(cursor, ref, "scope-a") == 17
     assert owner._cursor(ref, "scope-a", 17) != cursor
     for wrong_ref, wrong_scope, wrong_cursor in (
