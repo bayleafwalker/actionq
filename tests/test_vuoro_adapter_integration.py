@@ -116,6 +116,11 @@ def test_registry_composition_accepts_an_injected_protocol_definition_factory():
 
 
 def test_catalog_wire_hash_and_registration_definitions_are_exact():
+    """Scope: the exact sha256 of the 26-operation catalog payload, which is
+    what byte-for-byte means here. Unlike the reachability contract's catalog
+    test, which pins operation names and handler bindings, this pins the wire
+    bytes -- so it is what falsifies "execution/v1 is unchanged" when a new
+    ActionQ wheel is published for a second domain."""
     catalog = catalog_metadata()
     payload = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode()
 

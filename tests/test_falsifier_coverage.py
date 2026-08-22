@@ -192,6 +192,30 @@ def test_every_falsifier_scope_is_restated_by_the_test_it_names() -> None:
             )
 
 
+def test_no_two_claims_declare_the_same_scope() -> None:
+    """The half of claim-to-scope agreement a machine can actually check.
+
+    The gate binds scope to the named test's docstring, and nothing binds the
+    *claim* to the scope -- a semantic relation no test can verify. But its
+    commonest failure is mechanical: a scope string copied from another
+    falsifier along with its test reference, leaving a claim cited by a test
+    that would not fail if the claim were false. That produced a false-positive
+    coverage entry in the W4 scope document, inflating its honest 1-of-6 to
+    2-of-6. Identical scopes across distinct claims are what that looks like.
+    """
+    seen: dict[str, str] = {}
+    for path, text in _documents():
+        for entry in _falsifiers(text, path):
+            scope = _flow(entry["scope"])
+            if scope in seen and seen[scope] != entry["id"]:
+                pytest.fail(
+                    f"{path}: falsifier {entry['id']!r} declares the same scope as "
+                    f"{seen[scope]!r}; a copied scope usually means a copied test reference "
+                    "that does not falsify this claim"
+                )
+            seen[scope] = entry["id"]
+
+
 def test_falsifier_coverage_meets_the_pinned_minimum_per_document() -> None:
     """Per document, never pooled.
 

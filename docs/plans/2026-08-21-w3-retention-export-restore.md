@@ -213,7 +213,7 @@ test that is supposed to prove it.
   {
     "id": "w3-no-delete-capable-surface",
     "claim": "Destructive archive action is manual only; no code or role can prune a federation row.",
-    "scope": "no role the frozen boundary installs holds DELETE or TRUNCATE on any federation table",
+    "scope": "It says nothing about a superuser or the table owner, which is why destructive archive stays a manual, owner-approved action rather than something the schema alone can prevent.",
     "test": "tests/test_federation_backfill_rebuild.py::test_no_federation_pruning_capability_exists"
   },
   {
