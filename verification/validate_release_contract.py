@@ -114,8 +114,12 @@ def validate_wheel(wheel_path: Path, tag: str | None = None) -> None:
         raise AssertionError(f"wheel is not an ActionQ wheel: {wheel_path.name}")
 
     project = _project_metadata()
-    if project["version"] != "0.1.26":
-        raise AssertionError("the release contract is frozen to ActionQ 0.1.26")
+    # Frozen to the version the Vuoro composition pins, and moved only by the
+    # tranche that publishes a new one. W4 is that tranche: it adds the
+    # federation serving surface, which cannot reach a deployment without a
+    # wheel, and a released wheel cannot be amended afterwards.
+    if project["version"] != "0.1.27":
+        raise AssertionError("the release contract is frozen to ActionQ 0.1.27")
     if "actionq-contracts==0.1.1" not in project["dependencies"]:
         raise AssertionError("actionq-contracts must remain pinned at 0.1.1")
 

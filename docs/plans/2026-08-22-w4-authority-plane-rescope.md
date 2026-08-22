@@ -1,8 +1,17 @@
 # W4 rescoped: federation as authority-plane contracts
 
-Status: **scope proposal, not authorization to build.** Supersedes
-`docs/plans/2026-08-22-w4-scope.md` (PR #40, paused as architecturally superseded). That
-document's corrections are retained and carried forward here; what it could not settle —
+Status: **authorized and built** (2026-08-22). This document was ratified as a scope proposal
+and the build it scopes is `actionq/vuoro_federation.py` plus its contract test, reachability
+entries and the 0.1.27 version bump. The "not authorization to build" line it originally carried
+is retired here rather than deleted quietly, because a reader arriving at this document later
+needs to know it stopped being a proposal and when.
+
+What remains unauthorized is unchanged and is not weakened by that: no migration is run, nothing
+is deployed, no credential or role is fenced, and no grant is issued. Those are W5 and remain
+operator-owned.
+
+Supersedes `docs/plans/2026-08-22-w4-scope.md` (PR #40, paused as architecturally superseded).
+That document's corrections are retained and carried forward here; what it could not settle —
 section 2, "the manifest cannot express five domains today" — is settled elsewhere and no longer
 blocks anything.
 

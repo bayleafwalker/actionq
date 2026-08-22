@@ -10,6 +10,7 @@
   "dispositions": [
     "retain-as-frozen-archive",
     "replace-by-federation",
+    "federation-successor",
     "historicalize/delete",
     "unresolved-owner-decision"
   ],
@@ -125,6 +126,17 @@
       "disposition": "unresolved-owner-decision",
       "owner": "actionq-runner-decision-owner-pending-ratification",
       "falsifying_test": "Runner gains an import edge to the root actionq package, or W6 closes without a reviewed retire/extract/transfer decision and zero federation reach."
+    },
+    {
+      "id": "federation-serving-import-edges",
+      "edges": [
+        "actionq.vuoro_federation|from|actionq.federation|FederationAuthority,FederationPrincipal",
+        "actionq.vuoro_federation|from|actionq|db",
+        "actionq.vuoro_federation|from|actionq|federation_schema"
+      ],
+      "disposition": "federation-successor",
+      "owner": "actionq+vuoro",
+      "falsifying_test": "The federation serving surface imports execution application or queue machinery, which would make a federation request assert execution schema readiness."
     },
     {
       "id": "frozen-execution-contract-package-edge",
@@ -246,6 +258,21 @@
       "falsifying_test": "Execution/v1 read operation bytes/hashes drift before explicit catalog removal or an archive read writes either domain."
     },
     {
+      "id": "federation-resource-ledger-operations",
+      "operations": [
+        "federation.acceptance.decide",
+        "federation.resource.create",
+        "federation.resource.execution-ref",
+        "federation.resource.relate",
+        "federation.resource.snapshot",
+        "federation.resource.supersede",
+        "federation.settlement.record"
+      ],
+      "disposition": "federation-successor",
+      "owner": "actionq+vuoro",
+      "falsifying_test": "A federation operation is added, removed or rebound, or one of them binds an ActionQApplication method, which would put the frozen execution schema's readiness assertion on a federation request."
+    },
+    {
       "id": "catalog-evidence-and-observation-successors",
       "operations": [
         "execution.action.create-immutable-candidate",
@@ -286,7 +313,14 @@
     "execution.session-completion.list": "list_session_completions",
     "execution.session-completion.replay": "list_session_completions",
     "execution.session.list": "list_sessions",
-    "execution.session.record": "record_session"
+    "execution.session.record": "record_session",
+    "federation.acceptance.decide": "decide_acceptance",
+    "federation.resource.create": "create",
+    "federation.resource.execution-ref": "record_execution_ref",
+    "federation.resource.relate": "add_relation",
+    "federation.resource.snapshot": "snapshot",
+    "federation.resource.supersede": "supersede",
+    "federation.settlement.record": "record_settlement"
   },
   "migration_groups": [
     {
@@ -396,6 +430,7 @@
         "tests/test_completion_log_integration.py",
         "tests/test_completion_outbox.py",
         "tests/test_federation_backfill_rebuild.py",
+        "tests/test_federation_catalog_contract.py",
         "tests/test_federation_revision_authority.py",
         "tests/test_integration_immutable_actions.py",
         "tests/test_integration_postgres.py",
@@ -1044,6 +1079,26 @@
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "Execution migration bytes/order/checksums drift, execution 013 appears, or schema mechanics keep importing the monolithic db after seam extraction."
+    },
+    {
+      "id": "federation-serving-surface",
+      "path": "actionq/vuoro_federation.py",
+      "symbols": [
+        "AdapterOperation",
+        "FederationPrincipalError",
+        "principal_from_identity",
+        "_object",
+        "_definition",
+        "build_operations",
+        "catalog_metadata",
+        "build",
+        "register",
+        "register_operations",
+        "compatibility_record"
+      ],
+      "disposition": "federation-successor",
+      "owner": "actionq+vuoro",
+      "falsifying_test": "The federation/v1 catalog acquires an execution operation, a write tolerates a missing idempotency key, an execution reference gains a field that could carry an instruction, or an unminted principal id reaches the resource ledger."
     },
     {
       "id": "legacy-vuoro-execution-adapter",
