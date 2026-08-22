@@ -41,7 +41,27 @@ TrueNAS `storage_layer` share:
 
 The export bytes are `actionq-contracts.canonical_bytes` over a fully ordered
 `federation-export/v1` document, so two exports of identical database content are
-byte-identical and independently digestible. Scheduling the periodic write is W5 operator
+byte-identical and independently digestible. Text order keys are compared under
+`COLLATE "C"`, so byte-identity survives a restore onto a cluster with a different
+`lc_collate` and a glibc/ICU collation update on this one — neither of which is a
+property of the data.
+
+The document is self-describing. Besides the nine tables it carries the schema version
+and compatibility label it was produced under, the producing ActionQ package version, and
+the federation migration ledger's `(version, name, checksum)` triples. That last matters
+because the first frozen invariant is that those triples never change, and a *restored*
+schema's own ledger is written by the restoring wheel — so without carrying them, the
+artifact could not evidence the invariant it is retained to evidence. `produced_at` and
+`source` are caller-supplied rather than read from the environment, so an export stays a
+pure function of its inputs and the byte-identity property above holds when they are
+omitted.
+
+**Known gap, owned by W5.** This designates a single TrueNAS path as the durable-
+authoritative record while demoting a mechanism (CNPG/Barman) that is compressed,
+versioned and offsite. The retention *windows* are as stated, but the engineering around
+the designated artifact is not yet equivalent: redundancy, snapshot policy, an offsite
+copy, a stored digest sidecar and a periodic integrity check are all W5 operator
+obligations and none of them exist today. No export has yet been written to that path. Scheduling the periodic write is W5 operator
 deployment work; W3 owns and proves the code path and the format, and names the target path
 here so W5 has nothing left to invent.
 
@@ -66,6 +86,12 @@ convention.
 Any destructive archive action requires explicit written owner approval recorded against the
 separate W7 destructive-retirement plan, which remains unauthorized.
 
+This is proved at the database rather than by convention: W3 asserts that no role the
+frozen boundary installs — migration, command, or a denied end-actor role — holds `DELETE`
+or `TRUNCATE` on any of the nine federation tables. A source-level check that no module
+contains a delete statement would not survive a third module, a later migration, or an
+operator at a `psql` prompt; a privilege assertion does.
+
 ## 5. Backfilled versus native facts
 
 Invariant #5 of "CAS, fencing, projection and rebuild" requires backfilled archive facts to
@@ -80,11 +106,41 @@ the distinction is **convention over reserved values**, not a schema feature:
 2. every backfilled execution reference carries an `assurance_type` beginning
    `legacy-provenance/` (`actionq.federation_backfill.LEGACY_ASSURANCE_PREFIX`).
 
-`actionq.federation_backfill.is_backfilled_change` is the single reader for (1). W3 asserts
+`actionq.federation_backfill.is_backfilled_change` is the single reader for (1), and the
+principal id is pinned in code rather than being a caller-supplied parameter. W3 asserts
 both, and asserts that no backfilled resource ever reaches `accepted`, `rejected` or a
 settlement.
 
-## 6. What this contract does not do
+## 6. What W3 preserves, and what it does not
+
+W3 preserves legacy **identity and shape**, not content. From a federation resource plus
+the export you can recover that an action existed, its status at import time, the ids and
+types of its events, its action-resource root and recovery floor, its candidate request,
+and its parent. You cannot recover anything descriptive or temporal: `action_type`,
+`project`, `target_ref`, `created_by`, `priority`, `result_ref`, `failure_reason` and
+every legacy timestamp are deliberately not imported, and `federation_execution_refs.
+created_at` records the *import* time, not the legacy time. Execution groups, dispatch
+requests, managed-dispatch envelopes and individual session-completion events are outside
+the mapping entirely; only the completion watermark is imported.
+
+That is correct while the execution schema still exists, and it is the reason W3 is safe
+to run before any retirement decision. It stops being sufficient at the point the
+execution schema is retired, when this export becomes the only surviving record — at which
+point an archive that can say action 4711 completed, but not when or what it was, is
+probably not what the owner wants. **Extending the mapping to preserve content is
+therefore a prerequisite of any W7 destructive-retirement plan, not of W3.** W7 remains
+unauthorized; this contract records the dependency so that decision is made deliberately
+rather than discovered afterwards.
+
+Backfilled resource references are deterministic and therefore precomputable by anyone who
+knows the environment name. `create` is first-writer-wins with no delete and no
+supersede-and-retry path, so a principal holding `federation.create` could occupy them and
+permanently block the import. **The backfill must therefore complete before any native
+principal is granted `federation.create` in an environment.** The freeze doc's release
+ordering already arranges this; stating it here makes the dependency explicit rather than
+incidental.
+
+## 7. What this contract does not do
 
 It does not change the execution-schema retention window, the CNPG policy, any Vuoro
 catalog, or W7's authorization state.

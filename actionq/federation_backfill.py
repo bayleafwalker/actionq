@@ -126,10 +126,12 @@ def legacy_completion_ref(*, environment: str) -> str:
     return f"{LEGACY_COMPLETION_NAMESPACE}:{_require_environment(environment)}"
 
 
-def legacy_assurance_type(kind: str) -> str:
+def legacy_assurance_type(kind: str, *, mapping_version: str = BACKFILL_MAPPING_VERSION) -> str:
     if not isinstance(kind, str) or not kind:
         raise db.ActionQError("legacy assurance kind is required")
-    return f"{LEGACY_ASSURANCE_PREFIX}{BACKFILL_MAPPING_VERSION}:{kind}"
+    if not isinstance(mapping_version, str) or not mapping_version:
+        raise db.ActionQError("mapping version is required")
+    return f"{LEGACY_ASSURANCE_PREFIX}{mapping_version}:{kind}"
 
 
 def deterministic_resource_ref(legacy_ref: str, *, mapping_version: str = BACKFILL_MAPPING_VERSION) -> str:
@@ -218,8 +220,14 @@ class LegacySource:
     a known resource ref plus principal scope, and its rows exist only for
     actions enqueued through it -- so action-resource roots, candidate requests
     and the session-completion watermark, which have no public reader at all,
-    are read here with plain SELECTs, marked, in one place.  When W6 extracts
-    ``actionq.storage`` this class is the only thing that moves.
+    are read here with plain SELECTs, marked, in one place.
+
+    This is the only place that *reaches* the legacy schema, so W6's extraction
+    of ``actionq.storage`` lands here.  It is not, however, the only place that
+    knows the legacy row *shape*: ``_source_facts`` reads specific keys off the
+    dicts returned below, so the seam is a data contract between the two, not a
+    boundary one of them can move across alone.  Every column selected here is
+    consumed by that mapping; nothing descriptive is read and then dropped.
 
     Every read is bounded by ``limit`` and every read *refuses* a result that
     reaches it.  A silently truncated read would produce a quietly incomplete
@@ -228,20 +236,30 @@ class LegacySource:
     that was never offered to it.
     """
 
-    def __init__(self, *, connection: Callable[[], Any], schema: str, limit: int = 100_000):
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-            raise db.ActionQError("legacy read limit must be a positive integer")
+    def __init__(self, *, connection: Callable[[], Any], schema: str, limit: int = 100_000,
+                 event_limit: int | None = None):
+        for name, value in (("limit", limit), ("event_limit", event_limit)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise db.ActionQError(f"legacy read {name} must be a positive integer")
         self.connection = connection
         self.schema = db.schema_name(schema)
         self.limit = limit
+        # Events outnumber actions by roughly an order of magnitude, so one
+        # shared bound would refuse the whole import on event count long before
+        # the action count came near it -- and raising it would multiply every
+        # other read at the same time.
+        self.event_limit = event_limit if event_limit is not None else limit * 20
 
     def _q(self, table: str) -> str:
         return db.qname(self.schema, table)
 
-    def _bounded(self, rows: list[Any], table: str) -> list[Any]:
-        if len(rows) >= self.limit:
+    def _bounded(self, rows: list[Any], table: str, limit: int | None = None) -> list[Any]:
+        bound = self.limit if limit is None else limit
+        if len(rows) >= bound:
             raise db.ActionQError(
-                f"legacy read of {table} reached the {self.limit}-row limit; "
+                f"legacy read of {table} reached the {bound}-row limit; "
                 "raise LegacySource(limit=...) rather than importing a truncated history"
             )
         return rows
@@ -274,8 +292,8 @@ class LegacySource:
         rows = self._bounded(conn.execute(
             f"SELECT id, action_id, event_type FROM {self._q('events')} "
             "WHERE action_id = ANY(%s) ORDER BY action_id, id LIMIT %s",
-            (selected, self.limit),
-        ).fetchall(), "events")
+            (selected, self.event_limit),
+        ).fetchall(), "events", self.event_limit)
         for row in rows:
             grouped[int(row["action_id"])].append(dict(row))
         return grouped
@@ -287,16 +305,11 @@ class LegacySource:
         LIMIT: a differently-ordered slice would drop the root of an action that
         *was* imported, and nothing downstream could detect the omission.
         """
-        return self._by_action(
-            conn, "action_resources", "action_id, resource_ref, revision, recovery_floor, state", action_ids,
-        )
+        return self._by_action(conn, "action_resources", "action_id, resource_ref, recovery_floor", action_ids)
 
     def candidate_requests(self, conn: Any, action_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
         """Immutable candidate requests for the selected actions (no public reader)."""
-        return self._by_action(
-            conn, "immutable_action_requests",
-            "action_id, request_ref, plan_ref, topology, role, subject", action_ids,
-        )
+        return self._by_action(conn, "immutable_action_requests", "action_id, request_ref", action_ids)
 
     def _by_action(self, conn: Any, table: str, columns: str,
                    action_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
@@ -338,8 +351,26 @@ class FederationBackfill:
     def _ref(self, legacy_ref: str) -> str:
         return deterministic_resource_ref(legacy_ref, mapping_version=self.mapping_version)
 
-    def _key(self, operation: str, fact: str) -> str:
-        return f"backfill:{self.mapping_version}:{operation}:{fact}"
+    def _key(self, operation: str, resource_ref: str, fact: tuple[str, ...]) -> str:
+        """Globally unique idempotency key for one fact.
+
+        A fact tuple is only unique *within* its resource -- ("create",) is the
+        same tuple for every resource -- while the command ledger's identity is
+        (environment, principal, operation, key).  The resource reference is
+        therefore part of the key, not just the fact.
+        """
+        return "\x1f".join(("backfill", self.mapping_version, operation, resource_ref, *fact))
+
+    def _assurance(self, kind: str) -> str:
+        """This instance's assurance type.
+
+        Scoped to the instance's mapping version, not the module default: refs
+        and idempotency keys already honour a caller-supplied mapping_version,
+        and an assurance type that did not would silently label a v2 import as
+        v1 -- a mislabelled import rather than an error, since assurance_type is
+        part of the record-execution-ref request digest.
+        """
+        return legacy_assurance_type(kind, mapping_version=self.mapping_version)
 
     def _read(self) -> dict[str, Any]:
         with self.source.connection() as conn, conn.transaction():
@@ -354,66 +385,64 @@ class FederationBackfill:
                 "watermark": self.source.completion_watermark(conn),
             }
 
-    def plan(self) -> tuple[BackfillCommand, ...]:
-        """The full command sequence for the current legacy snapshot.
+    def _source_facts(self) -> list[tuple[str, list[tuple[tuple[str, ...], str, dict[str, Any]]]]]:
+        """The legacy snapshot as ordered per-resource facts, before revisions.
 
-        Expected revisions come from this plan's own counters, never from live
-        federation state: a rerun must re-issue byte-identical requests so the
-        command-decision ledger replays them, and a request digest that embedded
-        an already-advanced live revision would not replay.
+        Pure function of the legacy source: identity, order and arguments only.
+        Revision numbers are assigned separately by ``plan()``, which is what
+        lets an already-recorded fact keep the revision it was first written at.
         """
         legacy = self._read()
-        commands: list[BackfillCommand] = []
-        revisions: dict[str, int] = {}
+        facts: dict[str, list[tuple[tuple[str, ...], str, dict[str, Any]]]] = {}
+        order: list[str] = []
 
-        def create(legacy_ref: str) -> str:
+        def resource(legacy_ref: str) -> str:
             resource_ref = self._ref(legacy_ref)
-            commands.append(BackfillCommand(
-                "create", self._key("create", legacy_ref), resource_ref, 0, {"resource_ref": resource_ref},
-            ))
-            revisions[resource_ref] = 1
+            facts[resource_ref] = [(("create",), "create", {"resource_ref": resource_ref})]
+            order.append(resource_ref)
             return resource_ref
 
         def execution_ref(resource_ref: str, reference: str, kind: str) -> None:
-            expected = revisions[resource_ref]
-            commands.append(BackfillCommand(
-                "record-execution-ref", self._key("record-execution-ref", reference), resource_ref, expected,
+            facts[resource_ref].append((
+                ("execution-ref", reference), "record-execution-ref",
                 {"resource_ref": resource_ref, "execution_ref": reference,
-                 "assurance_type": legacy_assurance_type(kind)},
+                 "assurance_type": self._assurance(kind)},
             ))
-            revisions[resource_ref] = expected + 1
 
-        def relation(source_ref: str, target_ref: str, fact: str) -> None:
-            expected = revisions[source_ref]
-            commands.append(BackfillCommand(
-                "add-relation", self._key("add-relation", fact), source_ref, expected,
+        def relation(source_ref: str, target_ref: str) -> None:
+            facts[source_ref].append((
+                ("relation", "parent-of", target_ref), "add-relation",
                 {"source_ref": source_ref, "relation_type": "parent-of", "target_ref": target_ref},
             ))
-            revisions[source_ref] = expected + 1
 
         planned: dict[int, str] = {}
         for action in legacy["actions"]:
             action_id = int(action["id"])
             legacy_ref = legacy_execution_ref(environment=self.environment, action_id=action_id)
-            resource_ref = create(legacy_ref)
+            resource_ref = resource(legacy_ref)
             planned[action_id] = resource_ref
             execution_ref(resource_ref, legacy_ref, "action")
-            execution_ref(resource_ref, f"{legacy_ref}#status:{action['status']}", "status")
-            for event in legacy["events"][action_id]:
-                execution_ref(
-                    resource_ref, f"{legacy_ref}#event:{int(event['id'])}", f"event:{event['event_type']}",
-                )
             root = legacy["action_resources"].get(action_id)
             if root is not None:
                 execution_ref(resource_ref, f"{legacy_ref}#action-resource:{root['resource_ref']}", "action-resource")
-                execution_ref(
-                    resource_ref, f"{legacy_ref}#action-resource-recovery-floor:{int(root['recovery_floor'])}",
-                    "action-resource-recovery-floor",
-                )
             candidate = legacy["candidate_requests"].get(action_id)
             if candidate is not None:
                 execution_ref(
                     resource_ref, f"{legacy_ref}#candidate-request:{candidate['request_ref']}", "candidate-request",
+                )
+            # Facts whose *value* is mutable, and facts whose cardinality grows,
+            # are emitted last in each chain.  A legacy status transition or a
+            # new event then only ever appends: it never needs a revision that
+            # an already-recorded fact was written at.
+            execution_ref(resource_ref, f"{legacy_ref}#status:{action['status']}", "status")
+            if root is not None:
+                execution_ref(
+                    resource_ref, f"{legacy_ref}#action-resource-recovery-floor:{int(root['recovery_floor'])}",
+                    "action-resource-recovery-floor",
+                )
+            for event in legacy["events"][action_id]:
+                execution_ref(
+                    resource_ref, f"{legacy_ref}#event:{int(event['id'])}", f"event:{event['event_type']}",
                 )
 
         for action in legacy["actions"]:
@@ -426,15 +455,15 @@ class FederationBackfill:
                 # anyway would be rejected as target-not-found and abort an
                 # otherwise-correct import; the child is still imported whole.
                 continue
-            child_id = int(action["id"])
-            relation(parent_ref, planned[child_id], f"parent-of:{int(parent_id)}:{child_id}")
+            relation(parent_ref, planned[int(action["id"])])
 
         watermark = legacy["watermark"]
         if watermark is not None:
             legacy_ref = legacy_completion_ref(environment=self.environment)
-            resource_ref = create(legacy_ref)
-            planned[0] = resource_ref
+            resource_ref = resource(legacy_ref)
             execution_ref(resource_ref, legacy_ref, "completion-watermark")
+            # Every remaining watermark fact is a moving counter; all three are
+            # append-only for the same reason as the mutable facts above.
             execution_ref(
                 resource_ref, f"{legacy_ref}#recovery-floor:{int(watermark['recovery_floor'])}",
                 "completion-recovery-floor",
@@ -447,7 +476,65 @@ class FederationBackfill:
                 resource_ref, f"{legacy_ref}#retention-seconds:{int(watermark['retention_seconds'])}",
                 "completion-retention-seconds",
             )
-        return tuple(commands)
+        return [(resource_ref, facts[resource_ref]) for resource_ref in order]
+
+    def plan(self) -> tuple[BackfillCommand, ...]:
+        """The command sequence for the current legacy snapshot and live state.
+
+        Expected revisions are reconciled against what is already recorded, not
+        counted from zero.  A fact already written keeps the revision it was
+        written at, so its request bytes are unchanged and the command-decision
+        ledger replays it; a fact the source has since gained is appended after
+        the resource's current revision.
+
+        That is what makes the import genuinely restartable and monotonic
+        against a *moving* legacy database, not only a frozen one.  Counting
+        from zero instead would renumber every fact after any inserted one,
+        re-issuing their idempotency keys under different canonical requests --
+        which federation.py durably rejects as an idempotency-key conflict, and
+        permanently, since each later run would replan the same conflict.
+
+        Obsolete facts are not removed and not an error.  "At import time this
+        action was pending" stays true after the action completes; an append-only
+        provenance ledger keeps both, which is more faithful than either
+        rewriting the first or refusing the second.
+        """
+        creates: list[BackfillCommand] = []
+        rest: list[BackfillCommand] = []
+        source = self._source_facts()
+        with self.authority.connection() as conn, conn.transaction():
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            live = {resource_ref: self._recorded(conn, resource_ref) for resource_ref, _ in source}
+        for resource_ref, facts in source:
+            revision, recorded, foreign = live[resource_ref]
+            if foreign:
+                raise BackfillDrift(
+                    "a principal other than backfill has written to this backfilled resource; "
+                    "its deterministic identity has been taken over",
+                    resource_ref=resource_ref, fact="",
+                )
+            replays = sorted(
+                ((recorded[fact], fact, operation, arguments)
+                 for fact, operation, arguments in facts if fact in recorded),
+                key=lambda item: item[0],
+            )
+            for source_revision, fact, operation, arguments in replays:
+                (creates if operation == "create" else rest).append(BackfillCommand(
+                    operation, self._key(operation, resource_ref, fact), resource_ref,
+                    source_revision - 1, arguments,
+                ))
+            expected = revision
+            for fact, operation, arguments in facts:
+                if fact in recorded:
+                    continue
+                (creates if operation == "create" else rest).append(BackfillCommand(
+                    operation, self._key(operation, resource_ref, fact), resource_ref, expected, arguments,
+                ))
+                expected += 1
+        # Every create precedes every other command: add-relation names a target
+        # resource that must already exist, and relations are planned inside the
+        # source resource's own chain.
+        return tuple(creates + rest)
 
     def _dispatch(self, command: BackfillCommand) -> CommandDecision:
         if command.operation not in _PROVENANCE_OPERATIONS:
@@ -462,23 +549,17 @@ class FederationBackfill:
             expected_revision=command.expected_revision, **command.arguments,
         )
 
-    @staticmethod
-    def _fact(command: BackfillCommand) -> tuple[str, ...]:
-        """This command's identity within its resource's revision chain."""
-        if command.operation == "create":
-            return ("create",)
-        if command.operation == "record-execution-ref":
-            return ("execution-ref", command.arguments["execution_ref"])
-        return ("relation", command.arguments["relation_type"], command.arguments["target_ref"])
-
-    def _recorded(self, conn: Any, resource_ref: str) -> tuple[int, dict[tuple[str, ...], int]]:
+    def _recorded(self, conn: Any, resource_ref: str) -> tuple[int, dict[tuple[str, ...], int], bool]:
+        """This resource's live revision, the revision each fact was written at,
+        and whether any change on it came from a principal other than backfill.
+        """
         schema = self.authority.schema
         root = conn.execute(
             f"SELECT revision FROM {db.qname(schema, 'federation_resources')} WHERE resource_ref=%s",
             (resource_ref,),
         ).fetchone()
         if root is None:
-            return 0, {}
+            return 0, {}, False
         recorded: dict[tuple[str, ...], int] = {("create",): 1}
         for row in conn.execute(
             f"SELECT execution_ref, source_revision FROM {db.qname(schema, 'federation_execution_refs')} "
@@ -490,63 +571,21 @@ class FederationBackfill:
             "WHERE source_ref=%s", (resource_ref,),
         ).fetchall():
             recorded["relation", str(row["relation_type"]), str(row["target_ref"])] = int(row["source_revision"])
-        return int(root["revision"]), recorded
-
-    def _require_no_drift(self, commands: tuple[BackfillCommand, ...]) -> None:
-        """Refuse, before writing anything, an import whose source has moved.
-
-        Expected revisions come from the plan's own counters, so a legacy row
-        that changes between runs shifts every later command in that resource's
-        chain: the same idempotency key is re-issued under a different canonical
-        request, which federation.py durably rejects as an idempotency-key
-        conflict -- permanently, since every later run replans the same
-        conflicting command.  A resume must therefore see the same source
-        snapshot as the run it is resuming.  Detecting that here turns a cryptic
-        mid-import abort into one upfront error naming the exact fact, and
-        leaves no partial write behind.
-        """
-        by_resource: dict[str, list[BackfillCommand]] = {}
-        for command in commands:
-            by_resource.setdefault(command.resource_ref, []).append(command)
-        with self.authority.connection() as conn, conn.transaction():
-            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            for resource_ref, planned in by_resource.items():
-                revision, recorded = self._recorded(conn, resource_ref)
-                if revision == 0:
-                    continue
-                for command in planned:
-                    fact = self._fact(command)
-                    after = command.expected_revision + 1
-                    position = recorded.pop(fact, None)
-                    if after <= revision and position != after:
-                        raise BackfillDrift(
-                            f"legacy source changed under a part-recorded import: {fact} is planned at "
-                            f"revision {after} but is recorded at {position}",
-                            resource_ref=resource_ref, fact=":".join(fact),
-                        )
-                    if after > revision and position is not None:
-                        raise BackfillDrift(
-                            f"legacy source changed under a part-recorded import: {fact} is already "
-                            f"recorded at revision {position} but is planned at {after}",
-                            resource_ref=resource_ref, fact=":".join(fact),
-                        )
-                if recorded:
-                    lost = sorted(recorded)[0]
-                    raise BackfillDrift(
-                        f"legacy source no longer offers a fact this import already recorded: {lost}",
-                        resource_ref=resource_ref, fact=":".join(lost),
-                    )
+        foreign = conn.execute(
+            f"SELECT 1 FROM {db.qname(schema, 'federation_resource_changes')} "
+            "WHERE resource_ref=%s AND actor_principal_id <> %s LIMIT 1",
+            (resource_ref, self.principal.principal_id),
+        ).fetchone()
+        return int(root["revision"]), recorded, foreign is not None
 
     def run(self) -> BackfillReport:
         """Apply the plan.
 
-        Restartable against the same legacy snapshot: a resumed run replays the
-        stored decision for every command already applied.  A source that has
-        changed since a part-recorded run is refused up front by
-        ``_require_no_drift`` rather than aborting partway through.
+        Restartable and incremental: every fact already recorded replays its
+        stored decision byte for byte, and every fact the legacy source has
+        gained since is appended.  Nothing is rewritten and nothing is removed.
         """
         commands = self.plan()
-        self._require_no_drift(commands)
         applied = replayed = 0
         resource_refs: list[str] = []
         for command in commands:
@@ -568,17 +607,31 @@ class FederationBackfill:
             applied=applied, replayed=replayed, resource_refs=tuple(resource_refs),
         )
 
-    def verify(self) -> tuple[dict[str, Any], ...]:
-        """Rebuild every planned resource from its changes and compare.
+    def verify(self, resource_refs: Sequence[str] | None = None) -> tuple[dict[str, Any], ...]:
+        """Rebuild the given resources from their changes and compare.
+
+        Pass ``BackfillReport.resource_refs`` to verify exactly what a run
+        wrote.  With no argument the current source is replanned, and resources
+        that do not exist yet are skipped rather than raising -- a legacy action
+        enqueued between run() and verify() is not a verification failure.
 
         One repeatable-read snapshot for the whole comparison: rebuild and live
         projection are separate statements, and a federation command committing
         between them would report a spurious mismatch on healthy data.
         """
-        refs = [command.resource_ref for command in self.plan() if command.operation == "create"]
+        selected = list(resource_refs) if resource_refs is not None else [
+            resource_ref for resource_ref, _ in self._source_facts()
+        ]
         with self.authority.connection() as conn, conn.transaction():
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            return tuple(verify_rebuild(conn, self.authority.schema, resource_ref) for resource_ref in refs)
+            existing = [
+                resource_ref for resource_ref in selected
+                if conn.execute(
+                    f"SELECT 1 FROM {db.qname(self.authority.schema, 'federation_resources')} WHERE resource_ref=%s",
+                    (resource_ref,),
+                ).fetchone() is not None
+            ]
+            return tuple(verify_rebuild(conn, self.authority.schema, resource_ref) for resource_ref in existing)
 
 
 def _q(schema: str, table: str) -> str:
@@ -805,47 +858,53 @@ def require_rebuild_matches(conn: Any, schema: str, resource_ref: str) -> dict[s
 # Export column shape: table -> ((column, kind), ...).  Kinds are explicit
 # because canonical_bytes accepts neither bytes nor datetimes, and an export
 # that guessed per value would not round-trip a NULL column back to its type.
-_EXPORT_TABLES: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+# Export shape: table -> (columns, primary key).  Kinds are explicit because
+# canonical_bytes accepts neither bytes nor datetimes, and an export that
+# guessed per value would not round-trip a NULL column back to its type.  The
+# column set is pinned against federation_schema._COLUMN_SHAPE by test, so a
+# migration that adds a column fails loudly instead of silently dropping it
+# from the artifact the retention contract calls the indefinite record.
+_EXPORT_TABLES: tuple[tuple[str, tuple[tuple[str, str], ...], tuple[str, ...]], ...] = (
     ("federation_resources", (
         ("resource_ref", "text"), ("owner_principal_id", "text"), ("state", "text"),
         ("revision", "int"), ("recovery_floor", "int"), ("created_at", "time"), ("updated_at", "time"),
-    )),
+    ), ("resource_ref",)),
     ("federation_resource_changes", (
         ("resource_ref", "text"), ("revision", "int"), ("operation", "text"), ("state", "text"),
         ("actor_principal_id", "text"), ("payload_bytes", "bytes"), ("payload_digest", "text"),
         ("occurred_at", "time"),
-    )),
+    ), ("resource_ref", "revision")),
     ("federation_relations", (
         ("source_ref", "text"), ("relation_type", "text"), ("target_ref", "text"),
         ("source_revision", "int"), ("created_at", "time"),
-    )),
+    ), ("source_ref", "relation_type", "target_ref")),
     ("federation_execution_refs", (
         ("resource_ref", "text"), ("execution_ref", "text"), ("assurance_type", "text"),
         ("source_revision", "int"), ("created_at", "time"),
-    )),
+    ), ("resource_ref", "execution_ref")),
     ("federation_evidence", (
         ("resource_ref", "text"), ("evidence_ref", "text"), ("evidence_digest", "text"),
         ("assurance_type", "text"), ("source_revision", "int"), ("created_at", "time"),
-    )),
+    ), ("resource_ref", "evidence_ref")),
     ("federation_acceptance_decisions", (
         ("resource_ref", "text"), ("source_revision", "int"), ("outcome", "text"),
         ("policy_ref", "text"), ("evidence_ref", "text"), ("decided_by", "text"), ("created_at", "time"),
-    )),
+    ), ("resource_ref", "source_revision")),
     ("federation_settlements", (
         ("resource_ref", "text"), ("source_revision", "int"), ("fact_ref", "text"),
         ("reconciled_by", "text"), ("created_at", "time"),
-    )),
+    ), ("resource_ref", "source_revision")),
     ("federation_idempotency_bindings", (
         ("environment", "text"), ("principal_id", "text"), ("operation", "text"),
         ("idempotency_key", "text"), ("request_digest", "text"), ("created_at", "time"),
-    )),
+    ), ("environment", "principal_id", "operation", "idempotency_key")),
     ("federation_command_decisions", (
         ("environment", "text"), ("principal_id", "text"), ("operation", "text"),
         ("idempotency_key", "text"), ("request_digest", "text"), ("status", "text"),
         ("code", "text"), ("message", "text"), ("response_bytes", "bytes"),
         ("response_digest", "text"), ("resource_ref", "text"),
         ("before_revision", "int"), ("after_revision", "int"), ("decided_at", "time"),
-    )),
+    ), ("environment", "principal_id", "operation", "idempotency_key", "request_digest")),
 )
 
 
@@ -888,40 +947,82 @@ def _decode(value: Any, kind: str) -> Any:
     return value
 
 
-def export_federation(conn: Any, schema: str) -> bytes:
+def _order_by(columns: tuple[tuple[str, str], ...], keys: tuple[str, ...]) -> str:
+    """Ordering over the primary key, with text keys forced to C collation.
+
+    Database collation is not a property of the data.  Ordering text keys under
+    the cluster's lc_collate makes two exports of identical content differ
+    byte-for-byte across clusters -- and across a glibc/ICU collation update on
+    one cluster, which matters on the multi-decade horizon this artifact claims.
+    """
+    kinds = dict(columns)
+    return ", ".join(
+        f'{key} COLLATE "C"' if kinds[key] == "text" else key for key in keys
+    )
+
+
+def export_federation(conn: Any, schema: str, *, produced_at: str | None = None,
+                      source: str | None = None) -> bytes:
     """Canonical logical dump of every federation v1 table.
 
     The durable-authoritative export named by the checked-in retention contract:
     independent of, and additional to, the whole-cluster physical backup, whose
-    retention window is far shorter than federation data's.  Two exports of
-    identical content are byte-identical.
+    retention window is far shorter than federation data's.
+
+    The document is self-describing.  A reader decades from now, holding these
+    bytes and nothing else, gets the schema version and compatibility label it
+    was produced under, the producing package version, the federation migration
+    ledger's name/checksum triples (which the first frozen invariant says never
+    change, and which a restored schema's own ledger cannot evidence because it
+    is written by the *restoring* wheel), and the source it was taken from.
+
+    ``produced_at`` and ``source`` are caller-supplied rather than read from the
+    environment, so an export is a pure function of its inputs: omit them and
+    two exports of identical content are byte-identical, which is the property
+    the retention contract relies on for restore-and-compare.
 
     All nine tables are read in one repeatable-read snapshot.  Under the default
-    read-committed isolation each statement takes a fresh snapshot even inside a
-    single transaction, so a concurrent command could otherwise tear the
-    document -- a change row for a resource missing from the resources dump, or
-    a resource at revision N carrying only N-1 changes, either of which fails
-    restore or rebuild.  Because a snapshot can only be selected before the
-    transaction's first query, pass a connection with no statements yet issued
-    in the current transaction.
+    read-committed isolation each statement takes a fresh snapshot, so a
+    concurrent command could otherwise tear the document -- a change row for a
+    resource missing from the resources dump, or a resource at revision N
+    carrying only N-1 changes, either of which fails restore or rebuild.  The
+    transaction is opened here rather than assumed: SET TRANSACTION outside a
+    transaction block is a silent no-op, so a caller-supplied autocommit
+    connection would have lost the protection without any error.
     """
-    conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-    compatibility = federation_schema.require_compatible(conn, schema)
-    tables: dict[str, Any] = {}
-    for table, columns in _EXPORT_TABLES:
-        names = [name for name, _ in columns]
-        order = ",".join(str(position) for position in range(1, len(names) + 1))
-        rows = conn.execute(
-            f"SELECT {','.join(names)} FROM {_q(schema, table)} ORDER BY {order}"
-        ).fetchall()
-        tables[table] = {
-            "columns": names,
-            "rows": [[_encode(row[name], kind) for name, kind in columns] for row in rows],
-        }
+    from . import __version__ as producer_version
+
+    with conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        compatibility = federation_schema.require_compatible(conn, schema)
+        ledger = [
+            {"version": int(row["version"]), "name": str(row["name"]), "checksum": str(row["checksum"])}
+            for row in conn.execute(
+                f"SELECT version, name, checksum FROM {_q(schema, federation_schema.MIGRATION_TABLE)} "
+                "WHERE domain=%s ORDER BY version", (federation_schema.DOMAIN,),
+            ).fetchall()
+        ]
+        tables: dict[str, Any] = {}
+        for table, columns, keys in _EXPORT_TABLES:
+            names = [name for name, _ in columns]
+            rows = conn.execute(
+                f"SELECT {','.join(names)} FROM {_q(schema, table)} ORDER BY {_order_by(columns, keys)}"
+            ).fetchall()
+            tables[table] = {
+                "columns": names,
+                "rows": [[_encode(row[name], kind) for name, kind in columns] for row in rows],
+            }
     return canonical_bytes({
         "schema_version": _EXPORT_SCHEMA_VERSION,
         "compatibility_label": compatibility.compatibility_label,
         "federation_schema_version": compatibility.observed_schema_version,
+        "provenance": {
+            "producer": "actionq",
+            "producer_version": producer_version,
+            "migration_ledger": ledger,
+            "source": source,
+            "produced_at": produced_at,
+        },
         "tables": tables,
     })
 
@@ -942,32 +1043,40 @@ def restore_federation(conn: Any, schema: str, payload: bytes) -> dict[str, int]
     if not isinstance(document, dict) or document.get("schema_version") != _EXPORT_SCHEMA_VERSION:
         raise ExportError("export payload is not a federation-export/v1 document")
     compatibility = federation_schema.require_compatible(conn, schema)
+    provenance = document.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ExportError("export payload carries no provenance block")
     if document.get("compatibility_label") != compatibility.compatibility_label:
         raise ExportError("export payload was produced under a different compatibility label")
     if document.get("federation_schema_version") != compatibility.observed_schema_version:
         raise ExportError("export payload was produced under a different federation schema version")
     tables = document.get("tables")
-    if not isinstance(tables, dict) or set(tables) != {name for name, _ in _EXPORT_TABLES}:
+    if not isinstance(tables, dict) or set(tables) != {name for name, _, _ in _EXPORT_TABLES}:
         raise ExportError("export payload does not describe every federation table")
 
     restored: dict[str, int] = {}
-    for table, _ in _EXPORT_TABLES:
-        occupied = conn.execute(f"SELECT 1 FROM {_q(schema, table)} LIMIT 1").fetchone()
-        if occupied is not None:
-            raise ExportError(f"restore requires an empty federation schema: {table} is not empty")
-    for table, columns in _EXPORT_TABLES:
-        names = [name for name, _ in columns]
-        described = tables[table]
-        if not isinstance(described, dict) or described.get("columns") != names:
-            raise ExportError(f"export payload column shape does not match {table}")
-        rows = described.get("rows")
-        if not isinstance(rows, list):
-            raise ExportError(f"export payload rows for {table} are not a list")
-        placeholders = ",".join(["%s"] * len(names))
-        statement = f"INSERT INTO {_q(schema, table)} ({','.join(names)}) VALUES ({placeholders})"
-        for row in rows:
-            if not isinstance(row, list) or len(row) != len(columns):
-                raise ExportError(f"export payload row for {table} has the wrong arity")
-            conn.execute(statement, tuple(_decode(value, kind) for value, (_, kind) in zip(row, columns)))
-        restored[table] = len(rows)
+    # One transaction for the emptiness probe and every insert.  Without it a
+    # failure partway through (a hand-edited export violating a CHECK, a dropped
+    # connection) leaves earlier tables populated, and the non-empty guard then
+    # blocks every retry -- the operator would have to hand-truncate the schema.
+    with conn.transaction():
+        for table, _, _ in _EXPORT_TABLES:
+            occupied = conn.execute(f"SELECT 1 FROM {_q(schema, table)} LIMIT 1").fetchone()
+            if occupied is not None:
+                raise ExportError(f"restore requires an empty federation schema: {table} is not empty")
+        for table, columns, _ in _EXPORT_TABLES:
+            names = [name for name, _ in columns]
+            described = tables[table]
+            if not isinstance(described, dict) or described.get("columns") != names:
+                raise ExportError(f"export payload column shape does not match {table}")
+            rows = described.get("rows")
+            if not isinstance(rows, list):
+                raise ExportError(f"export payload rows for {table} are not a list")
+            placeholders = ",".join(["%s"] * len(names))
+            statement = f"INSERT INTO {_q(schema, table)} ({','.join(names)}) VALUES ({placeholders})"
+            for row in rows:
+                if not isinstance(row, list) or len(row) != len(columns):
+                    raise ExportError(f"export payload row for {table} has the wrong arity")
+                conn.execute(statement, tuple(_decode(value, kind) for value, (_, kind) in zip(row, columns)))
+            restored[table] = len(rows)
     return restored

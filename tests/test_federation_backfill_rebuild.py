@@ -24,6 +24,7 @@ import json
 import uuid
 from pathlib import Path
 
+import psycopg.sql
 import pytest
 from actionq_contracts import CANDIDATE_VERIFICATION_SPEC_V1, canonical_bytes, sha256_digest
 
@@ -309,12 +310,20 @@ def test_retention_export_restore_contract_is_checked_in() -> None:
     """The freeze doc makes this contract a prerequisite to W3, not an output."""
     assert CONTRACT_DOC.is_file()
     text = CONTRACT_DOC.read_text(encoding="utf-8")
+    # Collapsed so an assertion is about the commitment, not where it wrapped.
+    flowed = " ".join(text.split())
     assert "indefinitely" in text
     assert "/mnt/truenas/storage_layer/" in text
     assert "Best effort" in text
     assert "Manual only" in text
     # The existing whole-cluster policy is named as untouched, not reinterpreted.
     assert "30d" in text and "unchanged by W3" in text
+    # Scope boundary, the W7 dependency it creates, and the ordering constraint
+    # deterministic references impose are all recorded, not left implicit.
+    assert "identity and shape" in flowed
+    assert "prerequisite of any W7 destructive-retirement plan" in flowed
+    assert "before any native principal is granted `federation.create`" in flowed
+    assert "Known gap, owned by W5" in flowed
 
 
 def test_deterministic_identity_is_stable_shaped_and_mapping_scoped() -> None:
@@ -521,71 +530,114 @@ def _add_event(planes: dict, action_id: int) -> None:
         conn.commit()
 
 
-def test_a_purely_appending_source_change_is_imported_not_refused(planes) -> None:
-    """A new fact at the end of a resource's chain needs no new revision for any
-    fact already recorded, so it is ordinary monotonic growth."""
+def test_a_new_legacy_event_is_appended_not_refused(planes) -> None:
+    """Variable-cardinality facts are emitted last in each chain, so a new event
+    never needs a revision an already-recorded fact was written at."""
     backfill = _backfill(planes)
     backfill.run()
     before = _count(planes, "federation_resource_changes")
 
-    # The completed action carries no action-resource or candidate refs, so a
-    # new event lands at the end of its chain.
-    _add_event(planes, int(planes["history"]["completed"]))
+    action_id = int(planes["history"]["action_resource_action"])
+    _add_event(planes, action_id)
     report = backfill.run()
 
     assert report.applied == 1
     assert _count(planes, "federation_resource_changes") == before + 1
-    assert all(result["matches"] for result in backfill.verify())
+    assert all(result["matches"] for result in backfill.verify(report.resource_refs))
 
 
-def test_a_source_that_changed_under_a_part_recorded_import_is_refused_upfront(planes) -> None:
-    """Expected revisions come from the plan, so a fact inserted *before*
-    already-recorded ones re-issues their idempotency keys under different
-    requests -- which the command ledger rejects permanently. Detect it before
-    writing anything."""
+def test_a_legacy_status_transition_is_appended_keeping_the_earlier_status(planes) -> None:
+    """The mutation the reviewer called the most common one: an action moves on
+    after import. The earlier status stays recorded -- "at import time this was
+    pending" is still true -- and the new one appends."""
     backfill = _backfill(planes)
     backfill.run()
-    before = _count(planes, "federation_resource_changes")
+    with db.connect(planes["url"]) as conn:
+        claimed = db.claim(conn, planes["execution"], worker="worker:one", timeout_minutes=30)
+        conn.commit()
+    pending_id = int(claimed["id"])
+    resource_ref = _resource_ref(pending_id)
+    legacy = legacy_execution_ref(environment=ENVIRONMENT, action_id=pending_id)
+    assert f"{legacy}#status:pending" in _execution_refs(planes, resource_ref)
 
-    # This action's chain continues past its events with action-resource refs,
-    # so a new event shifts the revision every one of those was recorded at.
-    action_id = int(planes["history"]["action_resource_action"])
-    _add_event(planes, action_id)
-
-    with pytest.raises(BackfillDrift) as drift:
-        backfill.run()
-    assert drift.value.resource_ref == _resource_ref(action_id)
-    # The first fact whose recorded position no longer matches its planned one:
-    # the new event itself, planned mid-chain while the resource is already past
-    # that revision.
-    assert drift.value.fact.startswith("execution-ref:") and "#event:" in drift.value.fact
-    assert _count(planes, "federation_resource_changes") == before
+    report = backfill.run()
+    refs = _execution_refs(planes, resource_ref)
+    assert f"{legacy}#status:pending" in refs
+    assert f"{legacy}#status:claimed" in refs
+    assert all(result["matches"] for result in backfill.verify(report.resource_refs))
+    # Still provenance-only: a legacy claim is not a federation decision.
+    assert _projection(planes, resource_ref)["state"] == "registered"
 
 
-def test_a_legacy_fact_that_disappeared_is_refused_upfront(planes) -> None:
+def test_a_legacy_fact_that_disappeared_is_replayed_not_refused(planes) -> None:
+    """Provenance is cumulative. A legacy row the source no longer offers does
+    not invalidate the fact already recorded about it, and db.prune_dispatch_
+    observation_events deletes events as a matter of routine."""
     backfill = _backfill(planes)
-    backfill.run()
+    first = backfill.run()
     before = _count(planes, "federation_resource_changes")
 
     action_id = int(planes["history"]["completed"])
     with db.connect(planes["url"]) as conn:
+        events = db.qname(planes["execution"], "events")
         conn.execute(
-            f"DELETE FROM {db.qname(planes['execution'], 'events')} WHERE action_id=%s "
-            "AND id = (SELECT max(id) FROM " + db.qname(planes["execution"], "events") + " WHERE action_id=%s)",
-            (action_id, action_id),
+            f"DELETE FROM {events} WHERE id = (SELECT max(id) FROM {events} WHERE action_id=%s)",
+            (action_id,),
         )
         conn.commit()
 
+    second = backfill.run()
+    assert second.applied == 0
+    assert second.planned < first.planned
+    assert _count(planes, "federation_resource_changes") == before
+
+
+def test_a_foreign_principal_writing_to_a_backfilled_resource_is_refused(planes) -> None:
+    """The one thing that really is corruption: the deterministic identity was
+    taken over by a principal that is not backfill."""
+    backfill = _backfill(planes)
+    report = backfill.run()
+    resource_ref = report.resource_refs[0]
+
+    # record_evidence is the real vector: unlike relate/supersede it does not
+    # require the actor to own the resource, so a native evidence ingester can
+    # write a change onto a backfilled resource it does not own.
+    evidence = b"foreign evidence"
+    intruder = _authority(planes).record_evidence(
+        principal=_principal("native:intruder", "federation.evidence.ingest"), idempotency_key="intrude",
+        resource_ref=resource_ref, evidence_ref="artifact:" + db.raw_digest(evidence),
+        evidence_bytes=evidence, assurance_type="native",
+        expected_revision=_projection(planes, resource_ref)["revision"],
+    )
+    assert intruder.status == "accepted"
     with pytest.raises(BackfillDrift) as drift:
         backfill.run()
-    assert drift.value.resource_ref == _resource_ref(action_id)
-    assert _count(planes, "federation_resource_changes") == before
+    assert drift.value.resource_ref == resource_ref
+
+
+def test_the_mapping_version_scopes_identity_keys_and_assurance_together(planes) -> None:
+    """A v2 mapping that still labelled its refs v1 would be a silently
+    mislabelled import, not an error: assurance_type is part of the digest."""
+    second = FederationBackfill(
+        authority=_authority(planes),
+        source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"]),
+        environment=ENVIRONMENT, mapping_version="federation-backfill/v2",
+    )
+    _backfill(planes).run()
+    report = second.run()
+
+    assert set(report.resource_refs).isdisjoint(_backfill(planes).run().resource_refs)
+    assurances = {
+        kind for resource_ref in report.resource_refs
+        for kind in _execution_refs(planes, resource_ref).values()
+    }
+    assert assurances and all(item.startswith("legacy-provenance/federation-backfill/v2:") for item in assurances)
 
 
 def test_export_column_shape_matches_the_frozen_schema(planes) -> None:
     """A migration that adds a column must fail here, not silently drop it from
     the artifact the retention contract calls the indefinite record."""
-    exported = {table: [name for name, _ in columns] for table, columns in _EXPORT_TABLES}
+    exported = {table: [name for name, _ in columns] for table, columns, _ in _EXPORT_TABLES}
     declared = {
         table: sorted(columns)
         for table, columns in federation_schema._COLUMN_SHAPE.items()
@@ -605,17 +657,45 @@ def test_backfill_refuses_to_issue_a_non_provenance_command(planes) -> None:
         backfill._dispatch(widened)
 
 
-def test_backfill_raises_when_a_command_is_rejected(planes) -> None:
-    """A rejected provenance command means the import is not deterministic."""
+def test_squatting_a_deterministic_reference_is_reported_as_identity_takeover(planes) -> None:
+    """Deterministic refs are precomputable, so any principal holding
+    federation.create can occupy one before the import runs. Backfill must name
+    that for what it is rather than reporting a confusing create rejection."""
     backfill = _backfill(planes)
     first = backfill.plan()[0]
-    # Occupy the deterministic identity under a different owner first.
     _authority(planes).create(principal=_principal("other", "federation.create"),
                               idempotency_key="squat", expected_revision=0,
                               resource_ref=first.resource_ref)
+    with pytest.raises(BackfillDrift) as raised:
+        backfill.run()
+    assert raised.value.resource_ref == first.resource_ref
+
+
+def test_a_command_rejected_by_the_authority_aborts_the_import(planes) -> None:
+    """run()'s own guard: a command the authority rejects must abort the import
+    rather than be counted as progress. Reached by stubbing the dispatcher,
+    because run() replans immediately before dispatching and the real race
+    window between the two is not deterministically reproducible."""
+    class _Rejecting(FederationBackfill):
+        def _dispatch(self, command):
+            decision = super()._dispatch(command)
+            if command.operation != "record-execution-ref":
+                return decision
+            return type(decision)(
+                status="rejected", code="stale-revision", message="expected_revision does not match",
+                response_bytes=b"{}", response_digest="sha256:" + "0" * 64,
+                resource_ref=command.resource_ref, before_revision=None, after_revision=None,
+            )
+
+    backfill = _Rejecting(
+        authority=_authority(planes),
+        source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"]),
+        environment=ENVIRONMENT,
+    )
     with pytest.raises(BackfillRejected) as raised:
         backfill.run()
-    assert raised.value.code == "resource-exists"
+    assert raised.value.code == "stale-revision"
+    assert raised.value.operation == "record-execution-ref"
 
 
 # --- rebuild -----------------------------------------------------------------
@@ -713,23 +793,92 @@ def test_rebuild_detects_a_projection_that_drifted_from_its_changes(planes) -> N
         conn.rollback()
 
 
-def test_no_federation_pruning_capability_exists(planes) -> None:
+def test_no_federation_pruning_capability_exists(postgres_urls) -> None:
     """Falsifier: any v1 change was pruned.
 
-    Structural, not documentary: neither module contains a statement that could
-    remove a federation row, so no caller can prune one.
+    Proved at the database, not by reading the source: no role the frozen
+    boundary installs holds DELETE or TRUNCATE on any federation table, so no
+    caller -- module, migration, or an operator at a psql prompt under a
+    service role -- can prune one.  A source grep would survive a
+    string-concatenated statement, a third module, or a later migration.
     """
-    for relative in ("actionq/federation.py", "actionq/federation_backfill.py"):
-        source = (ROOT / relative).read_text(encoding="utf-8")
-        statements = [line for line in source.splitlines()
-                      if any(word in line for word in ("DELETE FROM", "TRUNCATE", "DROP TABLE"))]
-        assert statements == [], (relative, statements)
+    selected = _new_schema("aqbf_acl")
+    suffix = uuid.uuid4().hex[:8]
+    owner_role, migrator_role = f"aqbf_owner_{suffix}", f"aqbf_migrator_{suffix}"
+    command_role, actor_role = f"aqbf_command_{suffix}", f"aqbf_actor_{suffix}"
+    roles = (owner_role, migrator_role, command_role, actor_role)
+    with db.connect(postgres_urls["admin"]) as conn:
+        for role in roles:
+            conn.execute(psycopg.sql.SQL("CREATE ROLE {}").format(psycopg.sql.Identifier(role)))
+        federation_schema.migrate(conn, selected)
+        federation_schema.configure_role_boundaries(
+            conn, selected, object_owner_role=owner_role, migration_role=migrator_role,
+            command_role=command_role, denied_roles=(actor_role,),
+        )
+        conn.commit()
+        try:
+            for table, _, _ in _EXPORT_TABLES:
+                for role in (migrator_role, command_role, actor_role):
+                    row = conn.execute(
+                        "SELECT has_table_privilege(%s,%s,'DELETE') AS d, "
+                        "has_table_privilege(%s,%s,'TRUNCATE') AS t",
+                        (role, f"{selected}.{table}", role, f"{selected}.{table}"),
+                    ).fetchone()
+                    assert not row["d"], (role, table, "DELETE")
+                    assert not row["t"], (role, table, "TRUNCATE")
+        finally:
+            conn.execute(f'DROP SCHEMA "{selected}" CASCADE')
+            for role in roles:
+                conn.execute(psycopg.sql.SQL("DROP ROLE IF EXISTS {}").format(psycopg.sql.Identifier(role)))
+            conn.commit()
 
+
+def test_a_rerun_removes_no_recorded_change(planes) -> None:
     backfill = _backfill(planes)
     backfill.run()
     before = _count(planes, "federation_resource_changes")
     backfill.run()
     assert _count(planes, "federation_resource_changes") == before
+
+
+def test_rebuild_replays_the_native_evidence_acceptance_settlement_and_supersede_path(planes) -> None:
+    """The rebuild's native branches matter most for post-cutover resources and
+    are unreachable through backfill, which only ever issues three operations."""
+    authority = _authority(planes)
+    native = _principal(
+        "native:full", "federation.create", "federation.relate", "federation.evidence.ingest",
+        "federation.acceptance.decide", "federation.settlement.record", "federation.supersede",
+    )
+    resource_ref = authority.create(principal=native, idempotency_key="n-create",
+                                    expected_revision=0).resource_ref
+    evidence = b"native evidence bytes"
+    evidence_ref = "artifact:" + db.raw_digest(evidence)
+    assert authority.record_evidence(
+        principal=native, idempotency_key="n-evidence", resource_ref=resource_ref,
+        evidence_ref=evidence_ref, evidence_bytes=evidence, assurance_type="native/v1",
+        expected_revision=1,
+    ).status == "accepted"
+    assert authority.decide_acceptance(
+        principal=native, idempotency_key="n-accept", resource_ref=resource_ref, outcome="accepted",
+        policy_ref="policy:native", evidence_ref=evidence_ref, expected_revision=2,
+    ).status == "accepted"
+    assert authority.record_settlement(
+        principal=native, idempotency_key="n-settle", resource_ref=resource_ref,
+        fact_ref="fact:native", expected_revision=3,
+    ).status == "accepted"
+    assert authority.supersede(
+        principal=native, idempotency_key="n-supersede", resource_ref=resource_ref, expected_revision=4,
+    ).status == "accepted"
+
+    with db.connect(planes["url"]) as conn:
+        result = require_rebuild_matches(conn, planes["federation"], resource_ref)
+        rebuilt = result["rebuilt"]
+    assert rebuilt["revision"] == 5
+    assert rebuilt["state"] == "superseded"
+    assert [item["outcome"] for item in rebuilt["acceptance_decisions"]] == ["accepted"]
+    assert [item["decided_by"] for item in rebuilt["acceptance_decisions"]] == ["native:full"]
+    assert [item["fact_ref"] for item in rebuilt["settlements"]] == ["fact:native"]
+    assert [item["evidence_ref"] for item in rebuilt["evidence"]] == [evidence_ref]
 
 
 def test_legacy_terminal_state_never_implies_acceptance_or_settlement(planes) -> None:
@@ -759,7 +908,8 @@ def _export(planes: dict, schema: str | None = None) -> bytes:
 
 
 def test_export_restore_round_trip_preserves_the_canonical_projection(planes) -> None:
-    """Falsifier: export/restore changes canonical projection."""
+    """Falsifiers: export/restore changes the canonical projection; a configured
+    retention objective cannot be restored."""
     report = _backfill(planes).run()
     exported = _export(planes)
     assert exported == _export(planes)
@@ -767,6 +917,20 @@ def test_export_restore_round_trip_preserves_the_canonical_projection(planes) ->
     assert document["schema_version"] == "federation-export/v1"
     assert document["compatibility_label"] == federation_schema.COMPATIBILITY_LABEL
     assert set(document["tables"]) >= {"federation_resources", "federation_resource_changes"}
+    # Self-describing: readable decades later with no other artifact.
+    provenance = document["provenance"]
+    assert provenance["producer"] == "actionq"
+    assert provenance["producer_version"]
+    assert [row["version"] for row in provenance["migration_ledger"]] == [1]
+    assert all(row["checksum"].startswith("sha256:") or len(row["checksum"]) == 64
+               for row in provenance["migration_ledger"])
+    # Caller-supplied fields keep the export a pure function of its inputs.
+    assert provenance["produced_at"] is None and provenance["source"] is None
+    with db.connect(planes["url"]) as conn:
+        stamped = json.loads(export_federation(conn, planes["federation"],
+                                               produced_at="2026-08-22T00:00:00Z", source="probe"))
+    assert stamped["provenance"]["produced_at"] == "2026-08-22T00:00:00Z"
+    assert stamped["tables"] == document["tables"]
 
     restored_schema = _new_schema("aqbf_restore")
     try:
@@ -792,7 +956,8 @@ def test_export_restore_round_trip_preserves_the_canonical_projection(planes) ->
 
 
 def test_restore_refuses_a_non_empty_target_or_a_foreign_document(planes) -> None:
-    """Falsifier: a configured retention objective cannot be restored."""
+    """Safety posture around restore. The "configured retention objective cannot
+    be restored" falsifier is discharged by the round-trip test above."""
     _backfill(planes).run()
     exported = _export(planes)
     with db.connect(planes["url"]) as conn:
