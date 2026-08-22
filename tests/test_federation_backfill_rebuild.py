@@ -327,6 +327,7 @@ def test_retention_export_restore_contract_is_checked_in() -> None:
     assert "Known gap, owned by W5" in flowed
     assert "must not be scheduled to run periodically" in flowed
     assert "required, explicit operator statement" in flowed
+    assert "has never been applied to any database" in flowed
 
 
 def test_deterministic_identity_is_stable_shaped_and_mapping_scoped() -> None:
@@ -614,6 +615,22 @@ def test_a_legacy_fact_that_disappeared_is_replayed_not_refused(planes) -> None:
     assert _count(planes, "federation_resource_changes") == before
 
 
+def test_a_self_parenting_legacy_action_is_refused_rather_than_planned(planes) -> None:
+    """federation v1 forbids self-relations, so planning that edge would emit a
+    command that can only ever be rejected -- and a durable rejection against an
+    unmoving revision replays for every later run, stalling the import."""
+    with db.connect(planes["url"]) as conn:
+        action_id = int(planes["history"]["pending"])
+        conn.execute(
+            f"UPDATE {db.qname(planes['execution'], 'actions')} SET parent_id=%s WHERE id=%s",
+            (action_id, action_id),
+        )
+        conn.commit()
+    with pytest.raises(BackfillDrift, match="its own parent"):
+        _backfill(planes).run()
+    assert _count(planes, "federation_resources") == 0
+
+
 def test_a_second_legacy_database_under_one_environment_cannot_merge(planes) -> None:
     """Deterministic refs are a function of the source too, so two unrelated
     legacy databases sharing an environment name cannot silently merge their
@@ -686,33 +703,52 @@ def test_a_rejected_command_can_still_be_imported_by_a_later_run(planes) -> None
     assert backfill._dispatch(appended).code == "stale-revision"
 
     report = backfill.run()
+    assert report.source_id == SOURCE_ID
     assert report.applied >= 1
     refs = _execution_refs(planes, resource_ref)
     assert appended.arguments["execution_ref"] in refs
     assert all(result["matches"] for result in backfill.verify(report.resource_refs))
 
 
-def test_a_foreign_principal_writing_to_a_backfilled_resource_is_refused(planes) -> None:
-    """The one thing that really is corruption: the deterministic identity was
-    taken over by a principal that is not backfill."""
+def test_a_native_write_to_a_backfilled_resource_does_not_stop_the_import(planes) -> None:
+    """federation.py lets an evidence ingester write to a resource it does not
+    own, so a native reviewer touching an imported provenance resource is
+    legitimate. Aborting the whole import on it would strand every remaining
+    legacy row with no way to clear the condition."""
     backfill = _backfill(planes)
     report = backfill.run()
     resource_ref = report.resource_refs[0]
 
-    # record_evidence is the real vector: unlike relate/supersede it does not
-    # require the actor to own the resource, so a native evidence ingester can
-    # write a change onto a backfilled resource it does not own.
-    evidence = b"foreign evidence"
-    intruder = _authority(planes).record_evidence(
-        principal=_principal("native:intruder", "federation.evidence.ingest"), idempotency_key="intrude",
+    evidence = b"native evidence on a provenance resource"
+    accepted = _authority(planes).record_evidence(
+        principal=_principal("native:reviewer", "federation.evidence.ingest"), idempotency_key="ingest",
         resource_ref=resource_ref, evidence_ref="artifact:" + db.raw_digest(evidence),
         evidence_bytes=evidence, assurance_type="native",
         expected_revision=_projection(planes, resource_ref)["revision"],
     )
-    assert intruder.status == "accepted"
-    with pytest.raises(BackfillDrift) as drift:
-        backfill.run()
-    assert drift.value.resource_ref == resource_ref
+    assert accepted.status == "accepted"
+
+    _add_event(planes, int(planes["history"]["completed"]))
+    resumed = backfill.run()
+    assert resumed.applied >= 1
+    # The native change stays distinguishable from the backfilled ones.
+    with db.connect(planes["url"]) as conn:
+        rows = conn.execute(
+            f"SELECT actor_principal_id FROM "
+            f"{db.qname(planes['federation'], 'federation_resource_changes')} WHERE resource_ref=%s",
+            (resource_ref,),
+        ).fetchall()
+    assert any(not is_backfilled_change(row) for row in rows)
+    assert any(is_backfilled_change(row) for row in rows)
+
+
+def test_is_backfilled_change_raises_on_a_row_shape_it_cannot_read(planes) -> None:
+    """The contract doc names this the single reader for the distinction, so a
+    confident wrong answer is worse than an error."""
+    assert is_backfilled_change({"actor_principal_id": BACKFILL_PRINCIPAL_ID}) is True
+    assert is_backfilled_change({"actor_principal_id": "native:one"}) is False
+    with pytest.raises((TypeError, KeyError, IndexError)):
+        is_backfilled_change(("aqf1_x", 1, "create", "registered", BACKFILL_PRINCIPAL_ID))
 
 
 def test_the_mapping_version_scopes_identity_keys_and_assurance_together(planes) -> None:
@@ -759,8 +795,9 @@ def test_backfill_refuses_to_issue_a_non_provenance_command(planes) -> None:
 
 def test_squatting_a_deterministic_reference_is_reported_as_identity_takeover(planes) -> None:
     """Deterministic refs are precomputable, so any principal holding
-    federation.create can occupy one before the import runs. Backfill must name
-    that for what it is rather than reporting a confusing create rejection."""
+    federation.create can occupy one before the import runs. Ownership is
+    immutable in v1, so unlike a foreign change this can never clear -- backfill
+    must name it rather than report a confusing create rejection."""
     backfill = _backfill(planes)
     first = backfill.plan()[0]
     _authority(planes).create(principal=_principal("other", "federation.create"),

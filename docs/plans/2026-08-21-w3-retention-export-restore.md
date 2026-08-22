@@ -161,6 +161,12 @@ records already written. `source_id` is a required, explicit operator statement 
 because "these two databases are the same source" must never be inferred from a shared
 environment name.
 
+The `federation-backfill/v1` mapping **has never been applied to any database**. Its
+definition — including the reference format and the idempotency-key composition — was still
+being corrected up to this pull request's merge, and is frozen from that point. Any change
+after it must bump the mapping version, because from then on a schema may exist that was
+imported under the old one.
+
 ## 8. What this contract does not do
 
 It does not change the execution-schema retention window, the CNPG policy, any Vuoro
