@@ -121,13 +121,13 @@ settlement.
 W3 preserves legacy **identity and shape**, not content. From a federation resource plus
 the export you can recover that an action existed, its status at import time, the ids and
 types of its events, its action-resource root and recovery floor, its candidate request,
-and its parent.
-<!-- claim: w3-preserves-identity-and-shape --> You cannot recover anything descriptive or temporal: `action_type`,
+and its parent. You cannot recover anything descriptive or temporal: `action_type`,
 `project`, `target_ref`, `created_by`, `priority`, `result_ref`, `failure_reason` and
 every legacy timestamp are deliberately not imported, and `federation_execution_refs.
 created_at` records the *import* time, not the legacy time. Execution groups, dispatch
 requests, managed-dispatch envelopes and individual session-completion events are outside
 the mapping entirely; only the completion watermark is imported.
+<!-- claim: w3-preserves-identity-and-shape -->
 
 That is correct while the execution schema still exists, and it is the reason W3 is safe
 to run before any retirement decision. It stops being sufficient at the point the
@@ -189,7 +189,9 @@ restated in that test's own docstring — so a claim cannot be broadened without
 test that is supposed to prove it.
 
 ```falsifiers
-[
+{
+  "minimum_coverage": 0.85,
+  "falsifiers": [
   {
     "id": "w3-retention-no-deletion",
     "claim": "Federation v1 data is retained indefinitely; nothing expires or deletes it.",
@@ -211,7 +213,7 @@ test that is supposed to prove it.
   {
     "id": "w3-no-delete-capable-surface",
     "claim": "Destructive archive action is manual only; no code or role can prune a federation row.",
-    "scope": "no role the frozen boundary installs holds DELETE or TRUNCATE on any federation table",
+    "scope": "It says nothing about a superuser or the table owner, which is why destructive archive stays a manual, owner-approved action rather than something the schema alone can prevent.",
     "test": "tests/test_federation_backfill_rebuild.py::test_no_federation_pruning_capability_exists"
   },
   {
@@ -238,6 +240,7 @@ test that is supposed to prove it.
     "scope": "operator-procedural: no code surface schedules the import, and the periodic job W5 owns is the export",
     "test": null,
     "gap": "Procedural, not mechanisable here. Nothing in the package schedules a backfill, so there is no code path to assert against; the enforceable half is W5 deployment configuration, which this repository does not contain. Revisit when W5 lands a scheduler."
-  }
-]
+    }
+  ]
+}
 ```
