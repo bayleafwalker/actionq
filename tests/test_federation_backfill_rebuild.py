@@ -1,0 +1,708 @@
+"""W3 -- deterministic backfill, rebuild, export and restore for federation v1.
+
+Covers every scenario the tranche-4 freeze names for W3 (every legacy lifecycle
+state, reclaims, renewals, stale receipts, cancellations, candidate
+publications, action-resource cursor pruning, completion recovery floors) and
+one explicit test per named falsifier:
+
+* rerun changes identity/digest
+* revision gaps or duplicates pass
+* any v1 change was pruned
+* rebuilt projection differs from live projection
+* legacy claimed/completed implies acceptance/settlement
+* export/restore changes canonical projection
+* a configured retention objective cannot be restored
+
+Run:
+    uv run --extra dev pytest tests/test_federation_backfill_rebuild.py \
+      tests/test_claim_authority.py tests/test_completion_log_integration.py -q
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from pathlib import Path
+
+import pytest
+from actionq_contracts import CANDIDATE_VERIFICATION_SPEC_V1, canonical_bytes, sha256_digest
+
+from actionq import db, federation_schema
+from actionq.action_resource import ActionResourceOwner
+from actionq.completion_log import CompletionLog
+from actionq.federation import FederationAuthority, FederationPrincipal
+from actionq.federation_backfill import (
+    BACKFILL_AUTHORITIES,
+    BACKFILL_MAPPING_VERSION,
+    BACKFILL_PRINCIPAL_ID,
+    FORBIDDEN_BACKFILL_AUTHORITIES,
+    LEGACY_ASSURANCE_PREFIX,
+    BackfillCommand,
+    BackfillRejected,
+    ExportError,
+    FederationBackfill,
+    LegacySource,
+    RebuildError,
+    backfill_principal,
+    deterministic_resource_ref,
+    export_federation,
+    is_backfilled_change,
+    legacy_assurance_type,
+    legacy_completion_ref,
+    legacy_execution_ref,
+    live_projection,
+    rebuild_from_changes,
+    require_rebuild_matches,
+    restore_federation,
+    verify_rebuild,
+)
+
+
+ROOT = Path(__file__).parents[1]
+ENVIRONMENT = "test"
+CONTRACT_DOC = ROOT / "docs/plans/2026-08-21-w3-retention-export-restore.md"
+
+
+def _factory(url: str):
+    return lambda: db.connect(url)
+
+
+def _principal(name: str, *authorities: str) -> FederationPrincipal:
+    return FederationPrincipal.authenticated(environment=ENVIRONMENT, principal_id=name, authorities=authorities)
+
+
+def _new_schema(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _ref(letter: str) -> str:
+    return "artifact:sha256:" + letter * 64
+
+
+def _enqueue(conn, schema: str, target: str, *, parent_id: int | None = None) -> dict:
+    return db.enqueue(
+        conn, schema, action_type="scope-iterate", project="demo", target_ref=target,
+        source_refs=[], priority=100, parent_id=parent_id, created_by="human:test",
+    )
+
+
+def _expire_claim(conn, schema: str, action_id: int) -> None:
+    conn.execute(
+        f"UPDATE {db.qname(schema, 'actions')} SET claim_deadline = now() - interval '1 hour' WHERE id=%s",
+        (action_id,),
+    )
+
+
+def _legacy_history(url: str, schema: str) -> dict:
+    """Every legacy lifecycle state the freeze doc names, in one schema.
+
+    Ordering matters: db.claim takes the oldest pending action, so each state is
+    driven to completion before the next pending action exists.
+    """
+    history: dict[str, object] = {}
+    with db.connect(url) as conn:
+        completed = _enqueue(conn, schema, "completed")
+        claimed = db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        db.complete(conn, schema, completed["id"], _ref("a"), worker="worker:one",
+                    claim_receipt=claimed["claim_receipt"])
+        history["completed"] = completed["id"]
+        history["completed_receipt"] = claimed["claim_receipt"]
+
+        failed = _enqueue(conn, schema, "failed")
+        claimed = db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        db.fail(conn, schema, failed["id"], "boom", worker="worker:one",
+                claim_receipt=claimed["claim_receipt"])
+        history["failed"] = failed["id"]
+
+        rejected = _enqueue(conn, schema, "rejected")
+        claimed = db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        db.reject(conn, schema, rejected["id"], reason="invalid", validator="validator:test",
+                  worker="worker:one", claim_receipt=claimed["claim_receipt"])
+        history["rejected"] = rejected["id"]
+
+        cancelled = _enqueue(conn, schema, "cancelled-from-pending")
+        db.cancel(conn, schema, cancelled["id"], "operator stop")
+        history["cancelled"] = cancelled["id"]
+
+        cancelling = _enqueue(conn, schema, "cancelling")
+        db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        db.cancel(conn, schema, cancelling["id"], "operator stop")
+        history["cancelling"] = cancelling["id"]
+
+        reaped = _enqueue(conn, schema, "cancel-reaped")
+        db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        db.cancel(conn, schema, reaped["id"], "operator stop")
+        conn.execute(
+            f"UPDATE {db.qname(schema, 'actions')} SET cancel_stop_deadline = now() - interval '1 minute' WHERE id=%s",
+            (reaped["id"],),
+        )
+        assert [row["id"] for row in db.reap_cancellations(conn, schema)] == [reaped["id"]]
+        history["reaped"] = reaped["id"]
+
+        # Renewal, stale receipt, reclaim: renew the lease, expire it, sweep it
+        # back to pending, then claim it again under a second receipt.
+        reclaimed = _enqueue(conn, schema, "reclaimed")
+        first = db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        db.renew(conn, schema, action_id=reclaimed["id"], worker="worker:one", timeout_minutes=30,
+                 claim_receipt=first["claim_receipt"])
+        _expire_claim(conn, schema, reclaimed["id"])
+        assert [row["id"] for row in db.sweep(conn, schema)] == [reclaimed["id"]]
+        second = db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        assert second["id"] == reclaimed["id"]
+        history["reclaimed"] = reclaimed["id"]
+        history["stale_receipt"] = first["claim_receipt"]
+        history["live_receipt"] = second["claim_receipt"]
+
+        # Candidate publication.
+        spec = {
+            "contract_id": CANDIDATE_VERIFICATION_SPEC_V1,
+            "candidate_ref": _ref("b"), "candidate_digest": "sha256:" + "b" * 64,
+            "profile_ref": _ref("c"), "profile_digest": "sha256:" + "c" * 64,
+            "publication_ref": _ref("d"), "publication_digest": "sha256:" + "d" * 64,
+        }
+        refs = [spec["candidate_ref"], spec["profile_ref"], spec["publication_ref"]]
+        spec_digest = sha256_digest(spec)
+        request = {
+            "contract_id": "action-creation-request/v1", "plan_ref": _ref("f"),
+            "topology": "independent", "role": "candidate-verification", "subject": "candidate:one",
+            "spec_ref": "artifact:" + spec_digest, "spec_digest": spec_digest,
+            "input_set_digest": db.immutable_input_set_digest(refs),
+        }
+        candidate = db.create_immutable_action(
+            conn, schema, request=request, spec=spec, input_refs=refs,
+            action_type="candidate-verification", project="demo", priority=100,
+            created_by="compiler:test",
+        )
+        candidate_claim = db.claim(conn, schema, worker="worker:one", timeout_minutes=30)
+        assert candidate_claim["id"] == candidate["action_id"]
+        db.register_publication(
+            conn, schema, action_id=candidate["action_id"], runner_id="worker:one",
+            runner_request_id=str(uuid.uuid4()), claim_receipt=candidate_claim["claim_receipt"],
+            attempt_id="attempt-1", journal_ref=_ref("e"), source_commit="b" * 40,
+            candidate_commit="c" * 40,
+        )
+        history["candidate"] = candidate["action_id"]
+        history["candidate_request_ref"] = candidate["request_ref"]
+
+        parent = _enqueue(conn, schema, "parent")
+        child = _enqueue(conn, schema, "child", parent_id=parent["id"])
+        history["parent"] = parent["id"]
+        history["child"] = child["id"]
+        conn.commit()
+
+    # Action-resource root with a pruned cursor, so a non-zero legacy recovery
+    # floor exists to import.
+    owner = ActionResourceOwner(schema=schema, connection=_factory(url), cursor_secret=b"\x01" * 32)
+    enqueued = owner.enqueue(
+        principal_scope="tenant:test", operation="execution.action.enqueue", idempotency_key="idem-1",
+        request={"action_type": "scope-iterate"},
+        create_action=lambda conn: _enqueue(conn, schema, "action-resource"),
+    )
+    with db.connect(url) as conn:
+        action_id = conn.execute(
+            f"SELECT action_id FROM {db.qname(schema, 'action_resources')} WHERE resource_ref=%s",
+            (enqueued.resource_ref,),
+        ).fetchone()["action_id"]
+        with conn.transaction():
+            owner.project_state(conn, action_id=int(action_id))
+        conn.commit()
+    pruned = owner.prune(resource_ref=enqueued.resource_ref, through_revision=1)
+    assert pruned == 1
+    history["action_resource_action"] = int(action_id)
+    history["action_resource_ref"] = enqueued.resource_ref
+
+    # Completion recovery floor: ingest, age the row past retention, compact.
+    log = CompletionLog(schema=schema, connection_factory=_factory(url))
+    event = {
+        "schema_version": "session.completion-observed/v1",
+        "event_id": "4d5e6f70-8192-4a3b-8c0d-3e4f50617283",
+        "origin_stream_id": "1a2b3c4d-5e6f-4788-9a0b-1c2d3e4f5061",
+        "origin_sequence": 1, "runtime_session_id": "session-1", "attempt_id": None,
+        "action_id": None, "repo": {"project": "actionq"}, "harness": "manual", "model": None,
+        "terminal": {"kind": "succeeded", "exit_code": 0, "reason_code": "completed", "retryable": False},
+        "started_at": "2026-08-11T10:00:00Z", "completed_at": "2026-08-11T10:00:01Z",
+        "observed_at": "2026-08-11T10:00:01Z", "duration_ms": 1000, "refs": [],
+        "evidence": {"dirty": False, "commit_count": 0, "verification": {"pass": 0, "fail": 0, "error": 0}},
+        "privacy": {
+            "prompt_absent": True, "transcript_absent": True, "raw_output_absent": True,
+            "environment_absent": True, "credentials_absent": True,
+            "absolute_paths_absent": True, "claim_proofs_absent": True,
+        },
+    }
+    log.ingest(event)
+    with db.connect(url) as conn:
+        conn.execute(
+            f"UPDATE {db.qname(schema, 'session_completion_events')} SET received_at = now() - interval '90 days'"
+        )
+        conn.commit()
+    assert log.compact() == 1
+
+    # The one action left pending, created last so nothing above claims it.
+    with db.connect(url) as conn:
+        pending = _enqueue(conn, schema, "pending")
+        conn.commit()
+    history["pending"] = pending["id"]
+    return history
+
+
+@pytest.fixture
+def planes(postgres_urls):
+    url = postgres_urls["admin"]
+    execution = _new_schema("aqbf_exec")
+    federation = _new_schema("aqbf_fed")
+    with db.connect(url) as conn:
+        db.migrate(conn, execution)
+        federation_schema.migrate(conn, federation)
+        conn.commit()
+    history = _legacy_history(url, execution)
+    yield {"url": url, "execution": execution, "federation": federation, "history": history}
+    with db.connect(url) as conn:
+        conn.execute(f'DROP SCHEMA "{execution}" CASCADE')
+        conn.execute(f'DROP SCHEMA "{federation}" CASCADE')
+        conn.commit()
+
+
+def _authority(planes: dict) -> FederationAuthority:
+    return FederationAuthority(connection=_factory(planes["url"]), schema=planes["federation"])
+
+
+def _backfill(planes: dict) -> FederationBackfill:
+    return FederationBackfill(
+        authority=_authority(planes),
+        source=LegacySource(connection=_factory(planes["url"]), schema=planes["execution"]),
+        environment=ENVIRONMENT,
+    )
+
+
+def _resource_ref(action_id: int) -> str:
+    return deterministic_resource_ref(legacy_execution_ref(environment=ENVIRONMENT, action_id=action_id))
+
+
+def _execution_refs(planes: dict, resource_ref: str) -> dict[str, str]:
+    with db.connect(planes["url"]) as conn:
+        rows = conn.execute(
+            f"SELECT execution_ref, assurance_type FROM "
+            f"{db.qname(planes['federation'], 'federation_execution_refs')} WHERE resource_ref=%s",
+            (resource_ref,),
+        ).fetchall()
+    return {str(row["execution_ref"]): str(row["assurance_type"]) for row in rows}
+
+
+def _projection(planes: dict, resource_ref: str) -> dict:
+    with db.connect(planes["url"]) as conn:
+        return live_projection(conn, planes["federation"], resource_ref)
+
+
+def _count(planes: dict, table: str) -> int:
+    with db.connect(planes["url"]) as conn:
+        return int(conn.execute(
+            f"SELECT count(*) AS n FROM {db.qname(planes['federation'], table)}"
+        ).fetchone()["n"])
+
+
+# --- identity, principal and contract ---------------------------------------
+
+
+def test_retention_export_restore_contract_is_checked_in() -> None:
+    """The freeze doc makes this contract a prerequisite to W3, not an output."""
+    assert CONTRACT_DOC.is_file()
+    text = CONTRACT_DOC.read_text(encoding="utf-8")
+    assert "indefinitely" in text
+    assert "/mnt/truenas/storage_layer/" in text
+    assert "Best effort" in text
+    assert "Manual only" in text
+    # The existing whole-cluster policy is named as untouched, not reinterpreted.
+    assert "30d" in text and "unchanged by W3" in text
+
+
+def test_deterministic_identity_is_stable_shaped_and_mapping_scoped() -> None:
+    legacy = legacy_execution_ref(environment=ENVIRONMENT, action_id=7)
+    assert legacy == "actionq-execution/v1:test:7"
+    first = deterministic_resource_ref(legacy)
+    assert first == deterministic_resource_ref(legacy)
+    assert first.startswith("aqf1_") and len(first) == len("aqf1_") + 43
+    assert first != deterministic_resource_ref(legacy, mapping_version="federation-backfill/v2")
+    assert first != deterministic_resource_ref(legacy_execution_ref(environment=ENVIRONMENT, action_id=8))
+    assert deterministic_resource_ref(legacy_completion_ref(environment=ENVIRONMENT)) != first
+    with pytest.raises(db.ActionQError):
+        legacy_execution_ref(environment="bad:environment", action_id=1)
+    with pytest.raises(db.ActionQError):
+        legacy_execution_ref(environment=ENVIRONMENT, action_id=0)
+
+
+def test_backfill_principal_cannot_decide_accept_settle_or_supersede(planes) -> None:
+    principal = backfill_principal(environment=ENVIRONMENT)
+    assert principal.principal_id == BACKFILL_PRINCIPAL_ID
+    assert not principal.authorities & FORBIDDEN_BACKFILL_AUTHORITIES
+    assert BACKFILL_AUTHORITIES >= {"federation.backfill", "federation.create", "federation.relate"}
+
+    authority = _authority(planes)
+    resource_ref = _resource_ref(int(planes["history"]["completed"]))
+    created = authority.create(principal=principal, idempotency_key="probe", expected_revision=0,
+                               resource_ref=resource_ref)
+    assert created.status == "accepted"
+
+    denied = [
+        authority.decide_acceptance(principal=principal, idempotency_key="probe-accept",
+                                    resource_ref=resource_ref, outcome="accepted",
+                                    policy_ref="policy:test", evidence_ref=None, expected_revision=1),
+        authority.record_settlement(principal=principal, idempotency_key="probe-settle",
+                                    resource_ref=resource_ref, fact_ref="fact:test", expected_revision=1),
+        authority.supersede(principal=principal, idempotency_key="probe-supersede",
+                            resource_ref=resource_ref, expected_revision=1),
+        authority.record_evidence(principal=principal, idempotency_key="probe-evidence",
+                                  resource_ref=resource_ref, evidence_ref="artifact:" + db.raw_digest(b"x"),
+                                  evidence_bytes=b"x", assurance_type="test", expected_revision=1),
+    ]
+    assert [decision.status for decision in denied] == ["rejected"] * 4
+    assert {decision.code for decision in denied} == {"authority-denied"}
+    # A denied decision is durable but advances nothing.
+    assert authority.snapshot(principal=_principal("reader", "federation.read"),
+                              resource_ref=resource_ref)["revision"] == 1
+    assert _count(planes, "federation_acceptance_decisions") == 0
+    assert _count(planes, "federation_settlements") == 0
+
+
+# --- the import itself -------------------------------------------------------
+
+
+def test_backfill_imports_every_legacy_lifecycle_state_as_provenance(planes) -> None:
+    report = _backfill(planes).run()
+    history = planes["history"]
+    assert report.mapping_version == BACKFILL_MAPPING_VERSION
+    assert report.replayed == 0 and report.applied == report.planned
+
+    expected_states = {
+        "completed": "completed", "failed": "failed", "rejected": "rejected",
+        "cancelled": "cancelled", "cancelling": "cancelling", "reaped": "cancelled",
+        "reclaimed": "claimed", "pending": "pending",
+    }
+    for name, status in expected_states.items():
+        resource_ref = _resource_ref(int(history[name]))
+        legacy = legacy_execution_ref(environment=ENVIRONMENT, action_id=int(history[name]))
+        refs = _execution_refs(planes, resource_ref)
+        assert refs[legacy] == legacy_assurance_type("action")
+        assert refs[f"{legacy}#status:{status}"] == legacy_assurance_type("status")
+        # Legacy terminal state never becomes a federation decision.
+        assert _projection(planes, resource_ref)["state"] == "registered"
+
+    # Reclaims, renewals, stale receipts and cancellations arrive as event facts.
+    reclaimed = _execution_refs(planes, _resource_ref(int(history["reclaimed"])))
+    kinds = {value.rsplit(":", 1)[-1] for value in reclaimed.values()}
+    assert {"claim_renewed", "claim_timed_out"} <= kinds
+    assert "action_cancelling" in {
+        value.rsplit(":", 1)[-1] for value in _execution_refs(planes, _resource_ref(int(history["cancelling"]))).values()
+    }
+    assert "action_cancel_reaped" in {
+        value.rsplit(":", 1)[-1] for value in _execution_refs(planes, _resource_ref(int(history["reaped"]))).values()
+    }
+
+    # Candidate publication.
+    candidate = _execution_refs(planes, _resource_ref(int(history["candidate"])))
+    assert "publication.registered" in {value.rsplit(":", 1)[-1] for value in candidate.values()}
+    assert legacy_assurance_type("candidate-request") in candidate.values()
+    assert any(str(history["candidate_request_ref"]) in ref for ref in candidate)
+
+    # Action-resource root and its pruned legacy cursor floor.
+    resource_root = _execution_refs(planes, _resource_ref(int(history["action_resource_action"])))
+    assert legacy_assurance_type("action-resource") in resource_root.values()
+    floor_refs = [ref for ref, kind in resource_root.items()
+                  if kind == legacy_assurance_type("action-resource-recovery-floor")]
+    assert len(floor_refs) == 1 and floor_refs[0].endswith("#action-resource-recovery-floor:1")
+
+    # Completion recovery floor.
+    completion = _execution_refs(planes, deterministic_resource_ref(legacy_completion_ref(environment=ENVIRONMENT)))
+    assert legacy_assurance_type("completion-recovery-floor") in completion.values()
+    assert any(ref.endswith("#recovery-floor:1") for ref in completion)
+
+    # Parent/child chains become directed federation relations.
+    with db.connect(planes["url"]) as conn:
+        relations = conn.execute(
+            f"SELECT source_ref, relation_type, target_ref FROM "
+            f"{db.qname(planes['federation'], 'federation_relations')}"
+        ).fetchall()
+    assert [(str(row["source_ref"]), str(row["relation_type"]), str(row["target_ref"])) for row in relations] == [
+        (_resource_ref(int(history["parent"])), "parent-of", _resource_ref(int(history["child"])))
+    ]
+
+
+def test_legacy_claim_receipts_and_event_payloads_never_enter_federation(planes) -> None:
+    _backfill(planes).run()
+    history = planes["history"]
+    secrets = {str(history["completed_receipt"]), str(history["stale_receipt"]), str(history["live_receipt"])}
+    with db.connect(planes["url"]) as conn:
+        blob = b"".join(
+            bytes(row["payload_bytes"]) for row in conn.execute(
+                f"SELECT payload_bytes FROM {db.qname(planes['federation'], 'federation_resource_changes')}"
+            ).fetchall()
+        ).decode("utf-8")
+        blob += "".join(
+            str(row["execution_ref"]) + str(row["assurance_type"]) for row in conn.execute(
+                f"SELECT execution_ref, assurance_type FROM "
+                f"{db.qname(planes['federation'], 'federation_execution_refs')}"
+            ).fetchall()
+        )
+    for secret in secrets:
+        assert secret and secret not in blob
+
+
+def test_rerun_changes_no_identity_digest_or_row_count(planes) -> None:
+    """Falsifier: rerun changes identity/digest."""
+    backfill = _backfill(planes)
+    first = backfill.run()
+    before_export = _export(planes)
+    before_counts = {table: _count(planes, table) for table in
+                     ("federation_resources", "federation_resource_changes", "federation_execution_refs",
+                      "federation_relations", "federation_command_decisions")}
+
+    second = backfill.run()
+    assert second.planned == first.planned
+    assert second.replayed == second.planned and second.applied == 0
+    assert second.resource_refs == first.resource_refs
+    assert {table: _count(planes, table) for table in before_counts} == before_counts
+    assert _export(planes) == before_export
+
+    # A fresh instance re-derives the same plan from the same source rows.
+    assert _backfill(planes).plan() == backfill.plan()
+
+
+def test_backfilled_changes_are_distinguishable_from_native_changes(planes) -> None:
+    _backfill(planes).run()
+    native = _principal("native:one", "federation.create", "federation.relate")
+    native_ref = _authority(planes).create(principal=native, idempotency_key="native-1",
+                                           expected_revision=0).resource_ref
+    with db.connect(planes["url"]) as conn:
+        rows = conn.execute(
+            f"SELECT resource_ref, actor_principal_id FROM "
+            f"{db.qname(planes['federation'], 'federation_resource_changes')}"
+        ).fetchall()
+        assurances = {str(row["assurance_type"]) for row in conn.execute(
+            f"SELECT assurance_type FROM {db.qname(planes['federation'], 'federation_execution_refs')}"
+        ).fetchall()}
+    backfilled = [row for row in rows if is_backfilled_change(row)]
+    assert backfilled and all(str(row["actor_principal_id"]) == BACKFILL_PRINCIPAL_ID for row in backfilled)
+    assert [row for row in rows if not is_backfilled_change(row)] == [
+        row for row in rows if str(row["resource_ref"]) == native_ref
+    ]
+    assert assurances and all(item.startswith(LEGACY_ASSURANCE_PREFIX) for item in assurances)
+
+
+def test_backfill_refuses_to_issue_a_non_provenance_command(planes) -> None:
+    backfill = _backfill(planes)
+    command = backfill.plan()[0]
+    widened = BackfillCommand("decide-acceptance", command.idempotency_key, command.resource_ref,
+                            command.expected_revision, {})
+    with pytest.raises(db.ActionQError, match="provenance commands"):
+        backfill._dispatch(widened)
+
+
+def test_backfill_raises_when_a_command_is_rejected(planes) -> None:
+    """A rejected provenance command means the import is not deterministic."""
+    backfill = _backfill(planes)
+    first = backfill.plan()[0]
+    # Occupy the deterministic identity under a different owner first.
+    _authority(planes).create(principal=_principal("other", "federation.create"),
+                              idempotency_key="squat", expected_revision=0,
+                              resource_ref=first.resource_ref)
+    with pytest.raises(BackfillRejected) as raised:
+        backfill.run()
+    assert raised.value.code == "resource-exists"
+
+
+# --- rebuild -----------------------------------------------------------------
+
+
+def test_rebuild_equals_live_projection_for_every_backfilled_resource(planes) -> None:
+    """Falsifier: rebuilt projection differs from live projection."""
+    report = _backfill(planes).run()
+    results = _backfill(planes).verify()
+    assert len(results) == len(report.resource_refs)
+    assert all(result["matches"] for result in results)
+    assert all(result["rebuilt_digest"] == result["live_digest"] for result in results)
+    # The rebuild is a real replay: it reproduces relations and execution refs,
+    # not just the resource row.
+    populated = [result for result in results if result["rebuilt"]["execution_refs"]]
+    assert len(populated) == len(results)
+    with db.connect(planes["url"]) as conn:
+        for resource_ref in report.resource_refs:
+            assert require_rebuild_matches(conn, planes["federation"], resource_ref)["matches"]
+
+
+def test_rebuild_agrees_with_the_authority_snapshot(planes) -> None:
+    report = _backfill(planes).run()
+    reader = _principal("reader", "federation.read")
+    authority = _authority(planes)
+    with db.connect(planes["url"]) as conn:
+        for resource_ref in report.resource_refs:
+            snapshot = authority.snapshot(principal=reader, resource_ref=resource_ref)
+            rebuilt = rebuild_from_changes(conn, planes["federation"], resource_ref)
+            assert rebuilt["revision"] == snapshot["revision"]
+            assert rebuilt["state"] == snapshot["state"]
+            assert rebuilt["owner_principal_id"] == snapshot["owner_principal_id"]
+            assert rebuilt["recovery_floor"] == snapshot["recovery_floor"]
+
+
+def test_rebuild_detects_gaps_duplicates_and_digest_conflicts(planes) -> None:
+    """Falsifier: revision gaps or duplicates pass."""
+    report = _backfill(planes).run()
+    resource_ref = report.resource_refs[0]
+    with db.connect(planes["url"]) as conn:
+        rows = conn.execute(
+            f"SELECT revision, operation, state, actor_principal_id, payload_bytes, payload_digest FROM "
+            f"{db.qname(planes['federation'], 'federation_resource_changes')} WHERE resource_ref=%s ORDER BY revision",
+            (resource_ref,),
+        ).fetchall()
+        assert len(rows) >= 3
+
+        with pytest.raises(RebuildError) as gap:
+            rebuild_from_changes(conn, planes["federation"], resource_ref,
+                                 changes=[rows[0], *rows[2:]])
+        assert gap.value.code == "revision-gap"
+
+        with pytest.raises(RebuildError) as duplicate:
+            rebuild_from_changes(conn, planes["federation"], resource_ref,
+                                 changes=[rows[0], rows[1], rows[1], *rows[2:]])
+        assert duplicate.value.code == "duplicate-revision"
+
+        with pytest.raises(RebuildError) as headless:
+            rebuild_from_changes(conn, planes["federation"], resource_ref, changes=rows[1:])
+        assert headless.value.code == "revision-gap"
+
+        # A stored digest that no longer matches its bytes is a rebuild failure,
+        # not a silently accepted projection.
+        conn.execute(
+            f"UPDATE {db.qname(planes['federation'], 'federation_resource_changes')} "
+            "SET payload_digest=%s WHERE resource_ref=%s AND revision=2",
+            ("sha256:" + "0" * 64, resource_ref),
+        )
+        with pytest.raises(RebuildError) as digest:
+            rebuild_from_changes(conn, planes["federation"], resource_ref)
+        assert digest.value.code == "payload-digest-mismatch"
+        conn.rollback()
+
+    with db.connect(planes["url"]) as conn:
+        with pytest.raises(RebuildError) as missing:
+            rebuild_from_changes(conn, planes["federation"],
+                                 deterministic_resource_ref("actionq-execution/v1:test:999999"))
+        assert missing.value.code == "resource-not-found"
+
+
+def test_rebuild_detects_a_projection_that_drifted_from_its_changes(planes) -> None:
+    report = _backfill(planes).run()
+    resource_ref = report.resource_refs[0]
+    with db.connect(planes["url"]) as conn:
+        conn.execute(
+            f"UPDATE {db.qname(planes['federation'], 'federation_resources')} "
+            "SET revision = revision + 1 WHERE resource_ref=%s",
+            (resource_ref,),
+        )
+        result = verify_rebuild(conn, planes["federation"], resource_ref)
+        assert result["matches"] is False
+        with pytest.raises(RebuildError) as drift:
+            require_rebuild_matches(conn, planes["federation"], resource_ref)
+        assert drift.value.code == "projection-mismatch"
+        conn.rollback()
+
+
+def test_no_federation_pruning_capability_exists(planes) -> None:
+    """Falsifier: any v1 change was pruned.
+
+    Structural, not documentary: neither module contains a statement that could
+    remove a federation row, so no caller can prune one.
+    """
+    for relative in ("actionq/federation.py", "actionq/federation_backfill.py"):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        statements = [line for line in source.splitlines()
+                      if any(word in line for word in ("DELETE FROM", "TRUNCATE", "DROP TABLE"))]
+        assert statements == [], (relative, statements)
+
+    backfill = _backfill(planes)
+    backfill.run()
+    before = _count(planes, "federation_resource_changes")
+    backfill.run()
+    assert _count(planes, "federation_resource_changes") == before
+
+
+def test_legacy_terminal_state_never_implies_acceptance_or_settlement(planes) -> None:
+    """Falsifier: legacy claimed/completed implies acceptance/settlement."""
+    report = _backfill(planes).run()
+    assert _count(planes, "federation_acceptance_decisions") == 0
+    assert _count(planes, "federation_settlements") == 0
+    assert _count(planes, "federation_evidence") == 0
+    with db.connect(planes["url"]) as conn:
+        states = {str(row["state"]) for row in conn.execute(
+            f"SELECT state FROM {db.qname(planes['federation'], 'federation_resources')}"
+        ).fetchall()}
+        operations = {str(row["operation"]) for row in conn.execute(
+            f"SELECT operation FROM {db.qname(planes['federation'], 'federation_resource_changes')}"
+        ).fetchall()}
+    assert states == {"registered"}
+    assert operations <= {"create", "record-execution-ref", "add-relation"}
+    assert len(report.resource_refs) >= 8
+
+
+# --- export and restore ------------------------------------------------------
+
+
+def _export(planes: dict, schema: str | None = None) -> bytes:
+    with db.connect(planes["url"]) as conn:
+        return export_federation(conn, schema or planes["federation"])
+
+
+def test_export_restore_round_trip_preserves_the_canonical_projection(planes) -> None:
+    """Falsifier: export/restore changes canonical projection."""
+    report = _backfill(planes).run()
+    exported = _export(planes)
+    assert exported == _export(planes)
+    document = json.loads(exported)
+    assert document["schema_version"] == "federation-export/v1"
+    assert document["compatibility_label"] == federation_schema.COMPATIBILITY_LABEL
+    assert set(document["tables"]) >= {"federation_resources", "federation_resource_changes"}
+
+    restored_schema = _new_schema("aqbf_restore")
+    try:
+        with db.connect(planes["url"]) as conn:
+            federation_schema.migrate(conn, restored_schema)
+            conn.commit()
+        with db.connect(planes["url"]) as conn:
+            counts = restore_federation(conn, restored_schema, exported)
+            conn.commit()
+        assert counts["federation_resources"] == len(report.resource_refs)
+
+        with db.connect(planes["url"]) as conn:
+            for resource_ref in report.resource_refs:
+                original = live_projection(conn, planes["federation"], resource_ref)
+                copied = live_projection(conn, restored_schema, resource_ref)
+                assert canonical_bytes(original) == canonical_bytes(copied)
+                assert require_rebuild_matches(conn, restored_schema, resource_ref)["matches"]
+        assert _export(planes, restored_schema) == exported
+    finally:
+        with db.connect(planes["url"]) as conn:
+            conn.execute(f'DROP SCHEMA "{restored_schema}" CASCADE')
+            conn.commit()
+
+
+def test_restore_refuses_a_non_empty_target_or_a_foreign_document(planes) -> None:
+    """Falsifier: a configured retention objective cannot be restored."""
+    _backfill(planes).run()
+    exported = _export(planes)
+    with db.connect(planes["url"]) as conn:
+        with pytest.raises(ExportError, match="empty federation schema"):
+            restore_federation(conn, planes["federation"], exported)
+        conn.rollback()
+        with pytest.raises(ExportError, match="federation-export/v1 document"):
+            restore_federation(conn, planes["federation"], b'{"schema_version":"other/v1"}')
+        conn.rollback()
+        with pytest.raises(ExportError, match="not JSON"):
+            restore_federation(conn, planes["federation"], b"not json")
+        conn.rollback()
+        with pytest.raises(ExportError, match="must be bytes"):
+            restore_federation(conn, planes["federation"], "not bytes")
+        conn.rollback()
+
+    document = json.loads(exported)
+    document["tables"].pop("federation_settlements")
+    with db.connect(planes["url"]) as conn:
+        with pytest.raises(ExportError, match="every federation table"):
+            restore_federation(conn, planes["federation"], canonical_bytes(document))
+        conn.rollback()

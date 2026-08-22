@@ -42,6 +42,10 @@
         "actionq.federation|from|actionq|federation_schema",
         "actionq.federation|from|actionq_contracts|canonical_bytes,sha256_digest",
         "actionq.federation_schema|from|actionq|db",
+        "actionq.federation_backfill|from|actionq|db",
+        "actionq.federation_backfill|from|actionq|federation_schema",
+        "actionq.federation_backfill|from|actionq.federation|CommandDecision,FederationAuthority,FederationPrincipal,RESOURCE_RE",
+        "actionq.federation_backfill|from|actionq_contracts|canonical_bytes,sha256_digest",
         "actionq.schema|from|actionq|db",
         "actionq.vuoro|from|actionq|db",
         "actionq.vuoro|from|actionq.application|ActionQApplication,InvocationProvenance",
@@ -376,6 +380,7 @@
         "actionq/cli.py",
         "actionq/db.py",
         "actionq/federation.py",
+        "actionq/federation_backfill.py",
         "actionq/schema.py",
         "actionq/vuoro.py",
         "docs/contracts/action-resource-owner-v1.md",
@@ -389,6 +394,7 @@
         "tests/test_application_structure.py",
         "tests/test_completion_log_integration.py",
         "tests/test_completion_outbox.py",
+        "tests/test_federation_backfill_rebuild.py",
         "tests/test_federation_revision_authority.py",
         "tests/test_integration_immutable_actions.py",
         "tests/test_integration_postgres.py",
@@ -1021,6 +1027,14 @@
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "Federation migrations enter the execution domain, compatibility is conflated, or database roles can cross their frozen authority boundary."
+    },
+    {
+      "id": "federation-v1-backfill-rebuild-and-export",
+      "path": "actionq/federation_backfill.py",
+      "symbols": ["BackfillRejected", "BackfillRejected.__init__", "RebuildError", "RebuildError.__init__", "ExportError", "_require_environment", "_require_action_id", "legacy_execution_ref", "legacy_completion_ref", "legacy_assurance_type", "deterministic_resource_ref", "backfill_principal", "is_backfilled_change", "BackfillCommand", "BackfillReport", "LegacySource", "LegacySource.__init__", "LegacySource._q", "LegacySource.actions", "LegacySource.events", "LegacySource.action_resources", "LegacySource.candidate_requests", "LegacySource.completion_watermark", "FederationBackfill", "FederationBackfill.__init__", "FederationBackfill._ref", "FederationBackfill._key", "FederationBackfill._read", "FederationBackfill.plan", "FederationBackfill._dispatch", "FederationBackfill.run", "FederationBackfill.verify", "_q", "_empty_projection", "_sorted", "rebuild_from_changes", "live_projection", "verify_rebuild", "require_rebuild_matches", "_encode", "_decode", "export_federation", "restore_federation"],
+      "disposition": "replace-by-federation",
+      "owner": "actionq",
+      "falsifying_test": "Backfill gains acceptance/settlement authority, reads legacy rows outside its declared seam, changes identity or digest on rerun, prunes a federation change, or export/restore changes the canonical projection."
     },
     {
       "id": "execution-schema-and-migration-mechanics",
