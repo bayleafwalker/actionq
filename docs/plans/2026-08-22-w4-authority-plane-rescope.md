@@ -62,9 +62,14 @@ field of the principal itself.
 So `global` is not what ActionQ implements, and the freeze was right to flag it. It is
 nonetheless the right contract scope, and the reason is section 3: once a principal id is minted
 once and never reissued, it identifies the same subject in every environment, and ActionQ's
-`environment` column becomes a partition key rather than part of identity. Adopt `global` **on
-the condition that** the stable-identifier rule is adopted with it. Without that rule, `global`
-is a false statement about the data, and the honest scope would be `environment`.
+`environment` column becomes a partition key rather than part of identity.
+
+`global` is **adopted**, because the stable-identifier rule was adopted with it and is
+implemented on the issuer side (vuoro #53). The conditional this document originally carried is
+discharged: the alternative was scoping the contract to `environment`, which would have forced an
+edit to a contract shipped `frozen: true` and would have left `non-transferable` an obligation
+that stops meaning anything at exactly the boundary ownership crosses. A global frozen contract
+whose central guarantee is environment-local is not worth shipping.
 
 ### 2.3 `project` scope for `federation.grant/v1` — **corrected to `environment`**
 
@@ -91,8 +96,9 @@ an actor renamed, a decommissioned actor's name given to someone else — then e
 first holder owned silently becomes the second holder's, and there is no operation that can
 correct it. The data is unfixable, not merely wrong.
 
-**The rule.** `principal_id` is a **mint-once identifier, never reissued, distinct from the
-display actor**, and it is carried by the identity assertion rather than derived from a name:
+**The rule**, adopted and implemented on the issuer side in vuoro #53. `principal_id` is a
+**mint-once identifier, never reissued, distinct from the display actor**, carried by the
+identity assertion rather than derived from a name:
 
     principal_id := "<issuer>:<subject>:<epoch>"
 
@@ -107,11 +113,14 @@ Three consequences, stated because each is a change somewhere:
 1. **Vuoro's `Identity` gains a stable `principal_id` beside `actor`.** `actor` stays the display
    and provenance spelling; `principal_id` is what federation ownership binds. They are not the
    same field and must not be conflated: `actor` is chosen for humans and is expected to change.
-2. **The gateway assertion needs an epoch claim.** Today the assertion carries `actor`, `sub`
+2. **The gateway assertion carries an epoch claim.** It previously carried `actor`, `sub`
    (asserted equal to `actor`), `workspace_id`, `authorities`, `repo_ids` and per-request `iat`
-   / `nbf` / `exp` with a 30-second lifetime. `iat` is per *request*, not per issuance, so
-   nothing in the current claim set can distinguish a reissued actor from the original. The
-   static identity registry needs the same field.
+   / `nbf` / `exp` on a 30-second lifetime — and `iat` is per *request*, not per issuance, so
+   nothing in that set could distinguish a reissued actor from the original. `principal_epoch`
+   is now required and the resolver composes `issuer:sub:epoch`; the static registry requires a
+   minted `principal_id` per entry. **Minting and persisting the per-subject epoch is Vuoro
+   Cloud's half and is not yet built** — until it is, the gateway path refuses every assertion,
+   which is the correct failure direction.
 3. **The reserved system namespace stays reserved.** `BACKFILL_PRINCIPAL_ID =
    "federation-backfill/v1"` (`actionq/federation_backfill.py:41`) is a pinned literal, and
    deliberately so: it is half of what makes backfilled changes distinguishable from native ones
@@ -233,8 +242,8 @@ Two of #40's smaller open items are still open, and neither blocks the build:
 * who owns release-order steps 3 and 5-7 — Vuoro merge, release, deploy, client rediscovery,
   evidence capture — which no document assigns.
 
-One new one, created by section 3 and worth naming rather than absorbing: the epoch claim is a
-change to the gateway assertion, which is Vuoro Cloud's surface. If that change is not wanted,
-the fallback is `federation.principal/v1` scoped `environment` rather than `global`, and an
-explicit statement that principal ids are unique only within an environment — which is weaker,
-but at least true.
+One new one, created by section 3 and now the critical-path item: **Vuoro Cloud must mint and
+persist a per-subject epoch** before any gateway-issued identity can be resolved at all. The
+service side refuses an assertion without the claim, which is the right direction to fail but
+makes the cloud change a prerequisite rather than a follow-up. The static registry path is
+unaffected — its ids are minted by the operator in the registry file.
