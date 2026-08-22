@@ -50,19 +50,25 @@ HISTORIES = (
 ROUND_RECORDS = ROOT / "docs/evidence/w3-review-rounds.jsonl"
 
 
-def _untracked_python_files() -> list[str]:
+def _untracked_files() -> list[str]:
     """Files git has never seen, which several gates cannot see either.
 
-    ``_tracked_files`` in the reachability contract reads ``git ls-files``, so a
-    new module or test that has not been staged is invisible to the very checks
-    that exist to pin it -- the suite passes locally and fails in CI the moment
-    it is committed. That happened once; reporting it costs one subprocess.
+    ``_tracked_files`` in the reachability contract reads ``git ls-files``, so
+    anything unstaged is invisible to the very checks that exist to pin it --
+    the suite passes locally and fails in CI the moment it is committed.
+
+    This was first written to watch ``.py`` files, having been prompted by an
+    unstaged test module. It missed the next one by exactly one file extension:
+    the repository consumer scan classifies documents too, so an unstaged plan
+    under ``docs/`` failed CI the same way. Gitignored paths are already
+    excluded by ``--exclude-standard``, so anything this reports is a file the
+    repository is genuinely supposed to know about.
     """
     completed = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard"],
         cwd=ROOT, capture_output=True, text=True,
     )
-    return [line for line in completed.stdout.split() if line.endswith(".py")]
+    return completed.stdout.split()
 
 
 def _require_postgres() -> str | None:
@@ -202,13 +208,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"FAILED: {complaint}")
             return 1
 
-    untracked = _untracked_python_files()
+    untracked = _untracked_files()
     if untracked:
-        print("--- untracked python files")
+        print("--- untracked files")
         for path in untracked:
             print(f"  ! {path}: git ls-files cannot see this, and neither can the "
                   "reachability and retirement contracts")
-        print("\nFAILED: stage new modules and tests before running the round.")
+        print("\nFAILED: stage new files before running the round.")
         return 1
 
     ok, notes = _patch_manifest(dry_run=arguments.dry_run)
