@@ -1,0 +1,29 @@
+{
+  "schema_id": "actionq/review-finding-record/v1",
+  "purpose": "Per-finding measurements for the review measurement track. The round record (w3-review-rounds.jsonl) counts findings; this records what happened to each one, which is what item 3 needs to compare a cheap implement tier against the expensive baseline.",
+  "baseline_definition": {
+    "eligible_for_cheap_tier": "classification == 'line'. A claim-level finding changes what the plan asserts, so it routes to the plan tier by definition and is never handed to the implement tier.",
+    "first_attempt_pass": "The full suite passed on the first attempt after the fix for this finding, with no further edit to the fix. Measured per finding, which requires fixes to be applied and verified one at a time -- batching a round's fixes into one commit makes this unmeasurable, which is exactly why the W3 baseline is partial.",
+    "collateral_breakage": "The fix for this finding turned an unrelated falsifier red. Distinct from first_attempt_pass: a fix can pass its own falsifier and break another.",
+    "escalation_trigger": "A red falsifier is NOT a sufficient trigger. W3 round 3 introduced a regression that produced no red test at all and was caught only by review, so the trigger is (a) any red falsifier, (b) collateral breakage, or (c) the fix requiring a change to a claim rather than a line."
+  },
+  "fields": {
+    "id": "string, unique, matches ^w[0-9]+-r[0-9]+-(g|o)[0-9]{2}$ -- workstream, round, channel (g=pr_gate, o=opus_design), ordinal",
+    "round": "integer, must appear in the corresponding review-rounds record",
+    "channel": "one of pr_gate, opus_design",
+    "summary": "string, one line, what the finding was",
+    "classification": "one of claim, line",
+    "routed_to": "one of plan, implement -- derived: claim->plan, line->implement",
+    "implemented_by": "one of opus, cheap, or null when no fix was applied",
+    "first_attempt_pass": "boolean, or null when not captured",
+    "collateral_breakage": "boolean, or null when not captured",
+    "caught_by": "one of tests, review, probe, n/a -- how the finding itself surfaced",
+    "unavailable_reason": "string, required whenever first_attempt_pass is null",
+    "notes": "string, optional"
+  },
+  "known_limits": [
+    "The W3 records are a partial baseline. Diagnosis and implementation were never separated in W2/W3 -- every fix was written by the same expensive model that diagnosed it, and fixes were applied in per-round batches rather than one at a time. Per-finding first_attempt_pass is therefore genuinely unrecoverable for those rounds, not merely unrecorded, and is null with a reason rather than guessed.",
+    "What the W3 records do establish: the classification distribution (how much of the review yield is claim-level versus line-level), which channel surfaced what, and the collateral events that are independently attested by commit history.",
+    "A first-attempt pass rate for the expensive tier therefore has to be captured going forward, one finding at a time, before a cheap tier can be compared against it."
+  ]
+}
