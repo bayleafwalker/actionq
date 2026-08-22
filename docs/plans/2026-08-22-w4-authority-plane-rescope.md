@@ -256,3 +256,25 @@ persist a per-subject epoch** before any gateway-issued identity can be resolved
 service side refuses an assertion without the claim, which is the right direction to fail but
 makes the cloud change a prerequisite rather than a follow-up. The static registry path is
 unaffected — its ids are minted by the operator in the registry file.
+
+## 8. Handed to W5
+
+Recorded here rather than in a W5 plan because no W5 plan exists yet; whoever writes one should
+start from this list. Neither item is urgent and neither justifies a release of its own.
+
+1. **Bind `federation.resource/v1` in the Vuoro profile.** The composition now pins a wheel that
+   *can* serve it — actionq 0.1.27 carries `actionq/vuoro_federation.py` with `build`/`register`
+   — but the profile declares no adapter record, no closure and no attestation for it, so
+   nothing is bound and nothing is served. This is the first real W5 unit, and it is the point
+   at which the "no migration, no deployment, no grant" fence starts to matter: the federation
+   schema reports `uninitialized` until its migration runs, so binding without migrating
+   produces an incompatible domain at startup rather than a working surface. Backfill still
+   precedes any native principal holding `federation.create` in an environment (§5).
+
+2. **Move ActionQ's own adapter-kit pin.** `pyproject.toml:34` still requires
+   `vuoro-adapter-kit` 0.1.0 by URL and digest, while the composition installs 0.1.1 — the kit
+   that carries the uniform construction shims. Nothing fails today: a direct-URL requirement
+   carries no version specifier, so `uv pip check` is satisfied and the release gates pass. But
+   the owner's declared dependency is behind what its consumer runs, which is the kind of
+   divergence that is cheap to fix inside the next ActionQ change and expensive to discover
+   during a rollback. **Fold it into the next release; do not cut one for it.**
