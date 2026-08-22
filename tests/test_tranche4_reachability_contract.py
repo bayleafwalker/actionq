@@ -670,6 +670,11 @@ def test_every_local_import_edge_is_pinned_and_runner_has_zero_root_reach():
 
 
 def test_every_console_script_cli_command_and_catalog_operation_is_pinned():
+    """Scope: the 26-operation default catalog and its 27-operation
+    policy-enabled variant, pinned by exact operation name set. It pins the
+    operation *names* and their handler bindings, not the wire bytes of each
+    schema -- so it catches an added, removed or rebound operation, which is
+    what "execution/v1 stays frozen" means for W4."""
     manifest = _manifest()
     assert _flatten(manifest["console_script_groups"], "scripts") == _console_scripts()
     assert _flatten(manifest["cli_command_groups"], "commands") == _cli_commands()

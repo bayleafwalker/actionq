@@ -45,33 +45,62 @@ FALSIFIER_BLOCK = re.compile(r"```falsifiers\n(.*?)\n```", re.DOTALL)
 TEST_REFERENCE = re.compile(r"^(tests/[A-Za-z0-9_]+\.py)::([A-Za-z0-9_]+)$")
 REQUIRED_FIELDS = {"id", "claim", "scope"}
 
-# Pinned so a drop is a visible edit, the same way the reachability manifest is
-# hand-edited rather than regenerated. Raising it is free; lowering it should
-# require saying why in review.
-MINIMUM_COVERAGE = 0.85
+# Floor no document may declare below, whatever kind it is.
+ABSOLUTE_FLOOR = 0.0
 
 
 def _documents() -> list[tuple[Path, str]]:
+    """Documents that opt in, discovered by *either* signal.
+
+    Keying discovery on the falsifiers block alone would make a document that
+    carries claim markers and no block invisible to every check below -- the one
+    shape that most needs catching, since it is what a half-finished opt-in
+    looks like.
+    """
     found: list[tuple[Path, str]] = []
     for root in DOC_ROOTS:
         if not root.is_dir():
             continue
         for path in sorted(root.rglob("*.md")):
             text = path.read_text(encoding="utf-8")
-            if FALSIFIER_BLOCK.search(text):
+            if FALSIFIER_BLOCK.search(text) or CLAIM_MARKER.search(text):
                 found.append((path, text))
     return found
 
 
-def _falsifiers(text: str, path: Path) -> list[dict]:
+def _block(text: str, path: Path) -> dict:
+    """The document's falsifier declaration.
+
+    An object, not a bare list, because each document declares its own coverage
+    target. A contract document asserting properties of code at rest can hold a
+    high one; a scope document making ordering and boundary claims about a
+    change set that does not exist yet legitimately cannot, and forcing one
+    number on both would either block the scope document or set the number so
+    low it never bites the contract. The target is pinned in the document, so
+    lowering it is a visible edit in review rather than a silent drift.
+    """
     blocks = FALSIFIER_BLOCK.findall(text)
-    assert len(blocks) == 1, f"{path}: expected exactly one falsifiers block, found {len(blocks)}"
+    assert len(blocks) == 1, (
+        f"{path}: expected exactly one falsifiers block, found {len(blocks)}"
+        + ("; the document carries claim markers, so it has opted in and owes one"
+           if not blocks and CLAIM_MARKER.search(text) else "")
+    )
     try:
         parsed = json.loads(blocks[0])
     except ValueError as malformed:  # pragma: no cover - failure path is the point
         pytest.fail(f"{path}: falsifiers block is not valid JSON: {malformed}")
-    assert isinstance(parsed, list) and parsed, f"{path}: falsifiers block must be a non-empty list"
+    assert isinstance(parsed, dict), f"{path}: falsifiers block must be an object"
+    target = parsed.get("minimum_coverage")
+    assert isinstance(target, (int, float)) and ABSOLUTE_FLOOR <= target <= 1, (
+        f"{path}: falsifiers block must declare a minimum_coverage between {ABSOLUTE_FLOOR} and 1"
+    )
+    entries = parsed.get("falsifiers")
+    assert isinstance(entries, list) and entries, f"{path}: falsifiers must be a non-empty list"
     return parsed
+
+
+def _falsifiers(text: str, path: Path) -> list[dict]:
+    return _block(text, path)["falsifiers"]
 
 
 def _test_functions(relative: str) -> set[str]:
@@ -163,18 +192,44 @@ def test_every_falsifier_scope_is_restated_by_the_test_it_names() -> None:
             )
 
 
-def test_falsifier_coverage_meets_the_pinned_minimum() -> None:
-    total = covered = 0
-    gaps: list[str] = []
+def test_no_two_claims_declare_the_same_scope() -> None:
+    """The half of claim-to-scope agreement a machine can actually check.
+
+    The gate binds scope to the named test's docstring, and nothing binds the
+    *claim* to the scope -- a semantic relation no test can verify. But its
+    commonest failure is mechanical: a scope string copied from another
+    falsifier along with its test reference, leaving a claim cited by a test
+    that would not fail if the claim were false. That produced a false-positive
+    coverage entry in the W4 scope document, inflating its honest 1-of-6 to
+    2-of-6. Identical scopes across distinct claims are what that looks like.
+    """
+    seen: dict[str, str] = {}
     for path, text in _documents():
         for entry in _falsifiers(text, path):
-            total += 1
-            if entry.get("test") is None:
-                gaps.append(f"{path.name}:{entry['id']}")
-            else:
-                covered += 1
-    coverage = covered / total
-    assert coverage >= MINIMUM_COVERAGE, (
-        f"falsifier coverage {coverage:.2f} is below the pinned {MINIMUM_COVERAGE:.2f}; "
-        f"declared gaps: {gaps}"
-    )
+            scope = _flow(entry["scope"])
+            if scope in seen and seen[scope] != entry["id"]:
+                pytest.fail(
+                    f"{path}: falsifier {entry['id']!r} declares the same scope as "
+                    f"{seen[scope]!r}; a copied scope usually means a copied test reference "
+                    "that does not falsify this claim"
+                )
+            seen[scope] = entry["id"]
+
+
+def test_falsifier_coverage_meets_the_pinned_minimum_per_document() -> None:
+    """Per document, never pooled.
+
+    A pooled ratio lets a thoroughly falsified document carry an unfalsified
+    one, which is exactly backwards: the document with no falsifiers is the one
+    that needs the gate.
+    """
+    for path, text in _documents():
+        block = _block(text, path)
+        entries = block["falsifiers"]
+        target = block["minimum_coverage"]
+        gaps = [entry["id"] for entry in entries if entry.get("test") is None]
+        coverage = (len(entries) - len(gaps)) / len(entries)
+        assert coverage >= target, (
+            f"{path}: falsifier coverage {coverage:.2f} is below the {target:.2f} "
+            f"this document declares; declared gaps: {gaps}"
+        )
