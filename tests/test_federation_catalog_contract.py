@@ -232,3 +232,56 @@ def test_an_unminted_principal_id_is_refused_before_any_command(principal_id) ->
 def test_an_identity_without_an_environment_is_refused() -> None:
     with pytest.raises(FederationPrincipalError, match="environment-bound"):
         principal_from_identity(_identity(environment=""))
+
+
+# --- the migration entrypoint ------------------------------------------------
+
+
+def test_the_federation_migration_is_reachable_from_the_released_wheel() -> None:
+    """The gap W4 shipped with: assets and a loader, and nothing that calls them.
+
+    `federation_schema.migrate` and `federation_migrations/001_*.sql` were both
+    in the 0.1.27 wheel, and no console script, CLI command or manifest invoked
+    either -- so release-order step 3, "run the federation migration job using
+    that exact released wheel", could not be performed with the artifact it
+    names. This asserts the entrypoint exists and is wired to the federation
+    loader rather than the execution one.
+    """
+    from click.testing import CliRunner
+
+    from actionq import federation_schema
+    from actionq.cli import cli, federation_migrate
+
+    result = CliRunner().invoke(cli, ["federation", "--help"])
+    assert result.exit_code == 0
+    assert "migrate" in result.output and "check-compatibility" in result.output
+    assert federation_migrate.callback.__module__ == "actionq.cli"
+    assert federation_schema.load_migrations()
+
+
+def test_the_domain_selection_cannot_be_made_by_omission() -> None:
+    """A separate group, not a flag with a default.
+
+    The freeze requires the execution and federation migration selections to be
+    explicit inputs. A `--domain` flag defaulting to execution is a selection
+    that can be made by forgetting, and running the wrong domain's DDL against a
+    live database is not undone by rerunning the command.
+    """
+    from actionq.cli import cli, migrate
+
+    assert "federation" in cli.commands
+    assert not any(
+        parameter.name == "domain" for parameter in migrate.params
+    ), "execution migrate must not grow a domain selector"
+
+
+def test_the_federation_schema_is_not_inherited_from_the_execution_group() -> None:
+    """Different schemas in one database, so the option is not shared.
+
+    Inheriting would make `actionctl --schema execution federation migrate`
+    create federation tables inside the execution schema, which no later
+    migration could tidy up.
+    """
+    from actionq.cli import federation_migrate
+
+    assert any(parameter.name == "federation_schema_name" for parameter in federation_migrate.params)
