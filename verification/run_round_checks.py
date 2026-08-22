@@ -50,6 +50,21 @@ HISTORIES = (
 ROUND_RECORDS = ROOT / "docs/evidence/w3-review-rounds.jsonl"
 
 
+def _untracked_python_files() -> list[str]:
+    """Files git has never seen, which several gates cannot see either.
+
+    ``_tracked_files`` in the reachability contract reads ``git ls-files``, so a
+    new module or test that has not been staged is invisible to the very checks
+    that exist to pin it -- the suite passes locally and fails in CI the moment
+    it is committed. That happened once; reporting it costs one subprocess.
+    """
+    completed = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    return [line for line in completed.stdout.split() if line.endswith(".py")]
+
+
 def _require_postgres() -> str | None:
     """The suite and the packets both need initdb/pg_ctl on PATH.
 
@@ -186,6 +201,15 @@ def main(argv: list[str] | None = None) -> int:
         if complaint:
             print(f"FAILED: {complaint}")
             return 1
+
+    untracked = _untracked_python_files()
+    if untracked:
+        print("--- untracked python files")
+        for path in untracked:
+            print(f"  ! {path}: git ls-files cannot see this, and neither can the "
+                  "reachability and retirement contracts")
+        print("\nFAILED: stage new modules and tests before running the round.")
+        return 1
 
     ok, notes = _patch_manifest(dry_run=arguments.dry_run)
     print("--- reachability manifest")
