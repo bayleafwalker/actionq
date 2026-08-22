@@ -132,7 +132,8 @@
       "edges": [
         "actionq.vuoro_federation|from|actionq.federation|FederationAuthority,FederationPrincipal",
         "actionq.vuoro_federation|from|actionq|db",
-        "actionq.vuoro_federation|from|actionq|federation_schema"
+        "actionq.vuoro_federation|from|actionq|federation_schema",
+        "actionq.cli|from|actionq|federation_schema"
       ],
       "disposition": "federation-successor",
       "owner": "actionq+vuoro",
@@ -210,6 +211,9 @@
       "id": "cli-federation-successors",
       "commands": [
         "check-compatibility|actionq.cli:check_compatibility",
+        "federation check-compatibility|actionq.cli:federation_check_compatibility",
+        "federation migrate|actionq.cli:federation_migrate",
+        "federation|actionq.cli:federation",
         "migrate|actionq.cli:migrate",
         "register-publication|actionq.cli:register_publication"
       ],
@@ -1005,7 +1009,7 @@
     {
       "id": "mixed-actionctl-facade",
       "path": "actionq/cli.py",
-      "symbols": ["ActionQGroup", "ActionQGroup.invoke", "_schema", "_app", "_connect", "_echo_json", "cli", "migrate", "check_compatibility", "add", "list_cmd", "show", "execution_group", "group_realize", "group_show", "group_list", "group_stop", "claim", "renew", "complete", "fail", "reject", "settle", "cancel", "cancel_ack", "register_publication", "sweep", "events", "sessions", "emit"],
+      "symbols": ["ActionQGroup", "ActionQGroup.invoke", "_schema", "_app", "_connect", "_echo_json", "cli", "migrate", "federation", "federation_migrate", "federation_check_compatibility", "check_compatibility", "add", "list_cmd", "show", "execution_group", "group_realize", "group_show", "group_list", "group_stop", "claim", "renew", "complete", "fail", "reject", "settle", "cancel", "cancel_ack", "register_publication", "sweep", "events", "sessions", "emit"],
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "A legacy command silently aliases federation semantics, or a callable disappears before versioned deprecation and cutover."

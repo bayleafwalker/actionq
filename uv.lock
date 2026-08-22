@@ -11,7 +11,7 @@ members = [
 
 [[package]]
 name = "actionq"
-version = "0.1.22"
+version = "0.1.28"
 source = { editable = "." }
 dependencies = [
     { name = "actionq-contracts" },
@@ -34,7 +34,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=45" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "vuoro-adapter-kit", url = "https://github.com/bayleafwalker/vuoro/releases/download/vuoro-adapter-kit-v0.1.0/vuoro_adapter_kit-0.1.0-py3-none-any.whl" },
+    { name = "vuoro-adapter-kit", url = "https://github.com/bayleafwalker/vuoro/releases/download/vuoro-adapter-kit-v0.1.1/vuoro_adapter_kit-0.1.1-py3-none-any.whl" },
     { name = "vuoro-schema-runtime", url = "https://github.com/bayleafwalker/vuoro/releases/download/vuoro-schema-runtime-v0.1.0/vuoro_schema_runtime-0.1.0-py3-none-any.whl" },
 ]
 provides-extras = ["dev"]
@@ -384,10 +384,10 @@ wheels = [
 
 [[package]]
 name = "vuoro-adapter-kit"
-version = "0.1.0"
-source = { url = "https://github.com/bayleafwalker/vuoro/releases/download/vuoro-adapter-kit-v0.1.0/vuoro_adapter_kit-0.1.0-py3-none-any.whl" }
+version = "0.1.1"
+source = { url = "https://github.com/bayleafwalker/vuoro/releases/download/vuoro-adapter-kit-v0.1.1/vuoro_adapter_kit-0.1.1-py3-none-any.whl" }
 wheels = [
-    { url = "https://github.com/bayleafwalker/vuoro/releases/download/vuoro-adapter-kit-v0.1.0/vuoro_adapter_kit-0.1.0-py3-none-any.whl", hash = "sha256:0037898a4c9f01720a42302365b0172ecd203732070326ea2abdf549a44bf0c2" },
+    { url = "https://github.com/bayleafwalker/vuoro/releases/download/vuoro-adapter-kit-v0.1.1/vuoro_adapter_kit-0.1.1-py3-none-any.whl", hash = "sha256:0dac880d790857fbed1085906f0e2ffd151c509ab61d527a351b68f3775ee16f" },
 ]
 
 [package.metadata]
