@@ -50,6 +50,14 @@ Two facts found in the same pass that 5.3 and 5.6 both need, and which no docume
   do not block federation, but a consumer inventory (5.9 record 1) that treats every job as
   evidence of a run would misread them.
 
+**Owner decisions 2026-08-23** (pathway D-1/D-4/D-6/D-7): federation gets its own migration and
+runtime principals; 5.3/5.6 run on `vuoro-dev` first, which may be fully broken during tests;
+`vuoro-shared` then repeats the change as a migration exercise; clients update only after
+`vuoro-shared`; `agent-cockpit` last. Rule 8 refinement ratified (vuoro v4 freeze Amendment 2),
+so 5.4's second provider record may share the wheel filename. The three `[C-1]` drops —
+`execution/v1` out of the catalog, W6 facades, the epoch-less static-registry path — execute as
+**one big drop** after the regular W5 implementation passes, not interleaved with it.
+
 ## W5 — consumer cutover and legacy-write fence
 
 Ordered. Items marked **critical path** block everything below them; the rest are independent
