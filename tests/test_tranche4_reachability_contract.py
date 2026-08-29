@@ -26,6 +26,10 @@ MANIFEST_PATH = ROOT / "docs/contracts/tranche4-reachability-v1.json"
 DISPOSITIONS = {
     "retain-as-frozen-archive",
     "replace-by-federation",
+    # W4's addition: every prior term describes something awaiting federation.
+    # The federation serving surface is the thing they were waiting for, and
+    # calling it "replace-by-federation" would say it replaces itself.
+    "federation-successor",
     "historicalize/delete",
     "unresolved-owner-decision",
 }
@@ -266,9 +270,33 @@ def _cli_commands() -> set[str]:
     return commands
 
 
+def _bound_method_names(operation, subject) -> set[str]:
+    """Which method of ``subject`` an operation's handler actually calls.
+
+    Walks the handler and every callable it closes over, because the adapters
+    wrap their handlers: the name is in the inner lambda, not the outer one.
+    """
+    handler = operation.handler
+    callables = [handler]
+    callables.extend(
+        cell.cell_contents
+        for cell in (handler.__closure__ or ())
+        if callable(cell.cell_contents)
+    )
+    callables.extend(value for value in (handler.__defaults__ or ()) if callable(value))
+    return {
+        name
+        for callback in callables
+        for name in callback.__code__.co_names
+        if callable(getattr(subject, name, None))
+    }
+
+
 def _catalog_operations_and_handlers() -> tuple[set[str], dict[str, str]]:
     from actionq.application import ActionQApplication
+    from actionq.federation import FederationAuthority
     from actionq.vuoro import build_operations, catalog_metadata
+    from actionq import vuoro_federation
 
     policy_enabled = ActionQApplication(managed_dispatch_policy=object())
     built = build_operations(policy_enabled)
@@ -276,22 +304,20 @@ def _catalog_operations_and_handlers() -> tuple[set[str], dict[str, str]]:
     operations.update(operation.definition["name"] for operation in built)
     handlers: dict[str, str] = {}
     for operation in built:
-        handler = operation.handler
-        callables = [handler]
-        callables.extend(
-            cell.cell_contents
-            for cell in (handler.__closure__ or ())
-            if callable(cell.cell_contents)
-        )
-        callables.extend(value for value in (handler.__defaults__ or ()) if callable(value))
-        method_names = {
-            name
-            for callback in callables
-            for name in callback.__code__.co_names
-            if callable(getattr(policy_enabled, name, None))
-        }
+        method_names = _bound_method_names(operation, policy_enabled)
         assert len(method_names) == 1, (operation.definition["name"], method_names)
         handlers[operation.definition["name"]] = method_names.pop()
+
+    # The federation surface is pinned the same way and against its own subject:
+    # its handlers call FederationAuthority, never ActionQApplication, and that
+    # separation is the reason it is a separate module.
+    authority = FederationAuthority(connection=lambda: None, schema="federation")
+    for operation in vuoro_federation.build_operations():
+        name = operation.definition["name"]
+        operations.add(name)
+        method_names = _bound_method_names(operation, authority)
+        assert len(method_names) == 1, (name, method_names)
+        handlers[name] = method_names.pop()
     return operations, handlers
 
 

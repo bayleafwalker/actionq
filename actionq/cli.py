@@ -7,6 +7,7 @@ import click
 
 from . import __version__
 from . import db
+from . import federation_schema
 from . import schema as schema_contract
 from .application import ActionQApplication
 
@@ -68,6 +69,64 @@ def migrate(ctx: click.Context, json_output: bool) -> None:
         versions = result["applied_versions"]
         detail = f"applied {versions}" if versions else "already current"
         click.echo(f"Migrated schema {_schema(ctx)} ({detail})")
+
+
+@cli.group("federation")
+def federation() -> None:
+    """Federation-domain schema operations.
+
+    A separate command group rather than a ``--domain`` flag on ``migrate``,
+    because the freeze requires the execution and federation migration
+    selections to be *explicit* inputs: a flag with a default is a selection
+    that can be made by omission, and the failure it invites -- an operator
+    intending one domain and running the other against a live database -- is
+    the one that cannot be undone by rerunning the command.
+
+    The two loaders share no state. An execution v12 compatibility result never
+    claims federation readiness, and this group never touches execution
+    migrations.
+    """
+
+
+@federation.command("migrate")
+@click.option("--schema", "federation_schema_name", default=None,
+              help="Federation schema (default: ACTIONQ_FEDERATION_SCHEMA or federation)")
+@click.option("--json-output", is_flag=True, help="Emit the migration result as JSON.")
+def federation_migrate(federation_schema_name: str | None, json_output: bool) -> None:
+    """Apply federation migrations using a DDL-authorized role.
+
+    Takes its own ``--schema`` rather than inheriting the group's execution
+    schema: they are different schemas in the same database, and inheriting
+    would make ``actionctl --schema execution federation migrate`` silently
+    create federation tables in the execution schema.
+    """
+    selected = federation_schema_name or federation_schema.configured_schema()
+    with _connect(require_compatibility=False) as conn:
+        result = federation_schema.migrate(conn, selected)
+    if json_output:
+        _echo_json(result)
+    else:
+        versions = result.get("applied_versions") or []
+        detail = f"applied {versions}" if versions else "already current"
+        click.echo(f"Migrated federation schema {selected} ({detail})")
+
+
+@federation.command("check-compatibility")
+@click.option("--schema", "federation_schema_name", default=None,
+              help="Federation schema (default: ACTIONQ_FEDERATION_SCHEMA or federation)")
+def federation_check_compatibility(federation_schema_name: str | None) -> None:
+    """Report federation schema compatibility without running DDL.
+
+    Reports ``uninitialized`` until the migration has run, which is what makes
+    it usable as the precondition check before a cutover rather than only as a
+    postcondition.
+    """
+    selected = federation_schema_name or federation_schema.configured_schema()
+    with _connect(require_compatibility=False) as conn:
+        compatibility = federation_schema.check_compatibility(conn, selected)
+    _echo_json(compatibility.as_dict())
+    if not compatibility.compatible:
+        raise click.exceptions.Exit(3)
 
 
 @cli.command("check-compatibility")

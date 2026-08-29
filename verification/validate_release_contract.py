@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ADAPTER_NAME = "vuoro-adapter-kit"
 SCHEMA_RUNTIME_NAME = "vuoro-schema-runtime"
 EXPECTED_SHARED_DIGESTS = {
-    ADAPTER_NAME: "0037898a4c9f01720a42302365b0172ecd203732070326ea2abdf549a44bf0c2",
+    ADAPTER_NAME: "0dac880d790857fbed1085906f0e2ffd151c509ab61d527a351b68f3775ee16f",
     SCHEMA_RUNTIME_NAME: "b66c9357c99aa9e1a7353991ce54105a8621958ecfac47f8c121d80b90b77912",
 }
 DEPENDENCY_DIGEST_RE = re.compile(r"^sha256=(?P<digest>[0-9a-f]{64})$")
@@ -114,8 +114,12 @@ def validate_wheel(wheel_path: Path, tag: str | None = None) -> None:
         raise AssertionError(f"wheel is not an ActionQ wheel: {wheel_path.name}")
 
     project = _project_metadata()
-    if project["version"] != "0.1.26":
-        raise AssertionError("the release contract is frozen to ActionQ 0.1.26")
+    # Frozen to the version the Vuoro composition pins, and moved only by the
+    # tranche that publishes a new one. W4 is that tranche: it adds the
+    # federation serving surface, which cannot reach a deployment without a
+    # wheel, and a released wheel cannot be amended afterwards.
+    if project["version"] != "0.1.28":
+        raise AssertionError("the release contract is frozen to ActionQ 0.1.28")
     if "actionq-contracts==0.1.1" not in project["dependencies"]:
         raise AssertionError("actionq-contracts must remain pinned at 0.1.1")
 

@@ -159,8 +159,8 @@ def test_runtime_dependency_is_pinned_to_immutable_release_wheel():
     pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text()
     assert (
         "vuoro-adapter-kit @ https://github.com/bayleafwalker/vuoro/releases/"
-        "download/vuoro-adapter-kit-v0.1.0/vuoro_adapter_kit-0.1.0-py3-none-any.whl"
-        "#sha256=0037898a4c9f01720a42302365b0172ecd203732070326ea2abdf549a44bf0c2"
+        "download/vuoro-adapter-kit-v0.1.1/vuoro_adapter_kit-0.1.1-py3-none-any.whl"
+        "#sha256=0dac880d790857fbed1085906f0e2ffd151c509ab61d527a351b68f3775ee16f"
     ) in pyproject
 
 

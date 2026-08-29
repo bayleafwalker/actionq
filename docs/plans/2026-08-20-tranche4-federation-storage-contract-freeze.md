@@ -619,6 +619,29 @@ work packets owned outside this branch; both must cite the dispatcher tombstone 
 preserve a compatibility-launcher fiction. W5 requires current external-consumer evidence.
 W6 must not start while W0–W5 gates are open.
 
+## Amendments
+
+Named changes to this freeze after ratification. Each one says what moved, why, and where the
+change is enforced, so that a reader of the frozen text is never surprised by code that
+disagrees with it.
+
+**Amendment 1 — `federation-successor` disposition (2026-08-22, W4).** The reachability
+contract's disposition vocabulary was `retain-as-frozen-archive`, `replace-by-federation`,
+`historicalize/delete`, `unresolved-owner-decision`. Every one of those describes a surface
+*awaiting* federation, which was correct while nothing federation-side existed. W4 adds
+`actionq/vuoro_federation.py`, the first surface that is the successor rather than something to
+be succeeded, and labelling it `replace-by-federation` would have said it replaces itself.
+
+The amendment is **additive**: no existing term changes meaning, no existing entry is
+relabelled, and every prior disposition remains legal. It is enforced in two places that must
+agree — the `dispositions` list in `docs/contracts/tranche4-reachability-v1.json` and the
+`DISPOSITIONS` constant in `tests/test_tranche4_reachability_contract.py` — and the contract
+test fails on any entry carrying a term absent from both.
+
+Scope of the new term: a module, import group or catalog operation group that *implements*
+federation. It is not a disposition for anything retained, archived or awaiting a decision, and
+using it to escape `unresolved-owner-decision` would be a misuse rather than an amendment.
+
 ## Remaining operator decisions
 
 The following are real decisions and are intentionally not guessed here:
