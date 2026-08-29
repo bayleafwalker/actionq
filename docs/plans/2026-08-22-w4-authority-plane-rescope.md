@@ -10,10 +10,14 @@ What remains unauthorized is unchanged and is not weakened by that: no migration
 is deployed, no credential or role is fenced, and no grant is issued. Those are W5 and remain
 operator-owned.
 
-Supersedes `docs/plans/2026-08-22-w4-scope.md` (PR #40, paused as architecturally superseded).
-That document's corrections are retained and carried forward here; what it could not settle —
-section 2, "the manifest cannot express five domains today" — is settled elsewhere and no longer
-blocks anything.
+Supersedes the W4 scope proposal of PR #40 (`docs/plans/2026-08-22-w4-scope.md` on the
+`feature/w4-scope` branch, which is where it stays — it is deliberately not in this tree, because
+landing a superseded document would restate `w4-execution-v1-frozen` alongside the live
+`w4r-execution-v1-frozen` below, which the falsifier gate correctly rejects as a duplicated
+scope). That document's corrections are retained and carried forward here; what it could not
+settle — section 2, "the manifest cannot express five domains today" — is settled elsewhere and no
+longer blocks anything. Its review round is measured in
+`docs/evidence/w4-finding-records.jsonl`.
 
 Basis: the Vuoro composition v4 design freeze
 (`vuoro docs/plans/2026-08-22-composition-v4-design-freeze.md`, merged as vuoro #51) and the v4
