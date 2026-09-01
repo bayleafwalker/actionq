@@ -1,0 +1,22 @@
+apiVersion: v1
+data:
+  actionq_database_cluster: actionq-cnpg-main
+  notes: 'Active since 1dea5397 (feat(actionq-server): activate deployment and wire
+
+    cockpit dispatch). Implements GET /health, /sessions, /dispatches and
+
+    POST /dispatch against actionq-cnpg-main. Deployment contract recorded in
+
+    actionq''s docs/plans/actionq-server-daemon-workstream-c-plan.md.
+
+    '
+  service_name: actionq-server
+  service_port: '8080'
+kind: ConfigMap
+metadata:
+  labels:
+    kustomize.toolkit.fluxcd.io/name: actionq-server
+    kustomize.toolkit.fluxcd.io/namespace: flux-system
+  name: actionq-server-contract
+  namespace: vscode
+
