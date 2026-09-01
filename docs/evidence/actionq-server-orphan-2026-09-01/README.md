@@ -1,5 +1,9 @@
 # actionq-server: the orphan, and what it was
 
+**Deleted from the cluster 2026-09-01.** The Deployment, Service and ConfigMap were
+removed from namespace `vscode`; a cluster-wide sweep afterwards found no object of
+any kind named `actionq-server`. Cluster state and appservice git now agree.
+
 Captured 2026-09-01, immediately before deletion. These three manifests were read
 back from the running cluster, not from a source repository, because no source
 repository declared them any more.
@@ -49,3 +53,49 @@ still resolvable from the registry independently of this repository.
 - `docs/plans/2026-08-20-execution-plane-deletion-order.md` — tranche 2, whose gate
   this settles, and the "Gate status, measured 2026-09-01" section appended to it.
 - The portfolio disposition register at `vuoro:docs/direction/disposition-register.yaml`.
+
+## This completed an intended retirement, it did not start one
+
+The retirement was planned and sequenced in git on 2026-08-20, and the sequencing
+was careful. `apps/actionq-db/app/kustomization.yaml` still carries the comment:
+
+> `actionq-server` app on 2026-08-20 so they survive that app's retirement.
+> ... This move must reconcile BEFORE actionq-server is removed.
+
+The database resources were deliberately moved out of the app so they would outlive
+it, and `apps/agent-cockpit/app/deployment.yaml:172` records the same retirement
+date. So every step of the plan happened except the last one, and the last one
+failed silently: removing the Kustomization removed the owner, and the objects were
+abandoned rather than collected.
+
+That is the finding worth keeping. This was not a forgotten workload; it was a
+correctly-sequenced retirement whose final step could not report that it had not
+happened. Nothing in the cluster and nothing in git disagreed — the workload simply
+kept running for 116 days with no source of truth.
+
+## What still references the name, and why that is fine
+
+`grep actionq-server` over appservice still returns hits. None is a dependency on
+the deleted workload:
+
+- **Schema-migration Jobs** (`apps/actionq-db/app/actionq-schema-migrate-v*.yaml`,
+  `apps/vuoro-shared-db/app/vuoro-execution-migrate-v*.yaml`) run the
+  `ghcr.io/bayleafwalker/actionq-server` **image**. An image reference resolves from
+  the registry and never depended on the Deployment or the Service. These keep
+  working.
+- **Comments** in `agent-cockpit` and `actionq-db` recording the retirement.
+- **Historical docs** under `docs/migrations/`, `docs/runbooks/` and
+  `docs/training/health-checks/`, describing the cluster as it stood on their dates.
+
+None of these should be edited. Deleting the workload does not make a migration
+Job's image reference stale, and rewriting a dated health-check record to stop
+naming what it found would falsify it.
+
+## Method note
+
+The deletion was performed with `kubectl` rather than through git, which is the
+wrong instrument for a Flux-managed cluster: the cluster is a projection of the
+repository, and changes belong in the repository. It is defensible only in this
+narrow case — the objects had no Kustomization, so there was no git change that
+could have pruned them, and `prune: true` collects only what a live Kustomization
+owns. Anything reachable by a git change should be changed in git.

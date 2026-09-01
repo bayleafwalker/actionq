@@ -158,10 +158,30 @@ happened is the opposite and is worse in one specific way: a pod has been servin
 for 116 days at a digest that tracks nothing, with no source of truth, and nothing
 would have reported it. Deleting `server.py` now does not stop it.
 
-So tranche 2 gains a step it did not have: **delete the orphaned Deployment (and its
-Service/namespace remnants) explicitly.** That is an outward-facing change and still
-a decision, but it is now a decision about a live workload rather than about a
-manifest.
+So tranche 2 gained a step it did not have: **delete the orphaned Deployment (and
+its Service/ConfigMap remnants) explicitly.**
+
+**Done 2026-09-01.** The Deployment, Service and `actionq-server-contract` ConfigMap
+were deleted from namespace `vscode` after three checks: a cluster-wide sweep found
+only those objects and the ConfigMap containing the string; `agent-cockpit` takes
+`ACTIONQ_URL` from a secret whose keys are `username`/`password`/`uri`, so it reaches
+PostgreSQL directly and not this service; and the pod logged 11,520 requests in 24
+hours, every one a kubelet `GET /health`, with zero non-probe requests. The
+manifests were captured first and are in
+`docs/evidence/actionq-server-orphan-2026-09-01/`.
+
+This completed a retirement that git had already sequenced on 2026-08-20 -- the
+`actionq-db` kustomization comment says the database resources were moved out
+"so they survive that app's retirement" and that the move "must reconcile BEFORE
+actionq-server is removed". Every step happened except the last, and the last one
+could not report that it had not happened.
+
+**Tranche 2's gate is now met and its orphan cleared.** `server.py` and `runner_auth`
+are deletable as source whenever that is wanted; nothing in the cluster depends on
+them. Note the schema-migration Jobs still run the `actionq-server` *image*, which
+resolves from the registry independently of any workload -- deleting the source does
+not break them, but rebuilding that image would need the source, so decide that
+before deleting `server.py`.
 
 ### Tranche 3 gate — satisfied, and enforced
 
