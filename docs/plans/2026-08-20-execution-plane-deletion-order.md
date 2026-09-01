@@ -124,3 +124,71 @@ qualification, and a narrator-facing read/write surface.
 
 Both remaining gates are **decisions, not measurements**. The evidence for each is already
 recorded; nothing further can be learned by waiting.
+
+---
+
+## Gate status, measured 2026-09-01
+
+Both remaining gates are now measured as well as decided. The 2026-08-20 text said
+what could not be checked from this host; it can be checked now.
+
+### Tranche 2 gate — satisfied, and it left an orphan
+
+`appservice/clusters/main/kubernetes/apps/actionq-server/` **no longer exists**, and
+no `actionq-server` Kustomization is reconciling (`kubectl get kustomization -A`
+returns only `actionq-db`). So the gate as written — "remove the Kustomization from
+the cluster, or confirm it is not reconciling" — is met.
+
+But the workload was never pruned:
+
+```
+kubectl get deploy -n vscode actionq-server
+NAME             READY   AGE    IMAGES
+actionq-server   1/1     116d   ghcr.io/bayleafwalker/actionq-server@sha256:2d5121cf…
+```
+
+It still carries `kustomize.toolkit.fluxcd.io/name: actionq-server` and
+`…/namespace: flux-system`, so it was Flux-managed and Flux forgot it rather than
+collecting it. `prune: true` prunes what a live Kustomization owns; removing the
+Kustomization itself removes the owner, and the objects are simply abandoned.
+
+This inverts the 2026-08-19 note. The concern then was that deleting the directory
+would delete the workload as a side effect of a source cleanup. What actually
+happened is the opposite and is worse in one specific way: a pod has been serving
+for 116 days at a digest that tracks nothing, with no source of truth, and nothing
+would have reported it. Deleting `server.py` now does not stop it.
+
+So tranche 2 gains a step it did not have: **delete the orphaned Deployment (and its
+Service/namespace remnants) explicitly.** That is an outward-facing change and still
+a decision, but it is now a decision about a live workload rather than about a
+manifest.
+
+### Tranche 3 gate — satisfied, and enforced
+
+`actionq-dispatch.service` is `inactive` on this host, and
+`gitops-nixos/flake.nix:101` carries
+
+```nix
+assert !(builtins.hasAttr "actionq-dispatch" devboxServices);
+```
+
+so the unit cannot be reintroduced by configuration without the flake failing to
+evaluate. The gate is not merely "devbox stopped running it" — the service is
+architecturally excluded. Tranche 3 is unblocked.
+
+### What this does not license
+
+The disposition register's queue item A12 lists a deletion set of
+`application_enqueue`, `application_claim`, `application_dispatch`,
+`managed_dispatch`, `runner_auth`, keeping `federation`, `vuoro_federation`, `cas`.
+**That list is import-graph-derived and does not match these tranches.** Four of the
+five are reached from `application.py` and `application_core.py`, which every root
+including `vuoro.py` depends on, so they are tranche 4 — extraction, not deletion —
+and tranche 4 is explicitly last. `schema.py` also declares
+`managed_dispatch_envelopes` and the `actions.runner_auth_digest` /
+`cancel_runner_auth_digest` columns, so that tranche is a schema change against a
+deployed database, not a source cleanup.
+
+Following A12's list directly is the exact failure this document's "four things that
+look deletable and are not" section was written to prevent. The tranche order stands;
+A12 should be re-expressed against it rather than executed as written.
