@@ -148,6 +148,7 @@ the guarantee ActionQ can verify locally; the rest is the issuer's conformance e
 the v4 validator requires as `ownership_evidence` on any provider bound to
 `federation.principal/v1`.
 <!-- claim: w4r-reissued-identity-cannot-inherit -->
+<!-- claim: w4r-unminted-principal-refused -->
 
 ## 4. The rescoped slice
 
@@ -220,9 +221,14 @@ add one to.
     {
       "id": "w4r-reissued-identity-cannot-inherit",
       "claim": "A reissued actor identity cannot acquire a historical principal's ownership.",
-      "scope": "a principal_id whose epoch differs from a resource owner's principal_id fails the ownership comparison, and an id that is neither a mint-once identifier nor a reserved system principal is rejected before any command executes",
-      "test": null,
-      "gap": "The enforcement does not exist yet: it is item 5 of the slice. This is the rule the build implements, and its test is written with it."
+      "scope": "a principal_id whose epoch differs from a resource owner's principal_id fails the ownership comparison",
+      "test": "tests/test_federation_ownership_authority.py::test_a_reissued_epoch_cannot_mutate_the_prior_epochs_resource"
+    },
+    {
+      "id": "w4r-unminted-principal-refused",
+      "claim": "A reissued actor identity cannot acquire a historical principal's ownership.",
+      "scope": "an id that is neither a mint-once identifier nor a reserved system principal is rejected before any command executes",
+      "test": "tests/test_federation_catalog_contract.py::test_an_unminted_principal_id_is_refused_before_any_command"
     },
     {
       "id": "w4r-slice-contents",

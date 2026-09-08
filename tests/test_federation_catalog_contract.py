@@ -224,6 +224,9 @@ def test_an_unminted_principal_id_is_refused_before_any_command(principal_id) ->
     would hand the previous holder's resources to whoever holds the name next.
     ActionQ cannot verify that an epoch was incremented -- that is the issuer's
     evidence -- but it can refuse anything that was never minted at all.
+
+    Concretely: an id that is neither a mint-once identifier nor a reserved
+    system principal is rejected before any command executes.
     """
     with pytest.raises(FederationPrincipalError):
         principal_from_identity(_identity(principal_id=principal_id))
