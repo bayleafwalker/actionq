@@ -1,8 +1,10 @@
 """Database-backed proof that a reissued identity cannot inherit ownership.
 
-The rejection half of w4r-reissued-identity-cannot-inherit lives in
+The companion shape-refusal falsifier, w4r-unminted-principal-refused, lives
+in
 tests/test_federation_catalog_contract.py::test_an_unminted_principal_id_is_refused_before_any_command
-(a shape refusal at the serving edge). This is the ownership half: given two
+(a refusal at the serving edge of ids that were never minted at all -- a
+different claim from this one). This file is the ownership half: given two
 *validly minted* principal ids that share issuer and subject but differ only
 in epoch, the later epoch must not be able to mutate a resource the earlier
 epoch created, because owner_principal_id is compared by plain string
@@ -18,6 +20,7 @@ import pytest
 
 from actionq import db, federation_schema
 from actionq.federation import FederationAuthority, FederationPrincipal
+from actionq.vuoro_federation import MINTED_PRINCIPAL_ID
 
 
 def _factory(url: str):
@@ -39,12 +42,16 @@ def _migrate(url: str, selected: str) -> None:
 
 # Same issuer and subject, differing only in the trailing epoch segment --
 # once for the shipped post-E-8 subject-derived shape
-# (vuoro-cloud-local:<ulid>:<epoch>, per
-# /projects/dev/vuoro-cloud/docs/evidence/principal-id-conformance.json) and
-# once for the pre-E-8 actor-derived shape (prod:github:123:<epoch>), which
-# MINTED_PRINCIPAL_ID (actionq/vuoro_federation.py:64) still parses
-# right-to-left. The test asserts nothing about how either shape was
-# derived -- that is the issuer's evidence, not actionq's.
+# (vuoro-cloud-local:<ulid>:<epoch>) and once for the pre-E-8 actor-derived
+# shape (prod:github:123:<epoch>). Both match actionq's local shape check,
+# MINTED_PRINCIPAL_ID (actionq/vuoro_federation.py:64), which parses
+# right-to-left and is asserted below. The issuer's own conformance record
+# (/projects/dev/vuoro-cloud/docs/evidence/principal-id-conformance.json)
+# separately lists "prod:github:123:0" as a rejected_example -- actor
+# strings are never subjects on that side of the boundary -- but that is a
+# stricter, issuer-side rule this test does not and cannot enforce; it
+# proves only what actionq's local regex and ownership comparison do with
+# an id of this shape, not whether the issuer would ever mint one.
 _EPOCH_PAIRS = [
     pytest.param(
         "vuoro-cloud-local:01J8Z6Q4N0X6X6X6X6X6X6X6X6:0",
@@ -73,6 +80,13 @@ def test_a_reissued_epoch_cannot_mutate_the_prior_epochs_resource(
     successor logic, so a reissued identity cannot inherit the prior
     identity's ownership.
     """
+    # Load-bearing premise: both ids are validly minted shapes. Asserted in
+    # code, not merely by comment, so a narrowed MINTED_PRINCIPAL_ID fails
+    # this test loudly instead of silently degrading it to a proof about
+    # two arbitrary strings differing in a suffix.
+    assert MINTED_PRINCIPAL_ID.fullmatch(original_epoch_id)
+    assert MINTED_PRINCIPAL_ID.fullmatch(reissued_epoch_id)
+
     selected = _new_schema()
     _migrate(postgres_urls["admin"], selected)
     authority = FederationAuthority(connection=_factory(postgres_urls["admin"]), schema=selected)

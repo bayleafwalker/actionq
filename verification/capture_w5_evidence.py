@@ -47,6 +47,7 @@ from verification.w5_evidence.envelope import (  # noqa: E402
     CapturedEvidenceRecord,
     RepositoryCheckRecord,
     ToolVersions,
+    binding_digest,
     git_branch,
     git_commit,
     local_actor,
@@ -56,11 +57,6 @@ from verification.w5_evidence.envelope import (  # noqa: E402
 
 class EvidenceCaptureError(RuntimeError):
     """Raised when a capture cannot proceed. Callers must write nothing on this."""
-
-
-def _canonical_digest(payload: Mapping[str, Any]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
 
 
 def _tool_versions() -> ToolVersions:
@@ -170,15 +166,31 @@ def capture_record_1(
         "job_status": job_status,
     }
 
-    return RepositoryCheckRecord(
-        schema_version="w5-repository-check/v1",
-        record_id="w5-record-1-consumer-inventory-and-manifest-diff",
-        captured_at=now_iso8601(),
-        environment=_repository_environment(),
-        actor=local_actor(),
-        tool_versions=_tool_versions(),
+    schema_version = "w5-repository-check/v1"
+    record_id = "w5-record-1-consumer-inventory-and-manifest-diff"
+    captured_at = now_iso8601()
+    environment = _repository_environment()
+    actor = local_actor()
+    tool_versions = _tool_versions()
+    result_digest = binding_digest(
+        schema_version=schema_version,
+        record_id=record_id,
+        captured_at=captured_at,
+        environment=environment,
+        actor=actor,
+        tool_versions=tool_versions,
         payload=payload,
-        result_digest=_canonical_digest(payload),
+    )
+
+    return RepositoryCheckRecord(
+        schema_version=schema_version,
+        record_id=record_id,
+        captured_at=captured_at,
+        environment=environment,
+        actor=actor,
+        tool_versions=tool_versions,
+        payload=payload,
+        result_digest=result_digest,
     )
 
 
@@ -271,21 +283,69 @@ def capture_live_record(
 
     raw = capture_backend(number, inputs)
     payload = dict(raw)
-    return CapturedEvidenceRecord(
-        schema_version="w5-captured-evidence/v1",
-        record_id=f"w5-record-{number}",
-        captured_at=now_iso8601(),
-        environment=dict(payload.pop("environment")),
-        database_endpoint_fingerprint=payload.pop("database_endpoint_fingerprint"),
-        actionq_release=payload.pop("actionq_release"),
-        actionq_deployment_revision=payload.pop("actionq_deployment_revision"),
-        vuoro_release=payload.pop("vuoro_release"),
-        vuoro_deployment_revision=payload.pop("vuoro_deployment_revision"),
-        actor=local_actor(),
-        tool_versions=_tool_versions(),
-        payload=payload,
-        result_digest=_canonical_digest(payload),
+    required_binding_fields = (
+        "environment",
+        "database_endpoint_fingerprint",
+        "actionq_release",
+        "actionq_deployment_revision",
+        "vuoro_release",
+        "vuoro_deployment_revision",
     )
+    missing_from_backend = [name for name in required_binding_fields if name not in payload]
+    if missing_from_backend:
+        raise EvidenceCaptureError(
+            f"record {number} ({RECORD_DESCRIPTIONS[number]}): capture backend result is missing "
+            f"required binding field(s): {', '.join(missing_from_backend)}. Refusing to write "
+            "anything record-shaped."
+        )
+    try:
+        schema_version = "w5-captured-evidence/v1"
+        record_id = f"w5-record-{number}"
+        captured_at = now_iso8601()
+        environment = dict(payload.pop("environment"))
+        database_endpoint_fingerprint = payload.pop("database_endpoint_fingerprint")
+        actionq_release = payload.pop("actionq_release")
+        actionq_deployment_revision = payload.pop("actionq_deployment_revision")
+        vuoro_release = payload.pop("vuoro_release")
+        vuoro_deployment_revision = payload.pop("vuoro_deployment_revision")
+        actor = local_actor()
+        tool_versions = _tool_versions()
+        result_digest = binding_digest(
+            schema_version=schema_version,
+            record_id=record_id,
+            captured_at=captured_at,
+            environment=environment,
+            actor=actor,
+            tool_versions=tool_versions,
+            payload=payload,
+            extra={
+                "database_endpoint_fingerprint": database_endpoint_fingerprint,
+                "actionq_release": actionq_release,
+                "actionq_deployment_revision": actionq_deployment_revision,
+                "vuoro_release": vuoro_release,
+                "vuoro_deployment_revision": vuoro_deployment_revision,
+            },
+        )
+        return CapturedEvidenceRecord(
+            schema_version=schema_version,
+            record_id=record_id,
+            captured_at=captured_at,
+            environment=environment,
+            database_endpoint_fingerprint=database_endpoint_fingerprint,
+            actionq_release=actionq_release,
+            actionq_deployment_revision=actionq_deployment_revision,
+            vuoro_release=vuoro_release,
+            vuoro_deployment_revision=vuoro_deployment_revision,
+            actor=actor,
+            tool_versions=tool_versions,
+            payload=payload,
+            result_digest=result_digest,
+        )
+    except ValueError as error:
+        raise EvidenceCaptureError(
+            f"record {number} ({RECORD_DESCRIPTIONS[number]}): capture backend result failed "
+            f"envelope validation: {error}. Refusing to write anything record-shaped."
+        ) from error
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +353,31 @@ def capture_live_record(
 # ---------------------------------------------------------------------------
 
 
+_FORBIDDEN_OUT_DIRS = (ROOT / "docs/evidence",)
+
+
+def _reject_forbidden_out_path(out: str) -> None:
+    resolved = Path(out).resolve()
+    for forbidden in _FORBIDDEN_OUT_DIRS:
+        forbidden_resolved = forbidden.resolve()
+        if resolved == forbidden_resolved or forbidden_resolved in resolved.parents:
+            raise EvidenceCaptureError(
+                f"refusing to write to {resolved}: this tool must never author a record "
+                "under docs/evidence/ -- that directory is the operator's, on a live "
+                "target, so a change and its proof never share an author."
+            )
+
+
 def _cli_record_1(args: argparse.Namespace) -> int:
     live_jobs = None
     if args.live_jobs:
         live_jobs = json.loads(Path(args.live_jobs).read_text(encoding="utf-8"))
+    if args.out:
+        try:
+            _reject_forbidden_out_path(args.out)
+        except EvidenceCaptureError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
     record = capture_record_1(live_jobs=live_jobs)
     text = json.dumps(record.to_dict(), indent=2, sort_keys=True)
     if args.out:
@@ -318,11 +399,27 @@ def _cli_live_record(number: int, args: argparse.Namespace) -> int:
         for req in RECORD_REQUIREMENTS[number]
     }
     try:
-        capture_live_record(number, inputs)
+        # capture_backend is never wired from the CLI -- this repository
+        # ships no operator integration -- so this call fails closed today.
+        # It is written to also succeed correctly if an operator's own
+        # wrapper ever calls capture_live_record directly with a real
+        # backend and then drives this same _cli_live_record for output.
+        record = capture_live_record(number, inputs, capture_backend=getattr(args, "_capture_backend", None))
     except EvidenceCaptureError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    return 0  # unreachable today: no backend ships, so this always fails closed above
+    text = json.dumps(record.to_dict(), indent=2, sort_keys=True)
+    out = getattr(args, "out", None)
+    if out:
+        try:
+            _reject_forbidden_out_path(out)
+        except EvidenceCaptureError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        Path(out).write_text(text + "\n", encoding="utf-8")
+    else:
+        print(text)
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -336,6 +433,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     for number in range(2, 8):
         sub = subparsers.add_parser(f"record-{number}", help=RECORD_DESCRIPTIONS[number])
+        sub.add_argument("--out", help="write the record to this path instead of stdout")
         for req in RECORD_REQUIREMENTS[number]:
             sub.add_argument(f"--{req.name.replace('_', '-')}", dest=req.name, help=req.description)
         sub.set_defaults(func=lambda args, n=number: _cli_live_record(n, args))

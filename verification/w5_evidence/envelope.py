@@ -26,6 +26,8 @@ already-populated, real values in.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -95,6 +97,33 @@ def _require_mapping(field_name: str, value: Any) -> Mapping[str, Any]:
     return value
 
 
+def binding_digest(*, schema_version: str, record_id: str, captured_at: str,
+                    environment: Mapping[str, Any], actor: "Actor", tool_versions: "ToolVersions",
+                    payload: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> str:
+    """The sha256 a record's ``result_digest`` must equal.
+
+    Computed over every binding field -- schema_version, record_id,
+    captured_at, environment, actor, tool_versions, payload, and (for
+    CapturedEvidenceRecord) the deployment-binding fields passed as
+    ``extra`` -- so that changing any of them without recomputing the
+    digest is detectable at reconstruction time, not just changing the
+    payload.
+    """
+    material: dict[str, Any] = {
+        "schema_version": schema_version,
+        "record_id": record_id,
+        "captured_at": captured_at,
+        "environment": dict(environment),
+        "actor": {"identity": actor.identity, "method": actor.method},
+        "tool_versions": dict(tool_versions.versions),
+        "payload": dict(payload),
+    }
+    if extra:
+        material.update(extra)
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 @dataclass(frozen=True)
 class Actor:
     """The identity performing the capture -- never a secret, always a real read."""
@@ -161,6 +190,23 @@ class RepositoryCheckRecord:
         object.__setattr__(self, "environment", dict(environment))
         object.__setattr__(self, "payload", dict(payload))
         _require_sha256("result_digest", self.result_digest)
+        expected_digest = binding_digest(
+            schema_version=self.schema_version,
+            record_id=self.record_id,
+            captured_at=self.captured_at,
+            environment=self.environment,
+            actor=self.actor,
+            tool_versions=self.tool_versions,
+            payload=self.payload,
+        )
+        if self.result_digest != expected_digest:
+            raise ValueError(
+                "result_digest does not match the record's own binding fields "
+                f"(schema_version, record_id, captured_at, environment, actor, "
+                f"tool_versions, payload); recomputed {expected_digest!r}, got "
+                f"{self.result_digest!r}. A record's digest must be computed over its "
+                "own binding fields, not supplied independently."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +271,32 @@ class CapturedEvidenceRecord:
         object.__setattr__(self, "environment", dict(environment))
         object.__setattr__(self, "payload", dict(payload))
         _require_sha256("result_digest", self.result_digest)
+        expected_digest = binding_digest(
+            schema_version=self.schema_version,
+            record_id=self.record_id,
+            captured_at=self.captured_at,
+            environment=self.environment,
+            actor=self.actor,
+            tool_versions=self.tool_versions,
+            payload=self.payload,
+            extra={
+                "database_endpoint_fingerprint": self.database_endpoint_fingerprint,
+                "actionq_release": self.actionq_release,
+                "actionq_deployment_revision": self.actionq_deployment_revision,
+                "vuoro_release": self.vuoro_release,
+                "vuoro_deployment_revision": self.vuoro_deployment_revision,
+            },
+        )
+        if self.result_digest != expected_digest:
+            raise ValueError(
+                "result_digest does not match the record's own binding fields "
+                "(schema_version, record_id, captured_at, environment, actor, "
+                "tool_versions, payload, database_endpoint_fingerprint, "
+                "actionq_release, actionq_deployment_revision, vuoro_release, "
+                f"vuoro_deployment_revision); recomputed {expected_digest!r}, got "
+                f"{self.result_digest!r}. A record's digest must be computed over its "
+                "own binding fields, not supplied independently."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {

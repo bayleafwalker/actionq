@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,22 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repo_write_snapshot() -> str:
+    """A cheap whole-repository proxy for 'nothing was written or changed':
+    the porcelain status (tracked-file changes plus every untracked file,
+    anywhere in the tree -- not just under docs/evidence/). A fail-closed
+    path that writes a record-shaped file anywhere in the repo, including
+    outside docs/evidence/ (e.g. verification/results/), changes this."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
 
 from verification.capture_w5_evidence import (  # noqa: E402
     RECORD_REQUIREMENTS,
@@ -37,6 +54,7 @@ from verification.w5_evidence.envelope import (  # noqa: E402
     CapturedEvidenceRecord,
     RepositoryCheckRecord,
     ToolVersions,
+    binding_digest,
 )
 
 
@@ -71,15 +89,54 @@ def test_record_1_output_validates_against_the_envelope():
     json.dumps(as_dict)
 
 
-def test_record_1_diff_sections_report_the_current_real_drift():
-    """Record 1 must report whatever drift genuinely exists today, not a
-    hardcoded expectation. As of this packet, two independent, real,
-    nonempty diffs exist against docs/contracts/tranche4-reachability-v1.json:
-    a retired-plane-pattern match on the tracked generated file
-    .agents/project.generated.md, and an unclassified api-consumer match on
-    tests/test_federation_ownership_authority.py (added by an earlier
-    packet in this chain). This test asserts the tool surfaces both -- it
-    must never paper over a real diff to make its own output look clean."""
+def test_record_1_diff_computation_matches_an_independent_recomputation():
+    """Record 1's diff must equal whatever drift genuinely exists today,
+    recomputed independently here from the same reachability manifest and
+    scan logic the tool claims to reuse -- not a value the tool merely
+    asserts about itself, and not a literal snapshot of today's known
+    drift, which would go stale (and this test would then fail as a false
+    alarm) the moment the manifest owner fixes the underlying
+    classification. A capture_record_1 that returned a hardcoded diff
+    would fail this test."""
+    from tests import test_tranche4_reachability_contract as reachability
+
+    manifest = reachability._manifest()
+    api_scan = manifest["repository_scans"]["api_consumers"]
+    retired_scan = manifest["repository_scans"]["retired_plane"]
+    manifest_consumers = reachability._flatten(manifest["repository_consumer_groups"], "paths")
+    manifest_retired = reachability._flatten(manifest["retired_plane_anchor_groups"], "paths")
+    observed_consumers = reachability._scan_paths(api_scan["pattern"])
+    observed_retired = reachability._scan_paths(retired_scan["pattern"])
+
+    expected_consumer_diff = {
+        "extra_in_repository": sorted(observed_consumers - manifest_consumers),
+        "missing_from_repository": sorted(manifest_consumers - observed_consumers),
+    }
+    expected_retired_plane_diff = {
+        "extra_in_repository": sorted(observed_retired - manifest_retired),
+        "missing_from_repository": sorted(manifest_retired - observed_retired),
+    }
+
+    record = capture_record_1()
+    payload = record.payload
+    assert payload["consumer_diff"] == expected_consumer_diff
+    assert payload["retired_plane_diff"] == expected_retired_plane_diff
+    assert payload["consumer_diff_is_empty"] == (
+        not (expected_consumer_diff["extra_in_repository"] or expected_consumer_diff["missing_from_repository"])
+    )
+    assert payload["retired_plane_diff_is_empty"] == (
+        not (expected_retired_plane_diff["extra_in_repository"] or expected_retired_plane_diff["missing_from_repository"])
+    )
+
+
+def test_record_1_diff_sections_report_the_currently_known_drift():
+    """Pins the specific drift known at the time this packet landed, as a
+    reported finding for a human to act on -- not as the tooling's
+    acceptance gate (see test_record_1_diff_computation_matches_an_independent_recomputation
+    for that). When the manifest owner classifies either path, this test
+    (and only this test) is expected to need updating; that failure names
+    the resolved discrepancy rather than looking like a tooling
+    regression."""
     record = capture_record_1()
     payload = record.payload
     assert payload["consumer_diff_is_empty"] is False
@@ -108,12 +165,30 @@ def test_record_1_job_status_reports_status_not_mere_existence_when_provided():
     assert job_status["status_counts"] == {"suspended": 2, "completed": 1}
 
 
-def test_record_1_never_writes_under_docs_evidence():
+def test_record_1_never_writes_anywhere_in_the_repository():
     """capture_record_1 returns a record in memory; it must never write
-    anything to disk on its own, least of all under docs/evidence/."""
-    before = set((ROOT / "docs/evidence").rglob("*")) if (ROOT / "docs/evidence").exists() else set()
+    anything to disk on its own, anywhere in the repository -- not just
+    under docs/evidence/."""
+    before = _repo_write_snapshot()
     capture_record_1()
-    after = set((ROOT / "docs/evidence").rglob("*")) if (ROOT / "docs/evidence").exists() else set()
+    after = _repo_write_snapshot()
+    assert before == after
+
+
+def test_record_1_cli_refuses_to_write_under_docs_evidence(tmp_path):
+    """The --out guard: the CLI must refuse to author a record-shaped file
+    under docs/evidence/, which is the operator's directory alone."""
+    before = _repo_write_snapshot()
+    forbidden_out = ROOT / "docs/evidence" / "should-not-be-written.json"
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "verification/capture_w5_evidence.py"), "record-1", "--out", str(forbidden_out)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    after = _repo_write_snapshot()
+    assert result.returncode != 0
+    assert not forbidden_out.exists()
     assert before == after
 
 
@@ -144,6 +219,24 @@ def test_record_1_cli_runs_fully_offline_and_exits_zero(tmp_path):
     assert written["schema_version"] == "w5-repository-check/v1"
 
 
+def test_record_1_makes_no_network_call(monkeypatch):
+    """Falsifier 1, made behavioural rather than only environment-shaped:
+    block every socket-creation path before calling capture_record_1() and
+    confirm it still succeeds. A record-1 implementation that needs a
+    live network peer or a cluster config to run would fail this test even
+    though it might still exit 0 under a merely-stripped environment."""
+
+    def _forbidden(*_args, **_kwargs):
+        raise RuntimeError("network use in an offline record-1 capture")
+
+    monkeypatch.setattr(socket, "socket", _forbidden)
+    monkeypatch.setattr(socket, "create_connection", _forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", _forbidden)
+
+    record = capture_record_1()
+    assert record.schema_version == "w5-repository-check/v1"
+
+
 # ---------------------------------------------------------------------------
 # Records 2-7: fail closed with no live input, and no fallback even with
 # inputs present but no wired capture backend.
@@ -152,11 +245,11 @@ def test_record_1_cli_runs_fully_offline_and_exits_zero(tmp_path):
 
 @pytest.mark.parametrize("number", sorted(RECORD_REQUIREMENTS))
 def test_live_record_fails_closed_with_no_inputs_and_writes_nothing(number, tmp_path):
-    before = set((ROOT / "docs/evidence").rglob("*")) if (ROOT / "docs/evidence").exists() else set()
+    before = _repo_write_snapshot()
     with pytest.raises(EvidenceCaptureError) as excinfo:
         capture_live_record(number, {})
     assert "missing required live input" in str(excinfo.value)
-    after = set((ROOT / "docs/evidence").rglob("*")) if (ROOT / "docs/evidence").exists() else set()
+    after = _repo_write_snapshot()
     assert before == after
 
 
@@ -212,12 +305,72 @@ def test_live_record_cli_exits_nonzero_with_no_inputs_and_writes_nothing(number,
     assert list(out_dir.iterdir()) == []
 
 
+# ---------------------------------------------------------------------------
+# Records 2-7: the with-a-backend branch (an operator's own integration).
+# ---------------------------------------------------------------------------
+
+
+def test_live_record_with_a_complete_backend_result_yields_a_captured_evidence_record():
+    inputs = {req.name: "present-but-not-real" for req in RECORD_REQUIREMENTS[3]}
+
+    def stub_backend(number, given_inputs):
+        assert number == 3
+        assert given_inputs == inputs
+        return {
+            "environment": {"cluster": "staging", "namespace_or_scope": "actionq"},
+            "database_endpoint_fingerprint": "d" * 64,
+            "actionq_release": "0.1.28",
+            "actionq_deployment_revision": "deadbeefcafefeed0000000000000000000dead",
+            "vuoro_release": "0.1.1",
+            "vuoro_deployment_revision": "cafefeed0000000000000000000deadbeefcafe",
+            "finding": "role x has no direct DML grant",
+        }
+
+    record = capture_live_record(3, inputs, capture_backend=stub_backend)
+    assert isinstance(record, CapturedEvidenceRecord)
+    assert record.schema_version == "w5-captured-evidence/v1"
+    assert record.payload == {"finding": "role x has no direct DML grant"}
+
+
+def test_live_record_with_a_backend_missing_a_binding_field_fails_closed_not_with_keyerror():
+    inputs = {req.name: "present-but-not-real" for req in RECORD_REQUIREMENTS[3]}
+
+    def stub_backend(number, given_inputs):
+        return {"environment": {"cluster": "staging", "namespace_or_scope": "actionq"}}
+        # every other required binding field is missing
+
+    with pytest.raises(EvidenceCaptureError) as excinfo:
+        capture_live_record(3, inputs, capture_backend=stub_backend)
+    assert "missing" in str(excinfo.value)
+    assert "database_endpoint_fingerprint" in str(excinfo.value)
+
+
+def test_live_record_with_a_backend_returning_invalid_values_fails_closed():
+    inputs = {req.name: "present-but-not-real" for req in RECORD_REQUIREMENTS[3]}
+
+    def stub_backend(number, given_inputs):
+        return {
+            "environment": {"cluster": "staging", "namespace_or_scope": "actionq"},
+            "database_endpoint_fingerprint": "not-a-real-fingerprint",
+            "actionq_release": "0.1.28",
+            "actionq_deployment_revision": "deadbeefcafefeed0000000000000000000dead",
+            "vuoro_release": "0.1.1",
+            "vuoro_deployment_revision": "cafefeed0000000000000000000deadbeefcafe",
+        }
+
+    with pytest.raises(EvidenceCaptureError) as excinfo:
+        capture_live_record(3, inputs, capture_backend=stub_backend)
+    assert "envelope validation" in str(excinfo.value)
+
+
 def test_a_captured_evidence_record_cannot_be_constructed_with_an_unset_binding_field():
     """Direct falsifier for the envelope's structural guarantee: no code
     path -- not even a direct call bypassing capture_live_record -- can
     build a w5-captured-evidence/v1 object with a binding field unset or
     literal-filled."""
-    complete_kwargs = dict(
+    actor = Actor(identity="operator@example.com", method="operator-supplied")
+    tool_versions = ToolVersions(versions={"tool": "1.0.0"})
+    binding_fields = dict(
         schema_version="w5-captured-evidence/v1",
         record_id="w5-record-3",
         captured_at="2026-09-08T00:00:00+00:00",
@@ -227,10 +380,29 @@ def test_a_captured_evidence_record_cannot_be_constructed_with_an_unset_binding_
         actionq_deployment_revision="deadbeefcafefeed0000000000000000000dead",
         vuoro_release="0.1.1",
         vuoro_deployment_revision="cafefeed0000000000000000000deadbeefcafe",
-        actor=Actor(identity="operator@example.com", method="operator-supplied"),
-        tool_versions=ToolVersions(versions={"tool": "1.0.0"}),
+    )
+    result_digest = binding_digest(
+        schema_version=binding_fields["schema_version"],
+        record_id=binding_fields["record_id"],
+        captured_at=binding_fields["captured_at"],
+        environment=binding_fields["environment"],
+        actor=actor,
+        tool_versions=tool_versions,
         payload={"finding": "denied"},
-        result_digest="b" * 64,
+        extra={
+            "database_endpoint_fingerprint": binding_fields["database_endpoint_fingerprint"],
+            "actionq_release": binding_fields["actionq_release"],
+            "actionq_deployment_revision": binding_fields["actionq_deployment_revision"],
+            "vuoro_release": binding_fields["vuoro_release"],
+            "vuoro_deployment_revision": binding_fields["vuoro_deployment_revision"],
+        },
+    )
+    complete_kwargs = dict(
+        binding_fields,
+        actor=actor,
+        tool_versions=tool_versions,
+        payload={"finding": "denied"},
+        result_digest=result_digest,
     )
     # Sanity: the fully-populated construction succeeds.
     CapturedEvidenceRecord(**complete_kwargs)
@@ -253,39 +425,77 @@ def test_a_repository_check_record_cannot_carry_the_captured_evidence_schema_ver
     RepositoryCheckRecord literally cannot be constructed with the
     'w5-captured-evidence/v1' schema_version, so a repository test result
     can never masquerade as deployment evidence."""
-    with pytest.raises(ValueError):
+    actor = Actor(identity="a@example.com", method="operator-supplied")
+    tool_versions = ToolVersions(versions={"t": "1"})
+    with pytest.raises(ValueError, match="schema_version must be exactly"):
         RepositoryCheckRecord(
             schema_version="w5-captured-evidence/v1",
             record_id="x",
             captured_at="2026-09-08T00:00:00+00:00",
             environment={"git_commit": "a" * 40, "git_branch": "main", "repo_root": "/x"},
-            actor=Actor(identity="a@example.com", method="test"),
-            tool_versions=ToolVersions(versions={"t": "1"}),
+            actor=actor,
+            tool_versions=tool_versions,
             payload={"k": "v"},
             result_digest="c" * 64,
         )
 
 
 def test_no_function_in_the_capture_module_converts_one_record_type_to_the_other():
-    """There must be no code path anywhere in the capture module whose
-    input is a RepositoryCheckRecord (or its .to_dict()) and whose output
-    is a CapturedEvidenceRecord, or vice versa."""
+    """No callable in either verification module may take a
+    RepositoryCheckRecord and produce a CapturedEvidenceRecord, or vice
+    versa -- checked syntactically (a lint, not a proof) across functions,
+    methods, and classmethods in both capture_w5_evidence.py and
+    envelope.py, and by substring rather than exact match so a union
+    annotation or an unparenthesized default does not evade it."""
     import inspect
 
+    import verification.capture_w5_evidence as capture_module
+    import verification.w5_evidence.envelope as envelope_module
+
+    def _mentions(text: str, name: str) -> bool:
+        return name in text
+
+    def _callables(module):
+        for _, obj in vars(module).items():
+            if inspect.isfunction(obj) and obj.__module__ == module.__name__:
+                yield obj
+            elif inspect.isclass(obj) and obj.__module__ == module.__name__:
+                for _, member in vars(obj).items():
+                    fn = inspect.unwrap(member) if isinstance(member, (staticmethod, classmethod)) else member
+                    if inspect.isfunction(fn):
+                        yield fn
+
+    for module in (capture_module, envelope_module):
+        for obj in _callables(module):
+            try:
+                signature = inspect.signature(obj)
+            except (TypeError, ValueError):
+                continue
+            annotation_text = " ".join(
+                str(p.annotation) for p in signature.parameters.values() if p.annotation is not inspect.Parameter.empty
+            )
+            annotation_text += " " + str(signature.return_annotation)
+            involves_repo_check = _mentions(annotation_text, "RepositoryCheckRecord")
+            involves_captured = _mentions(annotation_text, "CapturedEvidenceRecord")
+            assert not (involves_repo_check and involves_captured), (
+                f"{module.__name__}.{obj.__qualname__} touches both record types -- "
+                "no callable may convert one into the other"
+            )
+
+    # Behavioural spot-check: record 1's real output must not itself be
+    # accepted anywhere a CapturedEvidenceRecord is expected.
     import verification.capture_w5_evidence as module
 
+    record = capture_record_1()
     for name, obj in vars(module).items():
         if not inspect.isfunction(obj) or obj.__module__ != module.__name__:
             continue
-        signature = inspect.signature(obj)
-        params = {
-            p.annotation
-            for p in signature.parameters.values()
-            if isinstance(p.annotation, str)
-        }
-        return_annotation = signature.return_annotation
-        involves_repo_check = "RepositoryCheckRecord" in params or return_annotation == "RepositoryCheckRecord"
-        involves_captured = "CapturedEvidenceRecord" in params or return_annotation == "CapturedEvidenceRecord"
-        assert not (involves_repo_check and involves_captured), (
-            f"{name} touches both record types -- no function may convert one into the other"
+        if name in ("capture_record_1",):
+            continue
+        try:
+            result = obj(record)
+        except Exception:
+            continue
+        assert not isinstance(result, CapturedEvidenceRecord), (
+            f"{name}(record_1_output) produced a CapturedEvidenceRecord"
         )

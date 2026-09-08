@@ -226,8 +226,8 @@ add one to.
     },
     {
       "id": "w4r-unminted-principal-refused",
-      "claim": "A reissued actor identity cannot acquire a historical principal's ownership.",
-      "scope": "an id that is neither a mint-once identifier nor a reserved system principal is rejected before any command executes",
+      "claim": "ActionQ refuses a principal_id that is neither minted nor a reserved system principal before it is ever compared as an owner.",
+      "scope": "an id that is neither a mint-once identifier nor a reserved system principal is rejected",
       "test": "tests/test_federation_catalog_contract.py::test_an_unminted_principal_id_is_refused_before_any_command"
     },
     {
@@ -248,9 +248,11 @@ add one to.
 }
 ```
 
-Coverage is **1 of 5**. A scope document is mostly unfalsifiable until the thing it scopes
-exists — the same honest number #40 landed on, for the same reason. What changed is that four of
-its six claims were about a blocked decision, and none of these are.
+Coverage is **3 of 6**. A scope document is mostly unfalsifiable until the thing it scopes
+exists — the same honest reasoning #40 landed on, for the same reason. What changed since #40 is
+that the reissued-identity ownership half and the unminted-principal-id shape half both now have
+their own falsifying test, and three of the remaining six claims are still about a blocked
+decision or an operational ordering constraint that is not code at rest.
 
 ## 7. What this leaves open
 
