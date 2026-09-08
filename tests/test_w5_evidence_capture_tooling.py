@@ -129,20 +129,35 @@ def test_record_1_diff_computation_matches_an_independent_recomputation():
     )
 
 
-def test_record_1_diff_sections_report_the_currently_known_drift():
-    """Pins the specific drift known at the time this packet landed, as a
-    reported finding for a human to act on -- not as the tooling's
-    acceptance gate (see test_record_1_diff_computation_matches_an_independent_recomputation
-    for that). When the manifest owner classifies either path, this test
-    (and only this test) is expected to need updating; that failure names
-    the resolved discrepancy rather than looking like a tooling
-    regression."""
+def test_record_1_reports_no_consumer_or_retired_plane_drift():
+    """Successor to test_record_1_diff_sections_report_the_currently_known_drift.
+
+    That test pinned two unclassified paths as a reported finding for a human to
+    act on, and said in its own docstring that it -- and only it -- was expected
+    to need updating once the manifest owner classified them. Both were
+    classified on 2026-09-08 in docs/contracts/tranche4-reachability-v1.json:
+    tests/test_federation_ownership_authority.py into
+    repository-federation-or-facade-successors (replace-by-federation, matching
+    its sibling test_federation_revision_authority.py), and
+    .agents/project.generated.md into
+    production-and-generated-retired-plane-anchors (historicalize/delete).
+
+    The retired-plane path was already unclassified on main before this packet's
+    branch existed, so this closes a pre-existing failure as well as the one this
+    packet introduced.
+
+    The assertion is now the stronger one: manifest and repository agree, and W5
+    evidence record 1's consumer diff is empty. Backlog 5.9 requires that diff to
+    be empty at the fence, so a regression here is a fence blocker rather than a
+    reported finding."""
     record = capture_record_1()
     payload = record.payload
-    assert payload["consumer_diff_is_empty"] is False
-    assert payload["retired_plane_diff_is_empty"] is False
-    assert "tests/test_federation_ownership_authority.py" in payload["consumer_diff"]["extra_in_repository"]
-    assert ".agents/project.generated.md" in payload["retired_plane_diff"]["extra_in_repository"]
+    assert payload["consumer_diff_is_empty"] is True
+    assert payload["retired_plane_diff_is_empty"] is True
+    assert payload["consumer_diff"]["extra_in_repository"] == []
+    assert payload["consumer_diff"]["missing_from_repository"] == []
+    assert payload["retired_plane_diff"]["extra_in_repository"] == []
+    assert payload["retired_plane_diff"]["missing_from_repository"] == []
 
 
 def test_record_1_job_status_unavailable_without_a_live_jobs_source():

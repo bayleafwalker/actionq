@@ -436,6 +436,7 @@
         "tests/test_completion_outbox.py",
         "tests/test_federation_backfill_rebuild.py",
         "tests/test_federation_catalog_contract.py",
+        "tests/test_federation_ownership_authority.py",
         "tests/test_federation_revision_authority.py",
         "tests/test_integration_immutable_actions.py",
         "tests/test_integration_postgres.py",
@@ -528,6 +529,7 @@
     {
       "id": "production-and-generated-retired-plane-anchors",
       "paths": [
+        ".agents/project.generated.md",
         "actionq.dispatch.json",
         "actionq/completion_outbox.py"
       ],
