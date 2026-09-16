@@ -3,7 +3,7 @@
      project: vuoro
      member: actionq
      render: full
-     source_bundle_sha256: 312fc5ea6441d27dbbf3071bb96c6a31d4c0ff1433d3ba9512fa8c29d8c0f3f4
+     source_bundle_sha256: 259e07f46f79a7cf479d2bc859ce512e93022026209b3305b59ca96f0ca1237c
      tool: agentops-render/v1
 -->
 
@@ -37,8 +37,8 @@ them from project tooling.
   state. Do not add raw cross-tool database writes or cross-tool transactions.
 - The former `outctl` member is retired from active Vuoro scope. Its repository
   remains a frozen discovery artifact; new harness-evidence work belongs at the
-  native runtime boundary and targets standard OpenTelemetry plus Langfuse or
-  Phoenix with object storage rather than a new evidence product.
+  native runtime boundary and targets standard OpenTelemetry plus Langfuse
+  (selected 2026-09-14) with object storage rather than a new evidence product.
 - Inspect declared `risk_surfaces` before changing queue, claim, lease, retry,
   recovery, projection, publication, reconciliation, or backend-parity paths.
   `full` is a sequence of scoped actions, not blanket mutation authority.
