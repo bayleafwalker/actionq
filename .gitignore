@@ -9,3 +9,5 @@ build/
 
 # Per-user Claude Code settings; untracked copies made devbox checkouts read as dirty (dogfood 2026-09-16)
 .claude/settings.local.json
+.envrc.local
+.auditctl/
