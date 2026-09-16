@@ -15,7 +15,7 @@
     }
   },
   "skills": {
-    "template_root": "/projects/dev/agentops/templates/dispatch/skills",
+    "template_root": "/projects/dev/agentops/skills",
     "selected": [
       "dispatch-plan",
       "dispatch-wave",

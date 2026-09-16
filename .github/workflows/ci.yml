@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bayleafwalker/agentops
-          ref: 67b9ec347ce781923907896efe03796a0df5d364
+          ref: 12b8f2953c8b05924fd1f38642e5b8579d44a173
           path: agentops-contracts
       - uses: astral-sh/setup-uv@v8.3.2
         with:
@@ -27,6 +27,6 @@ jobs:
       - run: uv sync --all-packages --all-extras
       - name: Run full suite with disposable PostgreSQL gate
         env:
-          AGENTOPS_SESSION_ARTIFACT_VALIDATOR: ${{ github.workspace }}/agentops-contracts/templates/dispatch/scripts/validate_session_mechanization_artifacts.py
+          AGENTOPS_SESSION_ARTIFACT_VALIDATOR: ${{ github.workspace }}/agentops-contracts/scripts/validate_session_mechanization_artifacts.py
           ACTIONQ_AGENTOPS_ROOT: ${{ github.workspace }}/agentops-contracts
         run: uv run --all-packages --extra dev pytest -q
