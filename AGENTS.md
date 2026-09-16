@@ -80,7 +80,7 @@ attempt returns to the coordinator.
 ```bash
 uv run pytest <specific-test-files> -x --tb=short
 ACTIONQ_TEST_URL=<disposable-postgres-url> uv run pytest tests/test_integration_postgres.py -q
-python /projects/dev/agentops/templates/dispatch/scripts/validate_verification_artifacts.py --root .
+python /projects/dev/agentops/scripts/validate_verification_artifacts.py --root .
 ```
 
 Run the narrowest affected tests first. Exercise `actionctl migrate` only
