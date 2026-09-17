@@ -1,0 +1,11 @@
+{
+  "schema_version": "managed-dispatch-capsule-source/v1",
+  "intent": "Implement the bounded transport adapter and run acceptance checks.",
+  "role_preset": {"id": "worker", "model": "Luna", "reasoning_effort": "high"},
+  "instruction_sources": [{"path": "AGENTS.md", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "source_sha": "1111111111111111111111111111111111111111", "selection_reason": "native root instruction"}],
+  "governing_refs": [{"kind": "architecture", "path": "docs/architecture/runtime.md", "source_sha": "1111111111111111111111111111111111111111", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],
+  "dependency_context": [{"item_id": "sprintctl:42", "summary": "Pinned dependency contract", "source_sha": "2222222222222222222222222222222222222222", "selection_reason": "direct declared dependency"}],
+  "acceptance_ids": ["acceptance.unit", "acceptance.contract"],
+  "source_shas": {"agentops": "1111111111111111111111111111111111111111", "consumer": "2222222222222222222222222222222222222222"},
+  "artifacts": [{"id": "contract", "kind": "schema", "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "selection_reason": "acceptance input"}]
+}
