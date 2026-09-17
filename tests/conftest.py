@@ -378,7 +378,7 @@ def session_artifact_validator() -> Path:
         Path(override)
         if override
         else agentops_root()
-        / "templates/dispatch/scripts/validate_session_mechanization_artifacts.py"
+        / "scripts/validate_session_mechanization_artifacts.py"
     )
     if not validator.is_file():
         pytest.skip(
