@@ -26,8 +26,7 @@
       "reconcile-project-contracts"
     ],
     "overlays": [
-      ".agents/overlays/actionq.state-protocols.md",
-      ".agents/overlays/actionq.hybrid-worker.md"
+      ".agents/overlays/actionq.state-protocols.md"
     ]
   },
   "instruction_set": {
