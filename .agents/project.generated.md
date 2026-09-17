@@ -3,7 +3,7 @@
      project: vuoro
      member: actionq
      render: full
-     source_bundle_sha256: 10eb92fe9ed2e97c4aa533d06c347c8bfc0df5f233c55a1ac10bca62bf217045
+     source_bundle_sha256: 738559479fdffc8a6c0ffa552484d8149976ae1badd79969f7e6395461d71c92
      tool: agentops-render/v1
 -->
 
@@ -87,11 +87,11 @@ Each entry's waking condition, evidence and supersession live in the register.
 - `actionq` — PostgreSQL-backed action queue and authority plane - mints actions, hands out fenced claims… Retires: actionq-db and actionq-db-proxy drop in S2 item 7 once the dump, test restore and scale-to-zero evidence holds.
 - `actionq-cas` — Not a repository - the on-disk root of ActionQ's server-owned content-addressed artifact… Retires: Archive with the actionq-db dump in S2 item 7.
 - `auditctl` — Repo-local append-only provenance ledger - a CLI (add/list/render/rebuild) writing each event… Retires: At S4 authored records import into the evidence schema with digests kept, and the central release line and adapter retire after a 90-day read-only…
-- `capability-receipts` — capability-receipt-drafted events written atomically with sprint close,… Retires: New row: decided today.
+- `capability-receipts` — capability-receipt-drafted events written atomically with sprint close,… Retires: Retires at S3: the forward migration removes the capability-receipt record types, maps the 4 drafted rows (sprintctl sprints 379 and 404-406) to…
 - `hostproto-consumer-vuoro-evidence` — The consumer the bounded proof turns on - a core reducer/model/decision path over generic… Retires: The vuoro-evidence package boundary is deleted; its core semantics are served as derived evaluation (dossier §5).
 - `kctl` — Local-first read-only reader and review CLI over sprintctl event streams. Retires: The kctl tool retires at S4; its data (249 candidates, 176 entries at the walk) is imported as lesson evidence.
-- `session-mechanization` — Session capsule, scribe, reconciler and trigger scripts plus… Retires: New row: previously unenumerated.
-- `vuoro-dev` — The development deployment of vuoro-service, its database cluster, and the sprintctl-test… Retires: New row: previously unenumerated.
+- `session-mechanization` — Session capsule, scribe, reconciler and trigger scripts plus… Retires: Retires at S4: session capsules and notes become evidence kinds; validate_session_mechanization_artifacts and actionq's CI use of it go with it…
+- `vuoro-dev` — The development deployment of vuoro-service, its database cluster, and the sprintctl-test… Retires: Retires in S2 item 7: dump digest, test restore and scale-to-zero evidence, then drop vuoro-dev-db, and remove the vuoro-dev namespace and…
 
 ### frozen
 
