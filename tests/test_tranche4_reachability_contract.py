@@ -504,7 +504,7 @@ def _check_mixed_symbols_constants_and_semantic_assets():
         "verification/results/action-resource-owner-*.json", "verification/*probe*.py",
         "verification/capture_claude_acp.py", "docs/operations/codex-luna-catalog-workaround.md",
             "docs/plans/acp-execution-adapter.md", "docs/verification/*depth-2-survey.md",
-            ".agents/overlays/actionq.hybrid-worker.md", "actionq/migrations/__init__.py", "AGENTS.md",
+            "actionq/migrations/__init__.py", "AGENTS.md",
             "verification/fixtures/tranche4-external-paths-v1.tar.gz.base64",
             "verification/fixtures/tranche4-external-paths-v1.md",
     ):
