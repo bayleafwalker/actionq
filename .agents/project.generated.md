@@ -3,7 +3,7 @@
      project: vuoro
      member: actionq
      render: full
-     source_bundle_sha256: 259e07f46f79a7cf479d2bc859ce512e93022026209b3305b59ca96f0ca1237c
+     source_bundle_sha256: 0911adeddfad9746cb52034485afff9639fb042938439d1e180c89359ee41bcf
      tool: agentops-render/v1
 -->
 
@@ -56,7 +56,7 @@ merged manually.
 ## Portfolio disposition
 
 Generated from `vuoro:docs/direction/disposition-register.yaml` by
-`agentops:templates/dispatch/scripts/render_disposition_fragment.py`. Do not edit
+`agentops:scripts/render_disposition_fragment.py`. Do not edit
 here; change the register and re-render.
 
 The register records status separately from intention: intention is what a plan
