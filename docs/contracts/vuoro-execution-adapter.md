@@ -86,11 +86,12 @@ Callers must inspect `result.decision.status` and retain its decision reference.
 ## Preserved lifecycle limitation
 
 Claim renewal verifies the authenticated actor against `claimed_by` and rejects
-an expired or reassigned lease. Terminal `complete`, `fail`, and `reject`
-operations still inherit Actionq's documented limitation: `claimed_by` is
-metadata, not claimant proof, and those transitions are not fenced. The adapter
-does not claim stale-terminal-owner rejection. Adding fencing remains a
-separately authorized lifecycle and schema decision.
+an expired or reassigned lease. `feat(lifecycle): fence cancellation and
+terminal settlement` (`c0c0f79`) superseded the earlier limitation: terminal
+`complete`, `fail`, and `reject` now require the exact `claim_receipt` from the
+live claim (see `actionq.db._transition_terminal`), so a prior or reclaimed
+claimant's terminal call is rejected rather than merely relying on
+`claimed_by` metadata.
 
 `actionctl` delegates to `ActionQApplication` without invocation provenance, so
 its existing output and lifecycle event shapes stay compatible with the served
