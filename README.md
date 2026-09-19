@@ -126,16 +126,19 @@ actionctl add \
 	--created-by human:cli
 ```
 
-Claim the next pending action:
+Claim the next pending action. `claim` takes no `--worker` flag; the caller
+identity comes from a signed `runner-auth/v1` proof read from stdin (see
+[the portable runner protocol](docs/protocols/portable-runner.md)):
 
 ```bash
-actionctl claim --worker worker:dispatcher-1
+echo "$RUNNER_PROOF_JSON" | actionctl claim --proof-stdin
 ```
 
-Complete the claimed action:
+Complete the claimed action, again supplying the claim receipt and a signed
+runner proof as `{"claim_receipt": ..., "runner_proof": ...}` on stdin:
 
 ```bash
-actionctl complete 1 --result branch=agent/scope-iterate/1
+echo "$CLAIM_PROOF_JSON" | actionctl complete 1 --result branch=agent/scope-iterate/1 --proof-stdin
 ```
 
 Inspect the action and its event history:
@@ -165,10 +168,10 @@ Priority is ascending, so smaller numbers are claimed first.
 | `actionctl add` | Enqueue a new action. |
 | `actionctl ls` | List actions with optional status, type, and project filters. |
 | `actionctl show ACTION_ID` | Show one action plus all recorded events. |
-| `actionctl claim --worker NAME` | Claim the next pending action. Exits with code `2` if none are available. |
-| `actionctl complete ACTION_ID --result REF` | Mark a claimed action completed. |
-| `actionctl fail ACTION_ID --reason TEXT` | Mark a claimed action failed. |
-| `actionctl reject ACTION_ID --reason TEXT --validator NAME` | Reject a claimed action after validation. |
+| `actionctl claim --proof-stdin` | Claim the next pending action using a signed runner proof read from stdin. Exits with code `2` if none are available. |
+| `actionctl complete ACTION_ID --result REF --proof-stdin` | Mark a claimed action completed using a claim receipt and signed runner proof read from stdin. |
+| `actionctl fail ACTION_ID --reason TEXT --proof-stdin` | Mark a claimed action failed using a claim receipt and signed runner proof read from stdin. |
+| `actionctl reject ACTION_ID --reason TEXT --validator NAME --proof-stdin` | Reject a claimed action after validation using a claim receipt and signed runner proof read from stdin. |
 | `actionctl cancel ACTION_ID --reason TEXT` | Cancel a pending or claimed action. |
 | `actionctl sweep` | Requeue timed-out claims. |
 | `actionctl events` | Read the event log, optionally filtered or tailed. |
