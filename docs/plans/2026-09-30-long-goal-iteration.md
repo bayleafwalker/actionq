@@ -4,7 +4,74 @@
 records which decision now governs and what that leaves to do. Checked against the artifacts
 named in each row, not against `HANDOFF.md`'s own claims.
 
-## Headline: the HANDOFF goal is superseded by D1 (retiring)
+**Corrected 2026-09-30 (operator).** The headline below misread D1 against the extended plan
+and is withdrawn. The section *Correction* that follows governs; the original text is kept
+under it, unedited, for history.
+
+## Correction: the abstraction is relocated per split horizon, not superseded
+
+The operator, on reading this note: *"I explicitly needed that abstraction. Check the extended
+plan documentations."* and *"The whole point was to enable \*somewhere\*. Not explicitly or
+necessarily actionq. There should be a split horizon model."*
+
+**What this note got wrong.** It read the register's `actionq` row (vuoro
+`docs/direction/disposition-register.yaml`, derived 2026-09-17 under delegation: *"no new
+execution, federation or placement work"*) as retiring the goal. The row retires ActionQ as the
+**host**. D1 itself (agentops `_artifacts` session note `2026-09-14-owner-decisions.md`) is the
+product sentence *"Vuoro owns the semantics of agent-performed work (release, evidence,
+decision) inside sprintctl's served authority"* and names neither ActionQ nor federation. The
+extended plan (vuoro `docs/plans/2026-08-22-extended-sprint-plan.md`, Week 4 items 11–13) and
+the direction it serves (vuoro `docs/plans/2026-08-22-long-term-direction.md` §10: *"Federation
+becomes three authority-plane capability contracts — `federation.principal/v1`,
+`federation.grant/v1`, `federation.resource/v1`"*; §6: coordination is *"ActionQ today;
+Restate, Hatchet, DBOS, Temporal-class challengers"*) define the abstraction as
+provider-neutral contracts with ActionQ as the first provider, not as ActionQ code. Records
+dated after D1 restate the need: vuoro `2026-09-19-agentic-pipeline-first-principles-rebuild.md`
+(R3 and "Coordination: leased claims, effect grants, resource reservations — Build"); agentops
+`2026-09-26-cloud-environments-options-memo.md` decision 3 (an exclusive owner-backed lease);
+agentops `2026-09-26-trusted-service-boundary-design.md` (EffectIntent lifecycle and settlement
+acceptance); agentops `docs/architecture/2026-09-27-agentic-ecosystem-and-split-horizon.md`
+(#255) and `docs/plans/2026-09-27-backlog-ideation.md` R4 (#253: Decision 1 A, the normative
+lease semantics, INV-L1/L2/E1).
+
+**The abstraction, precisely.** The authority plane separated from execution, as `HANDOFF.md` §2
+"done when" states it (work identity, relations and revisions; authority; evidence requirements
+and acceptance; references to external executions; reconciliation; no daemon, queue or
+fan-out), made concrete by the tranche-4 freeze's *Chosen federation contract v1*: a revisioned
+CAS aggregate; a command-decision and idempotency ledger keyed by environment, principal,
+operation, key and request digest; a fenced claim/lease with a generation; a mint-once
+principal (`issuer:subject:epoch`, W4 rescope §3); capability-scoped grants; and acceptance of
+cited evidence kept distinct from settlement.
+
+**Where each part lives now** (split horizon, #255 §3.0–§3.2: the coordination plane records,
+reserves and proposes; the protected horizon owns acceptance, credentials and effect):
+
+| Part | Horizon | Home | State (2026-09-30) |
+|---|---|---|---|
+| Fenced claim/lease, generation, stale takeover | coordination | sprintctl `work.lease.*` (agentops #2520, sprintctl 0.9.0; 0.10.x), served through vuoro-service and vuoro.cloud | shipped; inline in sprintctl's PostgreSQL store, with no provider-neutral interface |
+| Command-decision / idempotency ledger | coordination | sprintctl shared idempotency ledger (agentops #2542) | shipped |
+| Resource identity, revision CAS, relations, supersession | coordination | sprintctl work items and Release (S3) | shipped as work state; `federation.resource/v1` has no provider (vuoro's adapter shim still names this repository) |
+| Effect proposal | coordination | sprintctl `work.effect.propose` (agentops #2541) | shipped |
+| Digest-bound acceptance, settlement | protected | `work.effect.accept` / `mark-applied` held only by a trusted-side principal; `credctl accept`; homelab reconciler (M2-2) | partly shipped |
+| Principal issuance (mint-once) | protected | Vuoro identity (vuoro #53) and vuoro-cloud's per-subject epoch | issuer half built; epoch minting not confirmed here |
+| Grant | protected | cred-broker grant evidence (register `effect-grant` row, S7) | deferred while D2 stands |
+
+**Consequences for this repository.**
+
+- ActionQ may still retire. What must survive it is the contract and its invariants (the
+  freeze's *Chosen federation contract v1* and *Frozen invariants*), as the reference the
+  providers above conform to. Archive therefore waits on the contract being carried to its new
+  home, not only on the Release-test harvest.
+- Tranche 4 *inside this repository* stays not-next, and for a better reason than the one
+  given below: the freeze's own *Decision* forbids packaging claim/lease out of ActionQ. The
+  missing unit is the narrow, provider-neutral interface on the coordination-horizon provider
+  (sprintctl), tracked outside this repository.
+- *Remaining work* item 1 widens from the immutable-action invariants to the whole contract
+  (lease semantics, command-decision ledger, acceptance distinct from settlement); item 2's
+  "or drop" is withdrawn — the ownership projection is a derived query over the resource
+  contract, not optional.
+
+## Original headline (withdrawn 2026-09-30): the HANDOFF goal is superseded by D1 (retiring)
 
 `HANDOFF.md` §2 (2026-08-20) set the goal *"reduce actionq from an execution plane to a
 federation layer"*, with tranche 4 (lease/claim extraction) and the W1–W7 federation packets as
@@ -43,7 +110,7 @@ supersession, and discarded it uncommitted.
 | W5 5.3 federation schema init | **moot**: staged under `vuoro-dev-db/app/staged-federation/` (appservice 1e1d23d8), then the whole tree was dropped | appservice 890a8781 (#1678, 2026-09-18) |
 | W5 5.4–5.6 Vuoro binding | **moot**: vuoro #71 (0.1.61, 2026-09-16) unbound ActionQ's execution domain; no actionq wheel is pinned in vuoro; only a federation shim exists | vuoro 18039fa, 2e77cb1 |
 | W5 5.7–5.13, W6, W7 | **moot** under D1; no consumer, no deployed database | register `actionq` entry |
-| Tranche 4 (lease/claim extraction) | **superseded**, not next | D1 |
+| Tranche 4 (lease/claim extraction) | ~~**superseded**~~ **relocated** (see *Correction*); not next in this repository | D1 as corrected; freeze *Decision* |
 | agentops#2467 "ActionQ durable intent-lifecycle operation" | **not actionq's**: #2467 (E3) is done (vuoro #130/#132, 0.1.76); the intent lifecycle moved to sprintctl `work.effect.*` (agentops#2541, sprintctl 64ab0c9, accepted 2026-09-30) | vuoro `packages/vuoro-mcp-edge/src/vuoro_mcp_edge/effect_tools.py:20-35` still names ActionQ as intent-store owner: stale, a vuoro change |
 
 Vuoro's remaining reach into actionq (all lazy imports, none of lease/claim/renew/settle):
@@ -82,3 +149,8 @@ None that is code. The only actionq-side change still worth making before archiv
 the docs say what governs: a supersession banner on `HANDOFF.md` §2/§5 and on the W5+ backlog
 and tranche-4 freeze, pointing here, so no later session starts tranche 4 again. That banner
 ships with this note.
+
+*Corrected 2026-09-30:* the banners now say "relocated per split horizon, not superseded" and
+point at *Correction* above. Still no code unit in this repository: the next unit of the
+abstraction is the provider-neutral claim/lease and effect-authority interface on the
+coordination-horizon provider, which is sprintctl's to build.

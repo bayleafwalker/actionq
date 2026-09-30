@@ -112,9 +112,13 @@ never counted in the daemon-only figure.
 
 ## 2. The goal
 
-> **Superseded 2026-09-17 by D1 (ActionQ is retiring).** No new execution, federation or
-> placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side
-> detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.
+> **Relocated per split horizon, not superseded (operator correction, 2026-09-30).** The
+> authority-plane abstraction this document describes is still needed; ActionQ may retire as
+> its host, but its contract and invariants are the reference for the coordination-horizon
+> provider (sprintctl) and the protected horizon. Where each part now lives:
+> `docs/plans/2026-09-30-long-goal-iteration.md`, section *Correction*.
+>
+> *Withdrawn banner, kept for history (it misread D1 against the extended plan):* ~~Superseded 2026-09-17 by D1 (ActionQ is retiring). No new execution, federation or placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.~~
 
 > **Reduce actionq from an execution plane to a federation layer — evidence first, deletion
 > last, without breaking the deployed devbox host.**
@@ -238,9 +242,15 @@ perform.
 
 ## 5. Open work
 
-> **Superseded 2026-09-17 by D1 (ActionQ is retiring).** Tranche 4 below is not the next
-> work. No new execution, federation or placement work; the remaining steps are an invariant
-> harvest into sprintctl, vuoro-side detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.
+> **Relocated per split horizon, not superseded (operator correction, 2026-09-30).** The
+> authority-plane abstraction this document describes is still needed; ActionQ may retire as
+> its host, but its contract and invariants are the reference for the coordination-horizon
+> provider (sprintctl) and the protected horizon. Where each part now lives:
+> `docs/plans/2026-09-30-long-goal-iteration.md`, section *Correction*. Tranche 4 *inside this
+> repository* is still not the next work (the freeze's own Decision forbids packaging claim/lease
+> out of ActionQ).
+>
+> *Withdrawn banner, kept for history (it misread D1 against the extended plan):* ~~Superseded 2026-09-17 by D1 (ActionQ is retiring). Tranche 4 below is not the next work. No new execution, federation or placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.~~
 
 - **Step 1 is closed.** `docs/evidence/2026-08-19-devbox-fence-baseline.md` (F1–F10). It did
   *not* conclude the way it was designed to: the fence was fed, shown to hold against real
