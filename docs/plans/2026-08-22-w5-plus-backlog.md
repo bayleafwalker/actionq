@@ -1,8 +1,13 @@
 # W5+ backlog
 
-> **Superseded (W5 onward moot) 2026-09-17 by D1 (ActionQ is retiring).** No new execution, federation or
-> placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side
-> detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.
+> **Relocated per split horizon, not superseded (operator correction, 2026-09-30).** The
+> authority-plane abstraction this document describes is still needed; ActionQ may retire as
+> its host, but its contract and invariants are the reference for the coordination-horizon
+> provider (sprintctl) and the protected horizon. Where each part now lives:
+> `docs/plans/2026-09-30-long-goal-iteration.md`, section *Correction*. W5 onward stays moot
+> for ActionQ as a deployed provider.
+>
+> *Withdrawn banner, kept for history (it misread D1 against the extended plan):* ~~Superseded (W5 onward moot) 2026-09-17 by D1 (ActionQ is retiring). No new execution, federation or placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.~~
 
 Status: **ratified** (2026-08-22), with 5.2 and 5.8 decided in §5.2 and §5.8 below and one
 factual correction to the draft (see *Baseline*). Generated from what the ratified documents
