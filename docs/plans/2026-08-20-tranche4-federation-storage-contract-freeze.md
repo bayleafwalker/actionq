@@ -1,5 +1,9 @@
 # Tranche 4 federation/storage contract freeze
 
+> **Superseded (W5 onward moot) 2026-09-17 by D1 (ActionQ is retiring).** No new execution, federation or
+> placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side
+> detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.
+
 **Status:** accepted and owner-ratified as R0. Durable decision:
 [PR #31 owner ratification](https://github.com/bayleafwalker/actionq/pull/31#issuecomment-5353774023).
 Independent architecture review accepted `f6750e47edeb9f3a60c23059cd638604ac0d40a4`;

@@ -112,6 +112,10 @@ never counted in the daemon-only figure.
 
 ## 2. The goal
 
+> **Superseded 2026-09-17 by D1 (ActionQ is retiring).** No new execution, federation or
+> placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side
+> detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.
+
 > **Reduce actionq from an execution plane to a federation layer — evidence first, deletion
 > last, without breaking the deployed devbox host.**
 
@@ -233,6 +237,10 @@ perform.
 ---
 
 ## 5. Open work
+
+> **Superseded 2026-09-17 by D1 (ActionQ is retiring).** Tranche 4 below is not the next
+> work. No new execution, federation or placement work; the remaining steps are an invariant
+> harvest into sprintctl, vuoro-side detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.
 
 - **Step 1 is closed.** `docs/evidence/2026-08-19-devbox-fence-baseline.md` (F1–F10). It did
   *not* conclude the way it was designed to: the fence was fed, shown to hold against real

@@ -1,5 +1,9 @@
 # W5+ backlog
 
+> **Superseded (W5 onward moot) 2026-09-17 by D1 (ActionQ is retiring).** No new execution, federation or
+> placement work; the remaining steps are an invariant harvest into sprintctl, vuoro-side
+> detach and archive. Current state and order: `docs/plans/2026-09-30-long-goal-iteration.md`.
+
 Status: **ratified** (2026-08-22), with 5.2 and 5.8 decided in §5.2 and §5.8 below and one
 factual correction to the draft (see *Baseline*). Generated from what the ratified documents
 already defer forward; every item cites where its obligation originates. This is the list the W4 rescope
