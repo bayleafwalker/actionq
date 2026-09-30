@@ -35,7 +35,7 @@ supersession, and discarded it uncommitted.
 | Step 1 fence experiment | closed | HANDOFF §2, F9 |
 | Step 2 harness qualification | closed; follow-ons moot (adapters deleted in tranche 3) | PR #29/#30 |
 | Step 3 deletion, tranches 1–3 | done in code | PR #30 |
-| §8.1 cluster rollout | done | `actionq-server` deleted 2026-09-01 (`docs/evidence/actionq-server-orphan-2026-09-01/`); `actionq-db`/`actionq-db-proxy` dropped by appservice #1676/#1678 (2026-09-18) |
+| §8.1 cluster rollout | done | the HTTP server deployment deleted 2026-09-01 (orphan record under `docs/evidence/`, dated 2026-09-01); `actionq-db`/`actionq-db-proxy` dropped by appservice #1676/#1678 (2026-09-18) |
 | §8.2 devbox `actionq-dispatch.service` | done | `ssh devbox-agent systemctl is-enabled actionq-dispatch.service` → `not-found` (2026-09-30); gitops-nixos `scripts/check-actionq-retirement.sh` enforces absence of `modules/system/actionq-dispatch.nix` |
 | W0 freeze, W1 reachability pin | done (W1's module split never started) | PR #31, #33 |
 | W2 federation authority, W3 backfill/export, W4 serving surface | done in code, **never served** | PR #34, #35, #42; register: no federation migration job ever ran |
@@ -49,7 +49,7 @@ supersession, and discarded it uncommitted.
 Vuoro's remaining reach into actionq (all lazy imports, none of lease/claim/renew/settle):
 `vuoro_adapter_kit/adapters/execution.py` (`actionq.application`, `actionq.vuoro`),
 `adapters/federation.py` (`actionq.vuoro_federation`), `scripts/verify_pre_migration_startup.py`
-(`actionq.schema`, `actionq.db.migrate`) and one specialized test. None is exercised by the
+(the schema module and the root `migrate` facade) and one specialized test. None is exercised by the
 served composition, which pins no actionq wheel. These are vuoro-side removals before archive.
 
 ## Remaining work, in order
