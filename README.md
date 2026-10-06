@@ -7,6 +7,12 @@
 > fence in `docs/plans/2026-08-20-tranche4-federation-storage-contract-freeze.md`. Deployment
 > state is separately owned and is not inferred from repository state.
 
+> **Abstraction preserved elsewhere (2026-10-05).** ActionQ retires as a host, not as the
+> authority-plane abstraction it carries. The provider-neutral contract and its conformance
+> tests are held in Vuoro (`packages/vuoro-service/tests/conformance/`, coverage matrix in
+> vuoro `docs/plans/2026-10-05-market-integration-milestone.md` §6 P3); implementations conform
+> at their respective horizons. No new execution, federation or placement work lands here.
+
 `actionq` is being reduced to federation state, evidence, acceptance and reconciliation for
 externally owned executions. Its Postgres queue/claim API remains temporarily writable for
 compatibility and historical-data migration.
