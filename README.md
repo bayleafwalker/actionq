@@ -140,12 +140,20 @@ identity comes from a signed `runner-auth/v1` proof read from stdin (see
 echo "$RUNNER_PROOF_JSON" | actionctl claim --proof-stdin
 ```
 
-Complete the claimed action, again supplying the claim receipt and a signed
-runner proof as `{"claim_receipt": ..., "runner_proof": ...}` on stdin:
+For the verified dispatch path, prepare a `dispatch-result/v1` artifact in the
+configured owner-controlled content-addressed store. Build a settlement packet
+from that exact result, the opaque receipt returned by `claim`, and a signed
+runner proof. The packet has exactly `claim_receipt`, `runner_proof`, and
+`result` fields. Keep the receipt and proof private; do not put them in logs or
+events:
 
 ```bash
-echo "$CLAIM_PROOF_JSON" | actionctl complete 1 --result branch=agent/scope-iterate/1 --proof-stdin
+actionctl settle 1 --packet-stdin < settlement-packet.json
 ```
+
+The `complete`, `fail`, and `reject` commands remain for their existing
+compatibility contract. They do not establish a verified
+`dispatch-result/v1` settlement.
 
 Inspect the action and its event history:
 
@@ -159,7 +167,9 @@ The normal action flow is:
 
 1. `add` inserts a `pending` action and writes `action_enqueued`.
 2. `claim` atomically marks the oldest highest-priority pending action as `claimed` and writes `action_claimed`.
-3. A worker finishes with one of `complete`, `fail`, or `reject`.
+3. The verified dispatch path settles through `settle` with the exact
+   `dispatch-result/v1` packet. Legacy `complete`, `fail`, and `reject` remain
+   available for their compatibility contract.
 4. Operators may `cancel` a `pending` or `claimed` action.
 5. `sweep` requeues expired claims by clearing claim ownership and writing `claim_timed_out`.
 
@@ -175,9 +185,10 @@ Priority is ascending, so smaller numbers are claimed first.
 | `actionctl ls` | List actions with optional status, type, and project filters. |
 | `actionctl show ACTION_ID` | Show one action plus all recorded events. |
 | `actionctl claim --proof-stdin` | Claim the next pending action using a signed runner proof read from stdin. Exits with code `2` if none are available. |
-| `actionctl complete ACTION_ID --result REF --proof-stdin` | Mark a claimed action completed using a claim receipt and signed runner proof read from stdin. |
-| `actionctl fail ACTION_ID --reason TEXT --proof-stdin` | Mark a claimed action failed using a claim receipt and signed runner proof read from stdin. |
-| `actionctl reject ACTION_ID --reason TEXT --validator NAME --proof-stdin` | Reject a claimed action after validation using a claim receipt and signed runner proof read from stdin. |
+| `actionctl settle ACTION_ID --packet-stdin` | Settle a claimed action from a verified `dispatch-result/v1` artifact, claim receipt, and signed runner proof read from stdin. |
+| `actionctl complete ACTION_ID --result REF --proof-stdin` | Legacy compatibility command; it does not verify a `dispatch-result/v1` artifact. |
+| `actionctl fail ACTION_ID --reason TEXT --proof-stdin` | Legacy compatibility command; it does not verify a `dispatch-result/v1` artifact. |
+| `actionctl reject ACTION_ID --reason TEXT --validator NAME --proof-stdin` | Legacy compatibility command; it does not verify a `dispatch-result/v1` artifact. |
 | `actionctl cancel ACTION_ID --reason TEXT` | Cancel a pending or claimed action. |
 | `actionctl sweep` | Requeue timed-out claims. |
 | `actionctl events` | Read the event log, optionally filtered or tailed. |
