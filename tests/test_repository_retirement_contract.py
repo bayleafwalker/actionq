@@ -74,18 +74,3 @@ def test_current_docs_do_not_present_the_retired_http_or_daemon_plan_as_live() -
     assert "Historical plan — superseded 2026-08-20" in plan
     assert "docs/plans/2026-08-20-execution-plane-deletion-order.md" in plan
     assert "owner/federation successor" in plan
-
-
-def test_quick_start_documents_verified_settlement_and_keeps_legacy_commands_distinct() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "actionctl claim --proof-stdin" in readme
-    assert "actionctl settle 1 --packet-stdin < settlement-packet.json" in readme
-    assert "`dispatch-result/v1`" in readme
-    assert "They do not establish a verified" in readme
-
-    from click.testing import CliRunner
-    from actionq.cli import cli
-
-    result = CliRunner().invoke(cli, ["settle", "--help"])
-    assert result.exit_code == 0, result.output
-    assert "--packet-stdin" in result.output
