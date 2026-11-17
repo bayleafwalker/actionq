@@ -1009,7 +1009,7 @@
     {
       "id": "mixed-actionctl-facade",
       "path": "actionq/cli.py",
-      "symbols": ["ActionQGroup", "ActionQGroup.invoke", "_schema", "_app", "_connect", "_echo_json", "cli", "migrate", "federation", "federation_migrate", "federation_check_compatibility", "check_compatibility", "add", "list_cmd", "show", "execution_group", "group_realize", "group_show", "group_list", "group_stop", "claim", "renew", "complete", "fail", "reject", "settle", "cancel", "cancel_ack", "register_publication", "sweep", "events", "sessions", "emit"],
+      "symbols": ["_json_option", "ActionQCommand", "ActionQCommand.__init__", "ActionQCommand.get_short_help_str", "OperatorClickException", "OperatorClickException.__init__", "OperatorClickException.show", "ActionQGroup", "ActionQGroup.get_short_help_str", "ActionQGroup.invoke", "ActionQGroup.format_commands", "ActionQGroup.format_epilog", "ActionQGroup.resolve_command", "_dsn_host", "_schema", "_app", "_connect", "_echo_json", "_table", "cli", "migrate", "federation", "federation_migrate", "federation_check_compatibility", "check_compatibility", "add", "list_cmd", "show", "execution_group", "group_realize", "group_show", "group_list", "group_stop", "claim", "renew", "complete", "fail", "reject", "settle", "cancel", "cancel_ack", "register_publication", "sweep", "events", "sessions", "emit"],
       "disposition": "replace-by-federation",
       "owner": "actionq",
       "falsifying_test": "A legacy command silently aliases federation semantics, or a callable disappears before versioned deprecation and cutover."

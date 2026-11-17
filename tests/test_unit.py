@@ -1,11 +1,14 @@
 import json
+import io
 from datetime import datetime, timezone
 
 import pytest
+import click
 from click.testing import CliRunner
 
 from actionq import db
-from actionq.cli import cli
+from actionq import cli as cli_module
+from actionq.cli import cli, list_cmd, sessions
 
 
 def test_schema_name_defaults(monkeypatch):
@@ -28,6 +31,87 @@ def test_cli_requires_actionq_url_for_migrate(monkeypatch):
     result = CliRunner().invoke(cli, ["migrate"])
     assert result.exit_code != 0
     assert "ACTIONQ_URL is required" in result.output
+    assert "postgresql://USER:PASSWORD@HOST:5432/DATABASE" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_connection_refusal_is_actionable_and_temporary(monkeypatch):
+    monkeypatch.setenv("ACTIONQ_URL", "postgresql://nobody@127.0.0.1:1/none")
+    result = CliRunner().invoke(cli, ["ls"])
+    assert result.exit_code == 75
+    assert "error: PostgreSQL connection failed for host 127.0.0.1" in result.output
+    assert "why: the database could not be reached" in result.output
+    assert "verify ACTIONQ_URL" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_authentication_failure_uses_exit_four(monkeypatch):
+    import psycopg
+
+    error = psycopg.OperationalError("password authentication failed")
+    error.sqlstate = "28P01"
+
+    class FakeApp:
+        def list_actions(self, **_filters):
+            raise error
+
+    monkeypatch.setenv("ACTIONQ_URL", "postgresql://nobody@db.internal:5432/actionq")
+    monkeypatch.setattr("actionq.cli._app", lambda _ctx: FakeApp())
+    result = CliRunner().invoke(cli, ["ls"])
+    assert result.exit_code == 4
+    assert "host db.internal" in result.output
+    assert "database authentication was rejected" in result.output
+    assert "ACTIONQ_URL" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_json_flag_is_accepted_after_subcommand(monkeypatch):
+    class FakeApp:
+        def list_actions(self, **_filters):
+            return [{"id": 9, "action_type": "build", "status": "pending", "project": "demo"}]
+
+    monkeypatch.setattr("actionq.cli._app", lambda _ctx: FakeApp())
+    result = CliRunner().invoke(cli, ["ls", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == [
+        {"id": 9, "action_type": "build", "status": "pending", "project": "demo"}
+    ]
+
+
+def test_list_and_sessions_render_tables_on_a_tty(monkeypatch):
+    class FakeApp:
+        def list_actions(self, **_filters):
+            return [{"id": 9, "action_type": "build", "status": "pending", "project": "demo"}]
+
+        def list_sessions(self, **_filters):
+            return [{"session_id": "aqs:9", "action_id": 9, "status": "running", "project": "demo"}]
+
+    class TTYBuffer(io.StringIO):
+        def isatty(self):
+            return True
+
+    output = TTYBuffer()
+    monkeypatch.setattr(cli_module.sys, "stdout", output)
+    monkeypatch.setattr(cli_module, "_app", lambda _ctx: FakeApp())
+    ctx = click.Context(cli)
+    ctx.obj = {"schema": "actionq"}
+    with ctx:
+        list_cmd.callback(None, None, None, 50)
+        sessions.callback(None, False, 100)
+    assert "ID  TYPE   STATUS    PROJECT" in output.getvalue()
+    assert "9   build  ○ queued  demo" in output.getvalue()
+    assert "SESSION  ACTION  STATUS     PROJECT" in output.getvalue()
+    assert "aqs:9" in output.getvalue() and "◐ running" in output.getvalue()
+    assert "1 actions" in output.getvalue() and "1 sessions" in output.getvalue()
+
+
+def test_root_help_groups_commands_and_shows_examples():
+    result = CliRunner().invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "Start here" in result.output
+    assert "Change" in result.output and "Plumbing" in result.output
+    assert "Examples:" in result.output
+    assert "actionctl ls" in result.output
 
 
 def test_json_default_serializes_plain_values():
